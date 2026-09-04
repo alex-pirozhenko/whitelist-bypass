@@ -15,10 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pion/webrtc/v4"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/wtsignal"
+	"github.com/pion/webrtc/v4"
 )
 
 const vkMaxReconnectAttempts = 10
@@ -101,6 +101,9 @@ type VKHeadlessJoiner struct {
 	remoteSet      bool
 	pendingICE     []webrtc.ICECandidateInit
 
+	Initiate  bool
+	offerSent bool
+
 	configAck        configAckTracker
 	reconnectAttempt atomic.Int32
 	stopCh           chan struct{}
@@ -120,6 +123,19 @@ func NewVKHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, stat
 }
 
 func (h *VKHeadlessJoiner) RunWithParams(jsonParams string) {
+	h.runWithParams(jsonParams)
+}
+
+// RunWithParamsInitiate behaves exactly like RunWithParams, except this
+// joiner will initiate the SDP offer itself instead of only answering.
+// Used when two headless ends must negotiate with no browser participant
+// to send the first offer.
+func (h *VKHeadlessJoiner) RunWithParamsInitiate(jsonParams string) {
+	h.Initiate = true
+	h.runWithParams(jsonParams)
+}
+
+func (h *VKHeadlessJoiner) runWithParams(jsonParams string) {
 	var params VKHeadlessAuthParams
 	if err := json.Unmarshal([]byte(jsonParams), &params); err != nil {
 		h.logFn("vk-joiner: failed to parse auth params: %v", err)
@@ -235,6 +251,7 @@ func (h *VKHeadlessJoiner) resetSessionState() {
 	h.pendingICE = nil
 	h.remotePeerID = nil
 	h.joinResp = nil
+	h.offerSent = false
 }
 
 func (h *VKHeadlessJoiner) Close() {
@@ -688,11 +705,13 @@ func (h *VKHeadlessJoiner) initPC() {
 	}
 
 	h.logFn("vk-joiner: PC ready, waiting for remote offer")
+	h.maybeInitiateOffer()
 }
 
 func (h *VKHeadlessJoiner) onRegisteredPeer(pid int64) {
 	h.remotePeerID = &pid
 	h.logFn("vk-joiner: peer registered: %d", pid)
+	h.maybeInitiateOffer()
 }
 
 func (h *VKHeadlessJoiner) onLocalICECandidate(candidate *webrtc.ICECandidate) {
@@ -766,4 +785,32 @@ func (h *VKHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 			h.vkMu.Unlock()
 		}
 	}
+}
+
+func (h *VKHeadlessJoiner) maybeInitiateOffer() {
+	if !h.Initiate || h.pc == nil || h.remotePeerID == nil || h.offerSent {
+		return
+	}
+	h.offerSent = true
+	offer, err := h.pc.CreateOffer(nil)
+	if err != nil {
+		h.logFn("vk-joiner: create offer failed: %v", err)
+		h.offerSent = false
+		return
+	}
+	if err := h.pc.SetLocalDescription(offer); err != nil {
+		h.logFn("vk-joiner: set local description failed: %v", err)
+		h.offerSent = false
+		return
+	}
+	sdpJSON, _ := json.Marshal(offer.SDP)
+	h.vkMu.Lock()
+	if h.sfu != nil {
+		h.vkSeq++
+		raw := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"sdp":{"sdp":%s,"type":%q},"animojiVersion":2},"participantType":"USER"}`,
+			h.vkSeq, *h.remotePeerID, sdpJSON, offer.Type.String())
+		h.sfu.Send([]byte(raw))
+		h.logFn("vk-joiner: -> offer (seq=%d)", h.vkSeq)
+	}
+	h.vkMu.Unlock()
 }

@@ -49,6 +49,7 @@ type VKHeadlessAuthParams struct {
 	VP8FPS          int    `json:"vp8Fps"`
 	VP8Batch        int    `json:"vp8Batch"`
 	DualTrack       bool   `json:"dualTrack"`
+	TunnelSecret    string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
 }
 
 type VKJoinResponse struct {
@@ -126,7 +127,7 @@ func (h *VKHeadlessJoiner) RunWithParams(jsonParams string) {
 		return
 	}
 	h.authParams = &params
-	obf, err := tunnel.NewTunnelObfuscator(tunnel.DeriveSecretFromJoinLink(params.JoinLink))
+	obf, err := tunnel.NewTunnelObfuscator(callpathTunnelSecret(params.TunnelSecret, params.JoinLink))
 	if err != nil {
 		h.logFn("vk-joiner: obfuscator init failed: %v", err)
 		h.Status.EmitStatusError("obfuscator init: " + err.Error())

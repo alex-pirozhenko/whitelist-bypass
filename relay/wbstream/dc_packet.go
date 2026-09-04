@@ -2,7 +2,7 @@ package wbstream
 
 import (
 	"github.com/pion/datachannel"
-	"whitelist-bypass/relay/livekit"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/livekit"
 )
 
 type dataPacketWrapper struct {

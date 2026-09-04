@@ -12,7 +12,7 @@ import (
 	"github.com/pion/datachannel"
 	"github.com/pion/webrtc/v4"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 // Telemost chunk size

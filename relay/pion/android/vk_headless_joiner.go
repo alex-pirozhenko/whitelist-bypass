@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"whitelist-bypass/relay/common"
-	"whitelist-bypass/relay/pion"
-	joiner "whitelist-bypass/relay/pion/headless-joiner-common"
-	"whitelist-bypass/relay/tunnel"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/pion"
+	joiner "github.com/alex-pirozhenko/whitelist-bypass/relay/pion/headless-joiner-common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
 
 type fileCacheStore struct {

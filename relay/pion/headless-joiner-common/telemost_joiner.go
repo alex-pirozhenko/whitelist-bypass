@@ -16,9 +16,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
-	"whitelist-bypass/relay/common"
-	tmapi "whitelist-bypass/relay/telemost"
-	"whitelist-bypass/relay/tunnel"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
+	tmapi "github.com/alex-pirozhenko/whitelist-bypass/relay/telemost"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
 
 const (

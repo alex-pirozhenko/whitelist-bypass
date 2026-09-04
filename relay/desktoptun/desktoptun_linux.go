@@ -15,7 +15,7 @@ import (
 
 	"github.com/xjasonlyu/tun2socks/v2/engine"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 type Config struct {

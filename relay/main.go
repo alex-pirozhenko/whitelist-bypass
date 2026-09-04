@@ -8,11 +8,11 @@ import (
 	"os"
 	"sync"
 
-	"whitelist-bypass/relay/androidbind"
-	"whitelist-bypass/relay/common"
-	"whitelist-bypass/relay/pion"
-	"whitelist-bypass/relay/pion/android"
-	"whitelist-bypass/relay/tunnel"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/androidbind"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/pion"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/pion/android"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
 
 type stdLogger struct{}

@@ -1,4 +1,4 @@
-module whitelist-bypass/relay
+module github.com/alex-pirozhenko/whitelist-bypass/relay
 
 go 1.26.1
 

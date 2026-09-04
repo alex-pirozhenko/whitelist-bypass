@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"whitelist-bypass/relay/tunnel"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
 
 const configResendPeriod = 3 * time.Second

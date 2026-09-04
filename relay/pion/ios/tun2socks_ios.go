@@ -14,7 +14,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 const (

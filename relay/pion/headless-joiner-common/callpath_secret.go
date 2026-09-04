@@ -3,7 +3,7 @@ package joiner
 import (
 	"encoding/base64"
 
-	"whitelist-bypass/relay/tunnel"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
 
 // callpath modification.

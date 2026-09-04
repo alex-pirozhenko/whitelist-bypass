@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 const (

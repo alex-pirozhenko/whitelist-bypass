@@ -64,6 +64,55 @@ Mirror `telemost_joiner.go`'s **video mode**, not vk_joiner's dc mode:
 - Non-goal: the DataChannel ("dc") tunnel, `transmit-data` offer/answer, `p2pRelay` field,
   and the self/peer ICE-candidate exchange over transmit-data — all superseded.
 
+## VERIFIED LIVE (2026-09-10) — the working handshake and the one remaining gap
+
+The SFU signaling flow below is implemented in max_joiner.go and **confirmed working against
+the live server** (no protocol errors, no TURN 403 any more):
+
+1. ws2 connect → `change-media-settings` (isVideoEnabled true) + `update-media-modifiers`.
+2. `connection` notification → adopt conversationParams TURN/STUN → build PC.
+3. **Topology matters and is not forcible.** A 1:1 call runs in `DIRECT` (peer-to-peer; the
+   server relays NO media and never produces, so no `producer-updated` ever arrives).
+   `switch-topology {topology:"SERVER",force:true}` is rejected with `feature-is-disabled`.
+   The conversation flips to `SERVER` **on its own once a THIRD participant joins** — verified:
+   `<- topology-changed topology=SERVER`. Implication for letmeout: a MAX tunnel needs a third
+   (filler) participant in the room, or the call must otherwise be a group call.
+4. On `topology-changed → SERVER`, RE-SEND `allocate-consumer` (the one sent while still in
+   DIRECT does not carry over). Then the SFU offers.
+5. `allocate-consumer` payload: `{"capabilities": {...}}` — a STRUCTURED object (the hex
+   bitmask is rejected with "Invalid message format"). Shape copied from the web bundle's
+   capabilities getter: estimatedPerformanceIndex, audioMix, consumerUpdate,
+   producer/consumer*DataChannelVersion, onDemandTracks, unifiedPlan, singleSession,
+   videoTracksCount, red, simulcast*, etc. Accepted by the server as implemented.
+6. `← producer-updated {description, sessionId}` = the SFU's SDP **offer**; we answer and send
+   `accept-producer {description, sessionId, ssrcs}`. Both directions verified on the wire.
+
+### The SFU's offer (captured live) — and the remaining gap
+The SFU is **`a=ice-lite`** (it never sends connectivity checks; our side must drive ICE), its
+candidates are plain host candidates on its own public IP (e.g. `155.212.206.87:43210` udp +
+tcp, no ufrag attribute), and ONE offer carries BOTH directions across 5 bundled m-lines:
+
+```
+a=group:BUNDLE 0 1 2 3 4 / a=ice-lite
+m=audio       mid:0  sendonly   SFU -> us (audio-mix)
+m=application mid:1             SCTP datachannel (SFU's own producerCommand/notification etc.)
+m=audio       mid:2  recvonly   us -> SFU
+m=video       mid:3  recvonly   us -> SFU   <-- OUR VP8 TUNNEL TRACK BELONGS HERE
+m=video       mid:4  sendonly   SFU -> us
+```
+(NB: the SFU *does* offer an SCTP m-line, so DataChannels are not categorically impossible —
+but they are the SFU's own control channels, so the VP8 media tunnel remains the design.)
+
+**Remaining gap:** our answer carries `ssrcs=[]` — the outbound VP8 track is added with
+`AddTracks` *before* the offer arrives and is never bound to `mid:3`, so we advertise video and
+supply none. The SFU then rejects the answer and re-offers with a fresh `sessionId` every ~14s,
+which is why ICE never settles (each new offer resets the session). Fix: after
+`SetRemoteDescription(offer)`, locate the transceiver whose mid is the video/recvonly one
+(mid:3) and attach the tunnel track to it (`transceiver.Sender().ReplaceTrack(sampleTrack)` or
+set its direction to sendonly), making sure the track's codec matches one of that m-line's
+payload types (98-106), then answer. `extractSSRCs` should then return a real SSRC and the SFU
+should accept, letting ICE complete against the ice-lite SFU.
+
 ## Next step
 Build a `CONSUMER`/`PRODUCER` SFU media flow in `max_joiner.go` (video/VP8 tunnel), driven by
 `allocate-consumer` / `accept-producer`, feeding Pion tracks. The cleanest reference is

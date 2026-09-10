@@ -80,13 +80,20 @@ func (c *Client) Connect(ctx context.Context, resolve ResolveFunc) error {
 		return fmt.Errorf("failed to dial %s: %w", targetAddr, err)
 	}
 
-	// InsecureSkipVerify matches the repo's other platform joiners
-	// (telemost_joiner.go, vk_joiner.go): api2.oneme.ru's chain is not in the
-	// system root store, the peer is pinned by IP via the resolver, and the
-	// tunnel's own obfuscation is the security boundary — not this TLS leg.
+	// api2.oneme.ru is issued under the Russian Trusted CA hierarchy, which is
+	// not in the system root store. Rather than disabling verification, trust
+	// ONLY that one CA, and only here: onemeRoots is a private pool scoped to
+	// this dialer, so the Russian CA is never added to the system or process
+	// trust store and cannot affect any other TLS connection. Hostname
+	// verification still applies.
+	roots, err := onemeRoots()
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("max ca pool: %w", err)
+	}
 	tlsConfig := &tls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: true,
+		ServerName: host,
+		RootCAs:    roots,
 	}
 
 	tlsConn := tls.Client(conn, tlsConfig)

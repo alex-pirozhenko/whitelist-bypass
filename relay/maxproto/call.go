@@ -1,6 +1,7 @@
 package maxproto
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -183,13 +184,22 @@ func ParseCallInfo(joinResp map[string]any) (*CallInfo, error) {
 		}
 	}
 
+	// UseNumber so the participant ids (id.internal is a 16-digit integer, and
+	// the same value ws2 addresses participants by) keep their exact digits.
+	// A plain decode makes them float64, and fmt.Sprint of that renders
+	// scientific notation ("1.125...e+15"), which never matches the id ws2
+	// sends — that mismatch breaks self/peer identification during signaling.
 	var ci CallInfo
-	if err := json.Unmarshal(data, &ci); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&ci); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal CallInfo: %w", err)
 	}
 
 	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err == nil {
+	rawDec := json.NewDecoder(bytes.NewReader(data))
+	rawDec.UseNumber()
+	if err := rawDec.Decode(&raw); err == nil {
 		ci.Raw = raw
 	}
 

@@ -169,7 +169,8 @@ type MaxHeadlessJoiner struct {
 	ctl *maxproto.Client
 	ci  *maxproto.CallInfo
 
-	selfUID string
+	selfUID    string
+	selfAltUID string
 
 	ws   *websocket.Conn
 	wsMu sync.Mutex
@@ -319,6 +320,7 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	h.offerOnce = sync.Once{}
 	h.ci = nil
 	h.selfUID = ""
+	h.selfAltUID = ""
 }
 
 func (h *MaxHeadlessJoiner) Close() {
@@ -437,7 +439,12 @@ func (h *MaxHeadlessJoiner) joinCall() error {
 		return fmt.Errorf("empty endpoint in call info")
 	}
 	h.ci = ci
-	h.selfUID = fmt.Sprint(ci.ID.External)
+	// ws2 notifications address participants by their INTERNAL id (the same
+	// value as the endpoint's userId=), not the external one. Track both so
+	// learnPeer can never mistake one of our own ids for the peer's — getting
+	// this wrong makes a peer send its ICE candidates to itself and ICE fails.
+	h.selfUID = fmt.Sprint(ci.ID.Internal)
+	h.selfAltUID = fmt.Sprint(ci.ID.External)
 	h.logFn("max-joiner: joined call self=%s endpoint=%s turn=%v", h.selfUID, ci.Endpoint, ci.Turn.URLs)
 	return nil
 }
@@ -494,7 +501,12 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 		WriteBufferSize:  65536,
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: hostname},
+		// The ws2 host (videowebrtc.okcdn.ru) is issued by a publicly trusted CA
+		// (HARICA), so it verifies against the system roots — no special CA and
+		// no InsecureSkipVerify here. Only api2.oneme.ru needs the scoped
+		// Russian CA pool, which lives in maxproto and applies to that dial alone.
+		// We connect to a pre-resolved IP, so ServerName drives verification.
+		TLSClientConfig: &tls.Config{ServerName: hostname},
 		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			_, port, _ := net.SplitHostPort(addr)
 			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, resolvedIP+":"+port)
@@ -665,6 +677,29 @@ func (h *MaxHeadlessJoiner) maybeSendOffer() {
 	})
 }
 
+// gatheredLocalDescription blocks until ICE gathering finishes and returns the
+// local description with every candidate inlined in the SDP (non-trickle).
+//
+// OK-Calls does NOT reliably relay standalone trickle candidates: a
+// transmit-data carrying only {"candidate":...} has no sdp object and so no
+// p2pRelay marker, and peers observably receive few or none of them. The proven
+// reference implementation (aiortc) is non-trickle and puts all candidates in
+// the offer/answer, so we do the same. Falls back to the ungathered description
+// if gathering stalls.
+func (h *MaxHeadlessJoiner) gatheredLocalDescription(fallback webrtc.SessionDescription) webrtc.SessionDescription {
+	select {
+	case <-webrtc.GatheringCompletePromise(h.pc):
+		if ld := h.pc.LocalDescription(); ld != nil {
+			h.logFn("max-joiner: ICE gathering complete, sending full SDP")
+			return *ld
+		}
+	case <-time.After(15 * time.Second):
+		h.logFn("max-joiner: ICE gathering timed out, sending SDP as-is")
+	case <-h.stopCh:
+	}
+	return fallback
+}
+
 func (h *MaxHeadlessJoiner) sendOffer(addr *maxPeerAddr) {
 	if h.pc == nil {
 		return
@@ -678,6 +713,7 @@ func (h *MaxHeadlessJoiner) sendOffer(addr *maxPeerAddr) {
 		h.logFn("max-joiner: set local description failed: %v", err)
 		return
 	}
+	offer = h.gatheredLocalDescription(offer)
 	h.sendTransmitData(addr, map[string]interface{}{
 		"sdp": map[string]interface{}{
 			"type":     "offer",
@@ -799,7 +835,7 @@ func (h *MaxHeadlessJoiner) learnPeer(m map[string]interface{}) {
 			continue
 		}
 		s := fmt.Sprint(v)
-		if s == "" || s == h.selfUID {
+		if s == "" || s == h.selfUID || s == h.selfAltUID {
 			continue
 		}
 		h.setPeerAddr(&maxPeerAddr{ParticipantID: s, ParticipantType: "USER", DeviceIdx: 0})
@@ -883,6 +919,7 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 			h.logFn("max-joiner: set local description failed: %v", err)
 			return
 		}
+		answer = h.gatheredLocalDescription(answer)
 		h.peerMu.Lock()
 		addr := h.peerAddr
 		h.peerMu.Unlock()

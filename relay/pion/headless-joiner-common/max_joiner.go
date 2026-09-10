@@ -534,7 +534,27 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	h.wsMu.Unlock()
 	h.logFn("max-joiner: ws2 connected self=%s", h.selfUID)
 
-	h.initPC()
+	// Declare media settings immediately, mirroring vk_joiner (VK Calls == this
+	// OK-Calls stack). The SFU does not begin ICE/media until the client states
+	// its media settings; without this, connectivity checks go unanswered and
+	// ICE fails. Data-only tunnel, so audio/video/screen are all disabled.
+	h.send("update-media-modifiers", map[string]interface{}{
+		"mediaModifiers": map[string]interface{}{"denoise": true, "denoiseAnn": true},
+	})
+	h.send("change-media-settings", map[string]interface{}{
+		"mediaSettings": map[string]interface{}{
+			"isAudioEnabled": false, "isVideoEnabled": false,
+			"isScreenSharingEnabled": false, "isFastScreenSharingEnabled": false,
+			"isAudioSharingEnabled": false, "isAnimojiEnabled": false,
+		},
+	})
+
+	// NOTE: the PeerConnection is NOT built here. The ws2 "connection"
+	// notification carries the TURN/STUN credentials that are actually valid
+	// for this ws2 session (op166's CallInfo ones are a different, earlier
+	// grant), and using the stale pair makes the TURN server answer
+	// CreatePermission with "403 Forbidden IP". handleConnection overrides the
+	// ICE servers and then calls initPC — same order as vk_joiner.go.
 
 	if h.params.Role == maxRoleOfferer {
 		go func() {
@@ -554,6 +574,56 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 // DataChannel (offerer creates "tunnel", answerer waits on OnDataChannel) —
 // this matches the proven okcalls_peer.py PoC. VK's negotiated id=2 approach
 // is unproven on the OK-Calls SFU and must not be used here.
+// handleConnection processes the ws2 "connection" notification, which is the
+// authoritative source of this session's ICE servers: conversationParams.turn
+// carries time-and-user-bound credentials ("<expiry>:<userId>") that differ
+// from the ones op166's CallInfo returned. Building the PeerConnection with
+// the stale CallInfo pair makes TURN reject CreatePermission with "403
+// Forbidden IP", so ICE can never leave checking. Mirrors vk_joiner.go:
+// adopt the credentials, then build the PC.
+func (h *MaxHeadlessJoiner) handleConnection(m map[string]interface{}) {
+	if conv, ok := m["conversation"].(map[string]interface{}); ok {
+		// DIRECT is the peer-to-peer topology this transport relies on.
+		h.logFn("max-joiner: <- connection topology=%v state=%v", conv["topology"], conv["state"])
+	}
+
+	if cp, ok := m["conversationParams"].(map[string]interface{}); ok {
+		if turn, ok := cp["turn"].(map[string]interface{}); ok {
+			urls := toStringSlice(turn["urls"])
+			if len(urls) > 0 {
+				h.ci.Turn.URLs = urls
+				h.ci.Turn.Username, _ = turn["username"].(string)
+				h.ci.Turn.Credential, _ = turn["credential"].(string)
+				h.logFn("max-joiner: TURN from connection: %v", urls)
+			}
+		}
+		if stun, ok := cp["stun"].(map[string]interface{}); ok {
+			if urls := toStringSlice(stun["urls"]); len(urls) > 0 {
+				h.ci.Stun.URLs = urls
+			}
+		}
+	}
+
+	if h.pc == nil {
+		h.initPC()
+	}
+}
+
+// toStringSlice converts a decoded JSON array into []string, skipping non-strings.
+func toStringSlice(v interface{}) []string {
+	raw, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func (h *MaxHeadlessJoiner) initPC() {
 	var iceServers []webrtc.ICEServer
 	if len(h.ci.Stun.URLs) > 0 {
@@ -640,6 +710,10 @@ func (h *MaxHeadlessJoiner) onLocalICECandidate(candidate *webrtc.ICECandidate) 
 	var parsed interface{}
 	json.Unmarshal(raw, &parsed)
 
+	// Trickle every local candidate to the SFU, mirroring the proven vk_joiner
+	// (VK Calls runs on this same OK-Calls stack): OK-Calls terminates ICE at
+	// the server, and the server needs our candidates to run connectivity
+	// checks toward us. Buffer until the peer/SFU address is learned, then flush.
 	h.peerMu.Lock()
 	addr := h.peerAddr
 	if addr == nil {
@@ -675,6 +749,32 @@ func (h *MaxHeadlessJoiner) maybeSendOffer() {
 	h.offerOnce.Do(func() {
 		h.sendOffer(addr)
 	})
+}
+
+// sdpUfragSummary reports an SDP's session ice-ufrag and the distinct "ufrag"
+// attributes on its candidate lines. They must match: a peer's ICE agent drops
+// every candidate whose ufrag differs from the session's.
+func sdpUfragSummary(sdp string) string {
+	sess := "?"
+	seen := map[string]int{}
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "a=ice-ufrag:") {
+			sess = strings.TrimPrefix(line, "a=ice-ufrag:")
+			continue
+		}
+		if strings.HasPrefix(line, "a=candidate:") {
+			if i := strings.Index(line, " ufrag "); i >= 0 {
+				f := strings.Fields(line[i+7:])
+				if len(f) > 0 {
+					seen[f[0]]++
+					continue
+				}
+			}
+			seen["(none)"]++
+		}
+	}
+	return fmt.Sprintf("sessUfrag=%s candUfrags=%v", sess, seen)
 }
 
 // gatheredLocalDescription blocks until ICE gathering finishes and returns the
@@ -713,7 +813,6 @@ func (h *MaxHeadlessJoiner) sendOffer(addr *maxPeerAddr) {
 		h.logFn("max-joiner: set local description failed: %v", err)
 		return
 	}
-	offer = h.gatheredLocalDescription(offer)
 	h.sendTransmitData(addr, map[string]interface{}{
 		"sdp": map[string]interface{}{
 			"type":     "offer",
@@ -722,7 +821,7 @@ func (h *MaxHeadlessJoiner) sendOffer(addr *maxPeerAddr) {
 		},
 		"label": "call",
 	})
-	h.logFn("max-joiner: sent OFFER")
+	h.logFn("max-joiner: sent OFFER [%s]", sdpUfragSummary(offer.SDP))
 }
 
 // send is the generic ws2 command sender: {"command":cmd,"sequence":n, ...fields}.
@@ -812,7 +911,9 @@ func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
 		}
 		h.logFn("max-joiner: <- %s participantId=%v", notif, pid)
 		h.maybeSendOffer()
-	case "connection", "settings-update":
+	case "connection":
+		h.handleConnection(m)
+	case "settings-update":
 		h.logFn("max-joiner: <- %s", notif)
 	default:
 		h.logFn("max-joiner: <- notification %s", notif)
@@ -867,18 +968,25 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 	}
 
 	if candidate, ok := data["candidate"]; ok {
+		// These standalone candidates are the SERVER's (OK-Calls terminates ICE
+		// itself: it rewrites the relayed SDP to its own ice-ufrag/pwd and then
+		// trickles the SFU's own candidates, which carry that same ufrag). They
+		// are essential — ICE/DTLS runs client<->SFU, not peer-to-peer — so
+		// apply them once the (server-rewritten) remote description is set,
+		// buffering until then.
 		candidateJSON, _ := json.Marshal(candidate)
 		var candidateInit webrtc.ICECandidateInit
-		json.Unmarshal(candidateJSON, &candidateInit)
-		if h.OnRemoteCandidate != nil {
-			h.OnRemoteCandidate(0, candidateInit.Candidate)
-		}
-		if h.remoteSet {
-			h.logFn("max-joiner: <- remote ICE candidate")
-			h.pc.AddICECandidate(candidateInit)
-		} else {
-			h.pendingICE = append(h.pendingICE, candidateInit)
-			h.logFn("max-joiner: remote ICE candidate buffered (no remote desc yet)")
+		if err := json.Unmarshal(candidateJSON, &candidateInit); err == nil {
+			if h.OnRemoteCandidate != nil {
+				h.OnRemoteCandidate(0, candidateInit.Candidate)
+			}
+			if h.remoteSet {
+				h.logFn("max-joiner: <- server ICE candidate")
+				h.pc.AddICECandidate(candidateInit)
+			} else {
+				h.pendingICE = append(h.pendingICE, candidateInit)
+				h.logFn("max-joiner: server ICE candidate buffered (no remote desc yet)")
+			}
 		}
 	}
 
@@ -891,7 +999,7 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 	if h.OnRemoteCandidate != nil {
 		h.OnRemoteCandidate(-1, sdpStr)
 	}
-	h.logFn("max-joiner: remote SDP: %s", sdpType)
+	h.logFn("max-joiner: remote SDP: %s [%s]", sdpType, sdpUfragSummary(sdpStr))
 
 	switch sdpType {
 	case "answer":
@@ -919,7 +1027,6 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 			h.logFn("max-joiner: set local description failed: %v", err)
 			return
 		}
-		answer = h.gatheredLocalDescription(answer)
 		h.peerMu.Lock()
 		addr := h.peerAddr
 		h.peerMu.Unlock()
@@ -935,6 +1042,6 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 			},
 			"label": "call",
 		})
-		h.logFn("max-joiner: sent ANSWER")
+		h.logFn("max-joiner: sent ANSWER [%s]", sdpUfragSummary(answer.SDP))
 	}
 }

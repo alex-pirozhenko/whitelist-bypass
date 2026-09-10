@@ -113,6 +113,52 @@ set its direction to sendonly), making sure the track's codec matches one of tha
 payload types (98-106), then answer. `extractSSRCs` should then return a real SSRC and the SFU
 should accept, letting ICE complete against the ice-lite SFU.
 
+## What the real client does in DIRECT + whitelist mode (traced from the web bundle)
+
+Answering "how does the app work when the call is DIRECT but only MAX/OK IPs are reachable":
+
+```js
+_createPeerConnection(){
+  new RTCPeerConnection({
+    iceServers: Q.iceServers,
+    iceTransportPolicy: Q.forceRelayPolicy ? `relay` : `all`
+  })
+}
+```
+`forceRelayPolicy` is a settable SDK parameter (`static set forceRelayPolicy(t)`). So in a
+restricted/whitelist network the client stays in DIRECT topology and simply forces **relay-only
+ICE**: every media packet goes to OK's own TURN servers (155.212.x) and never to the peer's
+address. That is exactly what an allowlist permits, and it is why the earlier
+`CreatePermission 403 Forbidden IP` failures happened — those were permissions for the PEER's
+host/srflx addresses, which relay-only never even attempts. `_isMaster` marks which side creates
+the offer in DIRECT.
+
+Implemented here: `webrtc.Configuration{ICETransportPolicy: webrtc.ICETransportPolicyRelay}`,
+and the `p2pRelay:"true"` SDP field was removed (the web client never sends such a field —
+p2pRelay is only a capability flag, and it is false).
+
+### Server-terminated ICE happens in DIRECT too (measured)
+Even in DIRECT topology and even with p2pRelay removed, the server does NOT relay the SDP
+verbatim: it rewrites `a=ice-ufrag`/`a=ice-pwd` to its OWN values — the SAME ufrag is presented
+to both peers — and then trickles its OWN candidates (e.g. `155.212.199.235:43210`) as
+standalone `transmit-data {"candidate":...}` messages carrying that rewritten ufrag. Measured:
+
+- offer sent   `sessUfrag=qpxldzIMYhnWfbxq`, 4 relay candidates (self-consistent)
+- offer recv   `sessUfrag=vHWYmztSZ3BmUIP`  ← rewritten; the inline candidates still carry
+  `qpxldzIMYhnWfbxq`, so Pion correctly drops them ("doesn't match the current ufrags")
+- the 2 candidates that DO match the rewritten ufrag are the SERVER's, delivered by trickle
+
+So the client must: apply the (rewritten) remote description, ignore the peer's inline
+candidates, and apply the SERVER's trickled candidates — ICE then runs client<->server and the
+server relays to the peer. This is the same server-terminated model as the SFU path, and it is
+whitelist-friendly by construction.
+
+**Current status / next debug step:** with relay-only + no p2pRelay + inline candidates, the
+ANSWERER buffers and applies the server's 2 trickled candidates correctly, but the OFFERER
+receives NO server candidates at all (no `<- server ICE candidate` on that side), so it forms no
+pairs and ICE fails. Chase that asymmetry first — likely the offerer must (re)send/announce
+something before the server trickles to it, or its candidates arrive on a notification we drop.
+
 ## Next step
 Build a `CONSUMER`/`PRODUCER` SFU media flow in `max_joiner.go` (video/VP8 tunnel), driven by
 `allocate-consumer` / `accept-producer`, feeding Pion tracks. The cleanest reference is

@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,21 +37,6 @@ const (
 	maxDefaultLocale          = "en"
 	maxDefaultOSVersion       = "34"
 	maxDefaultTunnelMode      = "dc"
-)
-
-// maxRoleAnswerer/maxRoleOfferer are vestigial: MAX/OK-Calls is a media-only
-// SFU, not a symmetric peer, so there is no offerer/answerer distinction any
-// more — the SFU is always the offerer for producer negotiation and the
-// client is always the answerer (see MAX_OKCALLS_NOTES.md). The constants and
-// MaxHeadlessAuthParams.Role are kept only so JSON payloads that still set
-// "role" (e.g. from core/internal/joiner, server/internal/exitd in the
-// letmeout repo, or cmd/maxjoin) keep decoding; the value is no longer read
-// anywhere in the media/signaling logic below.
-// OK-Calls conversation topologies. DIRECT = peer-to-peer (server is not a
-// media relay); SERVER = SFU relays media. We always want SERVER.
-const (
-	maxTopologyDirect = "DIRECT"
-	maxTopologyServer = "SERVER"
 )
 
 const (
@@ -102,19 +86,9 @@ type MaxHeadlessAuthParams struct {
 	APIHost        string `json:"apiHost"`
 	JoinLink       string `json:"joinLink"`
 	ConversationID string `json:"conversationId"`
-	// Role is no longer read by the media layer (see maxRoleAnswerer doc
-	// comment above) — kept for wire-compat with existing callers.
-	Role string `json:"role"`
-	// TunnelMode is no longer read: MAX is video-tunnel-only now (an SFU
-	// cannot carry a DataChannel) — kept for wire-compat with existing callers.
-	TunnelMode   string `json:"tunnelMode"`
-	TunnelSecret string `json:"tunnelSecret"`
-
-	// VP8FPS/VP8Batch configure the outbound VP8 tunnel track, mirroring
-	// VKHeadlessAuthParams/TelemostHeadlessJoiner's RunWithParams fields. Zero
-	// values fall back to tunnel.VP8DataTunnel's own defaults.
-	VP8FPS   int `json:"vp8Fps"`
-	VP8Batch int `json:"vp8Batch"`
+	Role           string `json:"role"`
+	TunnelMode     string `json:"tunnelMode"`
+	TunnelSecret   string `json:"tunnelSecret"`
 
 	// CreateRoom, when true, makes joinCall create the room itself via op76
 	// (VideoChatStart) on the same session before op166-joining it, then fills
@@ -168,14 +142,20 @@ func (p *MaxHeadlessAuthParams) applyDefaults() {
 	}
 }
 
+// maxPeerAddr is the ws2 "address" of the remote participant, learned from
+// notifications (see learnPeer) and used on every transmit-data send.
+type maxPeerAddr struct {
+	ParticipantID   string
+	ParticipantType string
+	DeviceIdx       int
+}
+
 type MaxHeadlessJoiner struct {
 	logFn       func(string, ...any)
 	OnConnected func(tunnel.DataTunnel)
-	// OnRemoteCandidate is fired once for the SFU's producer-updated SDP offer
-	// (target=-1) so callers can extract any inline candidates — e.g. the
-	// Windows joiner installs /32 bypass routes to the SFU's own address
-	// before applying the description. There is no more standalone trickle:
-	// OK-Calls' SFU inlines every candidate in its offer.
+	// OnRemoteCandidate is fired for every trickle ICE candidate the OK-Calls
+	// server relays, and once per incoming SDP (target=-1) so callers can
+	// extract any candidates carried inline.
 	OnRemoteCandidate func(target int, candidateOrSDP string)
 	ResolveFn         ResolveFunc
 	Status            StatusEmitter
@@ -196,22 +176,16 @@ type MaxHeadlessJoiner struct {
 	wsMu sync.Mutex
 	seq  int
 
-	// sendFn, when non-nil, replaces the ws2 write in send() — used by tests
-	// to capture outgoing commands without a real WebSocket connection.
-	sendFn func(command string, fields map[string]interface{})
+	peerMu          sync.Mutex
+	peerAddr        *maxPeerAddr
+	pendingLocalICE []interface{}
 
-	pc          *webrtc.PeerConnection
-	sampleTrack *webrtc.TrackLocalStaticSample
-	vp8tunnel   *tunnel.VP8DataTunnel
+	pc         *webrtc.PeerConnection
+	dc         *webrtc.DataChannel
+	remoteSet  bool
+	pendingICE []webrtc.ICECandidateInit
 
-	// producerSessionID is the last sessionId we accepted via accept-producer.
-	// A producer-updated notification carrying the same sessionId again is a
-	// duplicate/keepalive and must not re-trigger O/A; a different sessionId
-	// is a new negotiation (mirrors the web client's
-	// `producerSessionId !== e.sessionId` reconnect check).
-	producerSessionID string
-
-	configAck configAckTracker
+	offerOnce sync.Once
 
 	reconnectAttempt atomic.Int32
 	stopCh           chan struct{}
@@ -230,7 +204,10 @@ func NewMaxHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, sta
 	}
 }
 
-func (h *MaxHeadlessJoiner) MarkConfigAcked() { h.configAck.mark() }
+// MarkConfigAcked is a no-op: DC tunnel mode (the only mode MAX supports)
+// never pushes a VP8 config, but the method is kept for interface parity
+// with the VK/Telemost joiners.
+func (h *MaxHeadlessJoiner) MarkConfigAcked() {}
 
 func (h *MaxHeadlessJoiner) RunWithParams(jsonParams string) {
 	var params MaxHeadlessAuthParams
@@ -252,7 +229,7 @@ func (h *MaxHeadlessJoiner) RunWithParams(jsonParams string) {
 			return
 		}
 	}
-	h.logFn("max-joiner: auth params received vp8Fps=%d vp8Batch=%d", params.VP8FPS, params.VP8Batch)
+	h.logFn("max-joiner: auth params received role=%s tunnelMode=%s", params.Role, params.TunnelMode)
 
 	h.Status.EmitStatus(common.StatusConnecting)
 	if err := h.runOnce(); err != nil {
@@ -322,9 +299,9 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	if ws != nil {
 		ws.Close()
 	}
-	if h.vp8tunnel != nil {
-		h.vp8tunnel.Stop()
-		h.vp8tunnel = nil
+	if h.dc != nil {
+		h.dc.Close()
+		h.dc = nil
 	}
 	if h.pc != nil {
 		h.pc.Close()
@@ -334,8 +311,13 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 		h.ctl.Close()
 		h.ctl = nil
 	}
-	h.sampleTrack = nil
-	h.producerSessionID = ""
+	h.remoteSet = false
+	h.pendingICE = nil
+	h.peerMu.Lock()
+	h.peerAddr = nil
+	h.pendingLocalICE = nil
+	h.peerMu.Unlock()
+	h.offerOnce = sync.Once{}
 	h.ci = nil
 	h.selfUID = ""
 	h.selfAltUID = ""
@@ -349,9 +331,6 @@ func (h *MaxHeadlessJoiner) Close() {
 	h.wsMu.Unlock()
 	if ws != nil {
 		ws.Close()
-	}
-	if h.vp8tunnel != nil {
-		h.vp8tunnel.Stop()
 	}
 	if h.pc != nil {
 		h.pc.Close()
@@ -461,7 +440,9 @@ func (h *MaxHeadlessJoiner) joinCall() error {
 	}
 	h.ci = ci
 	// ws2 notifications address participants by their INTERNAL id (the same
-	// value as the endpoint's userId=), not the external one.
+	// value as the endpoint's userId=), not the external one. Track both so
+	// learnPeer can never mistake one of our own ids for the peer's — getting
+	// this wrong makes a peer send its ICE candidates to itself and ICE fails.
 	h.selfUID = fmt.Sprint(ci.ID.Internal)
 	h.selfAltUID = fmt.Sprint(ci.ID.External)
 	h.logFn("max-joiner: joined call self=%s endpoint=%s turn=%v", h.selfUID, ci.Endpoint, ci.Turn.URLs)
@@ -556,15 +537,13 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	// Declare media settings immediately, mirroring vk_joiner (VK Calls == this
 	// OK-Calls stack). The SFU does not begin ICE/media until the client states
 	// its media settings; without this, connectivity checks go unanswered and
-	// ICE fails. isVideoEnabled MUST be true: the tunnel now rides a VP8 video
-	// track through the SFU (an SFU is media-only, it cannot carry a
-	// DataChannel — see MAX_OKCALLS_NOTES.md).
+	// ICE fails. Data-only tunnel, so audio/video/screen are all disabled.
 	h.send("update-media-modifiers", map[string]interface{}{
 		"mediaModifiers": map[string]interface{}{"denoise": true, "denoiseAnn": true},
 	})
 	h.send("change-media-settings", map[string]interface{}{
 		"mediaSettings": map[string]interface{}{
-			"isAudioEnabled": false, "isVideoEnabled": true,
+			"isAudioEnabled": false, "isVideoEnabled": false,
 			"isScreenSharingEnabled": false, "isFastScreenSharingEnabled": false,
 			"isAudioSharingEnabled": false, "isAnimojiEnabled": false,
 		},
@@ -577,22 +556,34 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	// CreatePermission with "403 Forbidden IP". handleConnection overrides the
 	// ICE servers and then calls initPC — same order as vk_joiner.go.
 
+	if h.params.Role == maxRoleOfferer {
+		go func() {
+			select {
+			case <-time.After(3 * time.Second):
+				h.maybeSendOffer()
+			case <-h.stopCh:
+			}
+		}()
+	}
+
 	h.readLoop()
 	return nil
 }
 
+// initPC mirrors vk_joiner.go's DC-mode PC setup, but uses a NON-negotiated
+// DataChannel (offerer creates "tunnel", answerer waits on OnDataChannel) —
+// this matches the proven okcalls_peer.py PoC. VK's negotiated id=2 approach
+// is unproven on the OK-Calls SFU and must not be used here.
 // handleConnection processes the ws2 "connection" notification, which is the
 // authoritative source of this session's ICE servers: conversationParams.turn
 // carries time-and-user-bound credentials ("<expiry>:<userId>") that differ
 // from the ones op166's CallInfo returned. Building the PeerConnection with
 // the stale CallInfo pair makes TURN reject CreatePermission with "403
-// Forbidden IP", so ICE can never leave checking. Mirrors vk_joiner.go: adopt
-// the credentials, then build the PC, then kick off the SFU's producer/
-// consumer allocation with allocate-consumer.
+// Forbidden IP", so ICE can never leave checking. Mirrors vk_joiner.go:
+// adopt the credentials, then build the PC.
 func (h *MaxHeadlessJoiner) handleConnection(m map[string]interface{}) {
-	topology := ""
 	if conv, ok := m["conversation"].(map[string]interface{}); ok {
-		topology, _ = conv["topology"].(string)
+		// DIRECT is the peer-to-peer topology this transport relies on.
 		h.logFn("max-joiner: <- connection topology=%v state=%v", conv["topology"], conv["state"])
 	}
 
@@ -615,28 +606,7 @@ func (h *MaxHeadlessJoiner) handleConnection(m map[string]interface{}) {
 
 	if h.pc == nil {
 		h.initPC()
-		// A 2-party call starts in DIRECT (peer-to-peer) topology, where the
-		// server is NOT a media relay — so it never produces anything for us to
-		// consume and no producer-updated ever arrives. Ask it to switch to
-		// SERVER, which is both the only topology whose producer/consumer flow
-		// we can drive and the only one we want: under a censor's allowlist just
-		// the MAX/OK servers are reachable, never the peer. The web client does
-		// exactly this as its p2p fallback ("Unable to switch topology DIRECT to
-		// SERVER"): switchTopology(topology, force) -> {topology, force}.
-		if topology != maxTopologyServer {
-			h.sendSwitchTopology()
-		}
-		h.sendAllocateConsumer()
 	}
-}
-
-// sendSwitchTopology asks the conversation to move to SERVER (SFU) topology.
-func (h *MaxHeadlessJoiner) sendSwitchTopology() {
-	h.send("switch-topology", map[string]interface{}{
-		"topology": maxTopologyServer,
-		"force":    true,
-	})
-	h.logFn("max-joiner: -> switch-topology %s (force)", maxTopologyServer)
 }
 
 // toStringSlice converts a decoded JSON array into []string, skipping non-strings.
@@ -654,13 +624,6 @@ func toStringSlice(v interface{}) []string {
 	return out
 }
 
-// initPC builds the single PeerConnection used for the whole SFU session:
-// MAX/OK-Calls is a media-only SFU (mediasoup-style), the SFU is always the
-// OFFERER, and the client is always the answerer — there is no peer
-// offerer/answerer role any more. Tunnel bytes ride a VP8 media track
-// (AddTracks/ReadTrackFn), mirroring telemost_joiner.go's video mode and
-// vk_joiner.go's "video" TunnelMode branch. There is no DataChannel: an SFU
-// cannot carry SCTP.
 func (h *MaxHeadlessJoiner) initPC() {
 	var iceServers []webrtc.ICEServer
 	if len(h.ci.Stun.URLs) > 0 {
@@ -676,13 +639,22 @@ func (h *MaxHeadlessJoiner) initPC() {
 
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.DisableCloseByDTLS(true)
-	// No DetachDataChannels(): there is no DataChannel any more.
+	settingEngine.DetachDataChannels()
 	if h.PCConfig != nil {
 		h.PCConfig.ConfigureSettingEngine(&settingEngine)
 	}
 
+	// Relay-only ICE. This is what the real client does in whitelist/restricted
+	// mode: its SDK exposes forceRelayPolicy, which sets
+	// iceTransportPolicy:"relay" (web bundle: `iceTransportPolicy: forceRelayPolicy
+	// ? "relay" : "all"`). In DIRECT (peer-to-peer) topology that routes ALL media
+	// through OK's own TURN servers instead of the peer's address — which is both
+	// what a censor's allowlist permits (only MAX/OK IPs are reachable) and what
+	// makes ICE work here: host/srflx pairs against the peer are exactly what the
+	// TURN server refuses with "CreatePermission 403 Forbidden IP".
 	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(webrtc.Configuration{
-		ICEServers: iceServers,
+		ICEServers:         iceServers,
+		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
 	})
 	if err != nil {
 		h.logFn("max-joiner: failed to create PC: %v", err)
@@ -690,227 +662,107 @@ func (h *MaxHeadlessJoiner) initPC() {
 	}
 	h.pc = pc
 
-	h.sampleTrack = h.AddTracks(pc, h.logFn, "max-joiner")
+	h.logFn("max-joiner: role=%s tunnelMode=%s", h.params.Role, h.params.TunnelMode)
 
-	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		h.logFn("max-joiner: remote track: codec=%s ssrc=%d", track.Codec().MimeType, track.SSRC())
-		go h.ReadTrackFn(track, func(frame []byte) {
-			if h.vp8tunnel != nil {
-				h.vp8tunnel.HandleFrame(frame)
+	if h.params.Role == maxRoleOfferer {
+		dc, err := pc.CreateDataChannel("tunnel", nil)
+		if err != nil {
+			h.logFn("max-joiner: warning: could not create tunnel DC: %v", err)
+		} else {
+			h.onTunnelDC(dc)
+		}
+	} else {
+		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			h.logFn("max-joiner: remote DataChannel: label=%q id=%v", dc.Label(), dc.ID())
+			if dc.Label() == "tunnel" {
+				h.onTunnelDC(dc)
 			}
-		}, h.logFn, "max-joiner")
-	})
+		})
+	}
 
+	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		h.onLocalICECandidate(candidate)
+	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		h.logFn("max-joiner: PC state: %s", state.String())
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
 			h.logFn("max-joiner: PC %s, closing transport to trigger reconnect", state.String())
 			h.closeTransport()
+		}
+	})
+
+	h.logFn("max-joiner: PC ready, role=%s", h.params.Role)
+}
+
+func (h *MaxHeadlessJoiner) onTunnelDC(dc *webrtc.DataChannel) {
+	h.dc = dc
+	dc.OnOpen(func() {
+		h.logFn("max-joiner: tunnel DC open")
+		h.reconnectAttempt.Store(0)
+		h.logFn("max-joiner: === DC TUNNEL CONNECTED ===")
+		h.Status.EmitStatus(common.StatusTunnelConnected)
+		if h.OnConnected != nil {
+			h.OnConnected(tunnel.NewDCTunnel(dc, h.obf, common.RTPBufSize, h.logFn))
+		}
+	})
+	dc.OnClose(func() {
+		h.logFn("max-joiner: tunnel DC closed")
+	})
+}
+
+func (h *MaxHeadlessJoiner) onLocalICECandidate(candidate *webrtc.ICECandidate) {
+	candidateJSON := candidate.ToJSON()
+	raw, _ := json.Marshal(candidateJSON)
+	var parsed interface{}
+	json.Unmarshal(raw, &parsed)
+
+	// Trickle every local candidate to the SFU, mirroring the proven vk_joiner
+	// (VK Calls runs on this same OK-Calls stack): OK-Calls terminates ICE at
+	// the server, and the server needs our candidates to run connectivity
+	// checks toward us. Buffer until the peer/SFU address is learned, then flush.
+	h.peerMu.Lock()
+	addr := h.peerAddr
+	if addr == nil {
+		h.pendingLocalICE = append(h.pendingLocalICE, parsed)
+		h.peerMu.Unlock()
+		h.logFn("max-joiner: local ICE candidate buffered (peer unknown): %s", candidate.Typ)
+		return
+	}
+	h.peerMu.Unlock()
+	h.logFn("max-joiner: -> local ICE candidate (%s)", candidate.Typ)
+	h.sendTransmitData(addr, map[string]interface{}{"candidate": parsed})
+}
+
+// maybeSendOffer sends the initial offer exactly once, and only once the
+// peer's participantId has been learned (or, as a last resort, derived from
+// CallInfo.PeerID). Guarded by offerOnce so concurrent triggers (the 3s
+// timer, learnPeer, and participant-joined/registered-peer notifications)
+// only produce a single offer per session.
+func (h *MaxHeadlessJoiner) maybeSendOffer() {
+	if h.params == nil || h.params.Role != maxRoleOfferer {
+		return
+	}
+	h.peerMu.Lock()
+	addr := h.peerAddr
+	h.peerMu.Unlock()
+	if addr == nil {
+		if h.ci != nil && h.ci.PeerID != nil {
+			addr = &maxPeerAddr{ParticipantID: fmt.Sprint(h.ci.PeerID), ParticipantType: "USER", DeviceIdx: 0}
+		} else {
 			return
 		}
-		if state == webrtc.PeerConnectionStateConnected && h.vp8tunnel == nil {
-			h.reconnectAttempt.Store(0)
-			h.logFn("max-joiner: === VP8 TUNNEL CONNECTED ===")
-			h.Status.EmitStatus(common.StatusTunnelConnected)
-			h.vp8tunnel = tunnel.NewVP8DataTunnel(h.sampleTrack, h.obf, h.logFn)
-			vp8tun := h.vp8tunnel
-			vp8tun.Start(h.params.VP8FPS, h.params.VP8Batch)
-			if !h.configAck.acknowledged() {
-				acked, cancel := h.configAck.arm()
-				go sendVP8ConfigUntilAcked(acked, cancel, h.stopCh, vp8tun,
-					vp8tun.FPS(), vp8tun.Batch(), 1, h.logFn, "max-joiner")
-				h.logFn("max-joiner: pushed vp8 config to creator fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
-			}
-			if h.OnConnected != nil {
-				h.OnConnected(vp8tun)
-			}
-		}
-	})
-
-	h.logFn("max-joiner: PC ready with %d ICE servers, waiting for SFU producer offer", len(iceServers))
-}
-
-// sendAllocateConsumer sets up the receive side of the SFU session. The web
-// client's allocateConsumer(desc, capabilities) sends
-// {capabilities, description: desc?.sdp} — on the very first call desc is
-// null, and JSON.stringify drops the resulting undefined "description" key
-// entirely, so the wire payload is just {"capabilities": ...} (see
-// MAX_OKCALLS_NOTES.md).
-//
-// "capabilities" is a STRUCTURED feature descriptor, not the hex bitmask used
-// in the ws2 URL/internalParams — sending the hex string gets
-// {"error":"invalid-request","message":"Invalid message format"}. The exact
-// shape below is taken from the web client's capabilities getter (web.max.ru
-// bundle: `function t(){return{estimatedPerformanceIndex:...,transparentAudio:...}}`).
-// We advertise a single video track (our VP8 tunnel) and disable everything we
-// do not implement (screen share, simulcast, audio share, animoji, ASR).
-func (h *MaxHeadlessJoiner) sfuCapabilities() map[string]interface{} {
-	return map[string]interface{}{
-		"estimatedPerformanceIndex": 1,
-		"audioMix":                  true,
-		"consumerUpdate":            true,
-		// DataChannel protocol versions the SFU negotiates for its own control
-		// channels; mirror the web client's values verbatim.
-		"producerNotificationDataChannelVersion": 8,
-		"producerCommandDataChannelVersion":      3,
-		"consumerScreenDataChannelVersion":       1,
-		"producerScreenDataChannelVersion":       1,
-		"asrDataChannelVersion":                  0,
-		"animojiDataChannelVersion":              1,
-		"animojiBackendRender":                   false,
-		"onDemandTracks":                         true,
-		"unifiedPlan":                            true,
-		"singleSession":                          true,
-		"videoTracksCount":                       1,
-		"red":                                    true,
-		"audioShare":                             false,
-		"fastScreenShare":                        false,
-		"videoSuspend":                           false,
-		"simulcast":                              false,
-		"simulcastNativeOrder":                   true,
-		"consumerFastScreenShare":                false,
-		"consumerFastScreenShareQualityOnDemand": false,
-		"transparentAudio":                       false,
 	}
-}
-
-func (h *MaxHeadlessJoiner) sendAllocateConsumer() {
-	h.send("allocate-consumer", map[string]interface{}{
-		"capabilities": h.sfuCapabilities(),
-	})
-	h.logFn("max-joiner: -> allocate-consumer (structured capabilities)")
-}
-
-// parseSFUDescription decodes a producer-updated notification's "description"
-// field. GUESS (per spec): it may arrive as a raw SDP string or as a
-// {type, sdp} object; either way it is the SFU's SDP OFFER (the SFU is always
-// the offerer for producer negotiation) unless an explicit "type" says
-// otherwise.
-func parseSFUDescription(raw interface{}) (webrtc.SessionDescription, bool) {
-	switch v := raw.(type) {
-	case string:
-		if v == "" {
-			return webrtc.SessionDescription{}, false
-		}
-		return webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: v}, true
-	case map[string]interface{}:
-		sdpStr, _ := v["sdp"].(string)
-		if sdpStr == "" {
-			return webrtc.SessionDescription{}, false
-		}
-		sdpType := webrtc.SDPTypeOffer
-		if typeStr, ok := v["type"].(string); ok && typeStr != "" {
-			if t := webrtc.NewSDPType(typeStr); t != webrtc.SDPTypeUnknown {
-				sdpType = t
-			}
-		}
-		return webrtc.SessionDescription{Type: sdpType, SDP: sdpStr}, true
-	default:
-		return webrtc.SessionDescription{}, false
-	}
-}
-
-// extractSSRCs pulls every distinct SSRC advertised in an SDP's "a=ssrc:<id>
-// ..." attribute lines, in first-seen order, as decimal strings. Mirrors the
-// web client's `Object.keys(ssrcMap)` for acceptProducer's "ssrcs" field (see
-// MAX_OKCALLS_NOTES.md) — GUESS: deriving from our own answer SDP rather than
-// from the sender's RTCRtpSender parameters, which pion does not expose as
-// directly; VERIFY LIVE that the SFU accepts SSRCs sourced this way.
-func extractSSRCs(sdp string) []string {
-	seen := make(map[string]bool)
-	var out []string
-	for _, line := range strings.Split(sdp, "\n") {
-		line = strings.TrimRight(line, "\r")
-		if !strings.HasPrefix(line, "a=ssrc:") {
-			continue
-		}
-		rest := strings.TrimPrefix(line, "a=ssrc:")
-		id := rest
-		if i := strings.IndexByte(rest, ' '); i >= 0 {
-			id = rest[:i]
-		}
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, id)
-	}
-	return out
-}
-
-// gatheredLocalDescription blocks until ICE gathering finishes and returns the
-// local description with every candidate inlined in the SDP (non-trickle).
-// Falls back to the ungathered description if gathering stalls.
-func (h *MaxHeadlessJoiner) gatheredLocalDescription(fallback webrtc.SessionDescription) webrtc.SessionDescription {
-	select {
-	case <-webrtc.GatheringCompletePromise(h.pc):
-		if ld := h.pc.LocalDescription(); ld != nil {
-			h.logFn("max-joiner: ICE gathering complete, sending full SDP")
-			return *ld
-		}
-	case <-time.After(15 * time.Second):
-		h.logFn("max-joiner: ICE gathering timed out, sending SDP as-is")
-	case <-h.stopCh:
-	}
-	return fallback
-}
-
-// handleProducerUpdated implements the SFU's producer/consumer offer-answer:
-// the SFU sends its SDP offer (asking us to send our VP8 tunnel track), we
-// answer, then push the answer back as accept-producer along with the SSRCs
-// of what we're sending. A repeated sessionId is a duplicate/keepalive
-// notification, not a new negotiation, and is ignored (mirrors the web
-// client's `producerSessionId !== e.sessionId` reconnect check — see spec).
-func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
-	if h.pc == nil {
-		h.logFn("max-joiner: producer-updated but PC not ready, ignoring")
-		return
-	}
-	sessionID := fmt.Sprint(m["sessionId"])
-	if sessionID != "" && sessionID == h.producerSessionID {
-		h.logFn("max-joiner: producer-updated duplicate sessionId=%s, ignoring", sessionID)
-		return
-	}
-	desc, ok := parseSFUDescription(m["description"])
-	if !ok {
-		h.logFn("max-joiner: producer-updated missing/unparseable description")
-		return
-	}
-	if h.OnRemoteCandidate != nil {
-		h.OnRemoteCandidate(-1, desc.SDP)
-	}
-	h.logFn("max-joiner: <- producer-updated sessionId=%s [%s]", sessionID, sdpUfragSummary(desc.SDP))
-	if os.Getenv("MAX_SDP_DEBUG") != "" {
-		h.logFn("max-joiner: SFU OFFER SDP:\n%s", desc.SDP)
-	}
-
-	if err := h.pc.SetRemoteDescription(desc); err != nil {
-		h.logFn("max-joiner: set remote description (producer offer) failed: %v", err)
-		return
-	}
-	answer, err := h.pc.CreateAnswer(nil)
-	if err != nil {
-		h.logFn("max-joiner: create answer failed: %v", err)
-		return
-	}
-	if err := h.pc.SetLocalDescription(answer); err != nil {
-		h.logFn("max-joiner: set local description failed: %v", err)
-		return
-	}
-
-	final := h.gatheredLocalDescription(answer)
-	ssrcs := extractSSRCs(final.SDP)
-	h.producerSessionID = sessionID
-	h.logFn("max-joiner: -> accept-producer sessionId=%s ssrcs=%v [%s]", sessionID, ssrcs, sdpUfragSummary(final.SDP))
-	h.send("accept-producer", map[string]interface{}{
-		"description": final.SDP,
-		"sessionId":   m["sessionId"],
-		"ssrcs":       ssrcs,
+	h.offerOnce.Do(func() {
+		h.sendOffer(addr)
 	})
 }
 
 // sdpUfragSummary reports an SDP's session ice-ufrag and the distinct "ufrag"
-// attributes on its candidate lines, for diagnostic logging.
+// attributes on its candidate lines. They must match: a peer's ICE agent drops
+// every candidate whose ufrag differs from the session's.
 func sdpUfragSummary(sdp string) string {
 	sess := "?"
 	seen := map[string]int{}
@@ -934,23 +786,78 @@ func sdpUfragSummary(sdp string) string {
 	return fmt.Sprintf("sessUfrag=%s candUfrags=%v", sess, seen)
 }
 
+// gatheredLocalDescription blocks until ICE gathering finishes and returns the
+// local description with every candidate inlined in the SDP (non-trickle).
+//
+// OK-Calls does NOT reliably relay standalone trickle candidates: a
+// transmit-data carrying only {"candidate":...} has no sdp object and so no
+// p2pRelay marker, and peers observably receive few or none of them. The proven
+// reference implementation (aiortc) is non-trickle and puts all candidates in
+// the offer/answer, so we do the same. Falls back to the ungathered description
+// if gathering stalls.
+func (h *MaxHeadlessJoiner) gatheredLocalDescription(fallback webrtc.SessionDescription) webrtc.SessionDescription {
+	select {
+	case <-webrtc.GatheringCompletePromise(h.pc):
+		if ld := h.pc.LocalDescription(); ld != nil {
+			h.logFn("max-joiner: ICE gathering complete, sending full SDP")
+			return *ld
+		}
+	case <-time.After(15 * time.Second):
+		h.logFn("max-joiner: ICE gathering timed out, sending SDP as-is")
+	case <-h.stopCh:
+	}
+	return fallback
+}
+
+func (h *MaxHeadlessJoiner) sendOffer(addr *maxPeerAddr) {
+	if h.pc == nil {
+		return
+	}
+	offer, err := h.pc.CreateOffer(nil)
+	if err != nil {
+		h.logFn("max-joiner: create offer failed: %v", err)
+		return
+	}
+	if err := h.pc.SetLocalDescription(offer); err != nil {
+		h.logFn("max-joiner: set local description failed: %v", err)
+		return
+	}
+	offer = h.gatheredLocalDescription(offer)
+	h.sendTransmitData(addr, map[string]interface{}{
+		"sdp": map[string]interface{}{
+			"type": "offer",
+			"sdp":  offer.SDP,
+		},
+		"label": "call",
+	})
+	h.logFn("max-joiner: sent OFFER [%s]", sdpUfragSummary(offer.SDP))
+}
+
 // send is the generic ws2 command sender: {"command":cmd,"sequence":n, ...fields}.
 func (h *MaxHeadlessJoiner) send(command string, fields map[string]interface{}) {
 	h.wsMu.Lock()
 	defer h.wsMu.Unlock()
-	if h.sendFn == nil && h.ws == nil {
+	if h.ws == nil {
 		return
 	}
 	h.seq++
 	fields["command"] = command
 	fields["sequence"] = h.seq
-	if h.sendFn != nil {
-		h.sendFn(command, fields)
-		return
-	}
 	if err := h.ws.WriteJSON(fields); err != nil {
 		h.logFn("max-joiner: ws write failed: %v", err)
 	}
+}
+
+// sendTransmitData mirrors okcalls_peer.py Peer.transmit: the participantId/
+// participantType/deviceIdx fields address a specific peer, "data" carries
+// the SDP or candidate payload.
+func (h *MaxHeadlessJoiner) sendTransmitData(addr *maxPeerAddr, data map[string]interface{}) {
+	h.send("transmit-data", map[string]interface{}{
+		"participantId":   addr.ParticipantID,
+		"participantType": addr.ParticipantType,
+		"deviceIdx":       addr.DeviceIdx,
+		"data":            data,
+	})
 }
 
 func (h *MaxHeadlessJoiner) readLoop() {
@@ -971,15 +878,15 @@ func (h *MaxHeadlessJoiner) readLoop() {
 	}
 }
 
-// handleMessage dispatches ws2 notifications. Unlike the old peer-transport
-// design, there is no more per-peer address to learn (learnPeer/peerAddr are
-// gone): every notification is either about the SFU session itself
-// (connection, producer-updated, consumer-answered, topology-changed) or is
-// informational.
+// handleMessage mirrors okcalls_peer.py Peer.reader/learn_peer exactly:
+// learn the sender's participantId from EVERY notification (including
+// transmitted-data — the answerer needs it to address the answer back to
+// the offerer), then dispatch.
 func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
 	// UseNumber so a peer's 16-digit internal participantId keeps its exact
 	// integer form: a plain interface{} decode yields float64, and fmt.Sprint
-	// of that renders scientific notation ("1.125...e+15").
+	// of that renders scientific notation ("1.125...e+15"), which the server
+	// rejects as "invalid-request" when it comes back in a transmit-data.
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var m map[string]interface{}
@@ -997,31 +904,153 @@ func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
 		return
 	}
 
+	h.learnPeer(m)
+
 	switch notif {
+	case "transmitted-data":
+		if data, ok := m["data"].(map[string]interface{}); ok {
+			h.onTransmittedData(data)
+		}
+	case "participant-joined", "registered-peer":
+		pid := m["participantId"]
+		if pid == nil {
+			if data, ok := m["data"].(map[string]interface{}); ok {
+				pid = data["participantId"]
+			}
+		}
+		h.logFn("max-joiner: <- %s participantId=%v", notif, pid)
+		h.maybeSendOffer()
 	case "connection":
 		h.handleConnection(m)
-	case "producer-updated":
-		h.handleProducerUpdated(m)
-	case "consumer-answered":
-		// Confirms our allocate-consumer; nothing else to do.
-		h.logFn("max-joiner: <- consumer-answered sessionId=%v", m["sessionId"])
-	case "topology-changed":
-		// Unlike VK (which forces a reconnect off-DIRECT), we WANT the SFU's
-		// server topology here — do not force-close. A 2-party call runs in
-		// DIRECT, where the server relays no media and never produces anything;
-		// it flips to SERVER on its own once a third participant joins. The
-		// allocate-consumer we sent while still in DIRECT does not carry over,
-		// so re-allocate now that an SFU actually exists — otherwise no
-		// producer-updated ever arrives.
-		topo, _ := m["topology"].(string)
-		h.logFn("max-joiner: <- topology-changed topology=%v", m["topology"])
-		if topo == maxTopologyServer {
-			h.logFn("max-joiner: SERVER topology active, re-allocating consumer")
-			h.sendAllocateConsumer()
-		}
 	case "settings-update":
 		h.logFn("max-joiner: <- %s", notif)
 	default:
 		h.logFn("max-joiner: <- notification %s", notif)
+	}
+}
+
+// learnPeer scans the top-level participantId and, if present, the nested
+// data.participantId — the first non-empty value that isn't our own uid
+// becomes the peer address. Matches okcalls_peer.py Peer.learn_peer exactly,
+// including that a data.participantId overrides a top-level one when both
+// are present (data is inspected after m, so it wins on overwrite).
+func (h *MaxHeadlessJoiner) learnPeer(m map[string]interface{}) {
+	sources := []map[string]interface{}{m}
+	if data, ok := m["data"].(map[string]interface{}); ok {
+		sources = append(sources, data)
+	}
+	for _, src := range sources {
+		v, ok := src["participantId"]
+		if !ok || v == nil {
+			continue
+		}
+		s := fmt.Sprint(v)
+		if s == "" || s == h.selfUID || s == h.selfAltUID {
+			continue
+		}
+		h.setPeerAddr(&maxPeerAddr{ParticipantID: s, ParticipantType: "USER", DeviceIdx: 0})
+	}
+}
+
+func (h *MaxHeadlessJoiner) setPeerAddr(addr *maxPeerAddr) {
+	h.peerMu.Lock()
+	h.peerAddr = addr
+	pending := h.pendingLocalICE
+	h.pendingLocalICE = nil
+	h.peerMu.Unlock()
+
+	for _, cand := range pending {
+		h.sendTransmitData(addr, map[string]interface{}{"candidate": cand})
+	}
+
+	if h.params != nil && h.params.Role == maxRoleOfferer {
+		h.maybeSendOffer()
+	}
+}
+
+// onTransmittedData mirrors vk_joiner.go's onTransmittedData / okcalls_peer.py
+// handle_transmitted: candidate and sdp payloads, offerer receives "answer",
+// answerer receives "offer" and replies with its own "answer".
+func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
+	if h.pc == nil {
+		return
+	}
+
+	if candidate, ok := data["candidate"]; ok {
+		// These standalone candidates are the SERVER's (OK-Calls terminates ICE
+		// itself: it rewrites the relayed SDP to its own ice-ufrag/pwd and then
+		// trickles the SFU's own candidates, which carry that same ufrag). They
+		// are essential — ICE/DTLS runs client<->SFU, not peer-to-peer — so
+		// apply them once the (server-rewritten) remote description is set,
+		// buffering until then.
+		candidateJSON, _ := json.Marshal(candidate)
+		var candidateInit webrtc.ICECandidateInit
+		if err := json.Unmarshal(candidateJSON, &candidateInit); err == nil {
+			if h.OnRemoteCandidate != nil {
+				h.OnRemoteCandidate(0, candidateInit.Candidate)
+			}
+			if h.remoteSet {
+				h.logFn("max-joiner: <- server ICE candidate")
+				h.pc.AddICECandidate(candidateInit)
+			} else {
+				h.pendingICE = append(h.pendingICE, candidateInit)
+				h.logFn("max-joiner: server ICE candidate buffered (no remote desc yet)")
+			}
+		}
+	}
+
+	sdp, ok := data["sdp"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	sdpType, _ := sdp["type"].(string)
+	sdpStr, _ := sdp["sdp"].(string)
+	if h.OnRemoteCandidate != nil {
+		h.OnRemoteCandidate(-1, sdpStr)
+	}
+	h.logFn("max-joiner: remote SDP: %s [%s]", sdpType, sdpUfragSummary(sdpStr))
+
+	switch sdpType {
+	case "answer":
+		h.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdpStr})
+		h.remoteSet = true
+		for _, candidate := range h.pendingICE {
+			h.pc.AddICECandidate(candidate)
+		}
+		h.pendingICE = nil
+
+	case "offer":
+		h.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdpStr})
+		h.remoteSet = true
+		for _, candidate := range h.pendingICE {
+			h.pc.AddICECandidate(candidate)
+		}
+		h.pendingICE = nil
+
+		answer, err := h.pc.CreateAnswer(nil)
+		if err != nil {
+			h.logFn("max-joiner: create answer failed: %v", err)
+			return
+		}
+		if err := h.pc.SetLocalDescription(answer); err != nil {
+			h.logFn("max-joiner: set local description failed: %v", err)
+			return
+		}
+		answer = h.gatheredLocalDescription(answer)
+		h.peerMu.Lock()
+		addr := h.peerAddr
+		h.peerMu.Unlock()
+		if addr == nil {
+			h.logFn("max-joiner: cannot send answer, peer not learned yet")
+			return
+		}
+		h.sendTransmitData(addr, map[string]interface{}{
+			"sdp": map[string]interface{}{
+				"type": "answer",
+				"sdp":  answer.SDP,
+			},
+			"label": "call",
+		})
+		h.logFn("max-joiner: sent ANSWER [%s]", sdpUfragSummary(answer.SDP))
 	}
 }

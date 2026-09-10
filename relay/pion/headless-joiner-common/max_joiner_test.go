@@ -1,7 +1,6 @@
 package joiner
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
@@ -138,134 +137,62 @@ func TestBuildWSURL(t *testing.T) {
 	}
 }
 
-// TestExtractSSRCs covers the "ssrcs" derivation for accept-producer: unique
-// a=ssrc:<id> values, in first-seen order, as decimal strings.
-func TestExtractSSRCs(t *testing.T) {
-	sdp := "v=0\r\n" +
-		"m=video 9 UDP/TLS/RTP/SAVPF 96\r\n" +
-		"a=ssrc:1111 cname:abc\r\n" +
-		"a=ssrc:1111 msid:x y\r\n" +
-		"a=ssrc:2222 cname:abc\r\n"
-	got := extractSSRCs(sdp)
-	want := []string{"1111", "2222"}
-	if len(got) != len(want) {
-		t.Fatalf("extractSSRCs() = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("extractSSRCs() = %v, want %v", got, want)
-		}
-	}
-}
-
-// TestParseSFUDescription covers both shapes the spec says producer-updated's
-// "description" field may arrive as: a raw SDP string, or a {type,sdp} object.
-func TestParseSFUDescription(t *testing.T) {
-	desc, ok := parseSFUDescription("v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\n")
-	if !ok || desc.Type != webrtc.SDPTypeOffer || desc.SDP == "" {
-		t.Fatalf("parseSFUDescription(string) = %+v, ok=%v, want offer with non-empty SDP", desc, ok)
-	}
-
-	desc2, ok2 := parseSFUDescription(map[string]interface{}{"type": "offer", "sdp": "v=0\r\n"})
-	if !ok2 || desc2.Type != webrtc.SDPTypeOffer || desc2.SDP != "v=0\r\n" {
-		t.Fatalf("parseSFUDescription(object) = %+v, ok=%v, want offer with sdp=%q", desc2, ok2, "v=0\r\n")
-	}
-
-	if _, ok3 := parseSFUDescription(nil); ok3 {
-		t.Fatalf("parseSFUDescription(nil) should fail")
-	}
-	if _, ok4 := parseSFUDescription(map[string]interface{}{}); ok4 {
-		t.Fatalf("parseSFUDescription({}) should fail (no sdp)")
-	}
-}
-
-// TestHandleProducerUpdatedSendsAcceptProducer exercises the real
-// SFU-negotiation path end to end against real (loopback) pion
-// PeerConnections: a synthetic "SFU" PC creates an offer asking to receive
-// video (mirroring the SFU's producer-updated offer), and our joiner's
-// handleProducerUpdated answers it and emits accept-producer with the
-// sessionId and SSRCs of what we're sending. Uses a stubbed send (h.sendFn)
-// to capture the outgoing command without a real WebSocket.
-func TestHandleProducerUpdatedSendsAcceptProducer(t *testing.T) {
-	sfuPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
-	if err != nil {
-		t.Fatalf("sfu PC: %v", err)
-	}
-	defer sfuPC.Close()
-	if _, err := sfuPC.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
-	}); err != nil {
-		t.Fatalf("add transceiver: %v", err)
-	}
-	sfuOffer, err := sfuPC.CreateOffer(nil)
-	if err != nil {
-		t.Fatalf("sfu create offer: %v", err)
-	}
-	if err := sfuPC.SetLocalDescription(sfuOffer); err != nil {
-		t.Fatalf("sfu set local: %v", err)
-	}
-	<-webrtc.GatheringCompletePromise(sfuPC)
-	offerSDP := sfuPC.LocalDescription().SDP
-
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
-	if err != nil {
-		t.Fatalf("client PC: %v", err)
-	}
-	defer pc.Close()
-	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000}, "video", "max-joiner")
-	if err != nil {
-		t.Fatalf("new track: %v", err)
-	}
-	if _, err := pc.AddTrack(track); err != nil {
-		t.Fatalf("add track: %v", err)
-	}
-
-	type sentCmd struct {
-		command string
-		fields  map[string]interface{}
-	}
-	var sent []sentCmd
-
-	h := &MaxHeadlessJoiner{
-		logFn:  func(string, ...any) {},
-		stopCh: make(chan struct{}),
-		pc:     pc,
-		sendFn: func(command string, fields map[string]interface{}) {
-			sent = append(sent, sentCmd{command, fields})
+// TestLearnPeer matches okcalls_peer.py Peer.learn_peer: scan top-level then
+// data.participantId, skip our own uid, and let data.participantId win when
+// both are present (it's inspected after the top-level field).
+func TestLearnPeer(t *testing.T) {
+	h := &MaxHeadlessJoiner{selfUID: "100"}
+	msg := map[string]interface{}{
+		"notification":  "transmitted-data",
+		"participantId": "200",
+		"data": map[string]interface{}{
+			"participantId": "300",
 		},
 	}
+	h.learnPeer(msg)
 
-	h.handleProducerUpdated(map[string]interface{}{
-		"description": offerSDP,
-		"sessionId":   "sess-1",
-	})
+	h.peerMu.Lock()
+	addr := h.peerAddr
+	h.peerMu.Unlock()
+	if addr == nil || addr.ParticipantID != "300" {
+		t.Fatalf("learnPeer: got %+v, want data.participantId (300) to win", addr)
+	}
+	if addr.ParticipantType != "USER" || addr.DeviceIdx != 0 {
+		t.Errorf("learnPeer: got %+v, want participantType=USER deviceIdx=0", addr)
+	}
+}
 
-	if len(sent) != 1 || sent[0].command != "accept-producer" {
-		t.Fatalf("expected exactly one accept-producer send, got %+v", sent)
-	}
-	fields := sent[0].fields
-	if got := fmt.Sprint(fields["sessionId"]); got != "sess-1" {
-		t.Errorf("sessionId = %v, want sess-1", fields["sessionId"])
-	}
-	ssrcs, _ := fields["ssrcs"].([]string)
-	if len(ssrcs) == 0 {
-		t.Errorf("ssrcs empty, want at least one derived from the answer SDP")
-	}
-	descSDP, ok := fields["description"].(string)
-	if !ok || descSDP == "" {
-		t.Errorf("description missing/empty: %+v", fields["description"])
-	}
-	if h.producerSessionID != "sess-1" {
-		t.Errorf("producerSessionID = %q, want sess-1", h.producerSessionID)
-	}
+func TestLearnPeerIgnoresSelf(t *testing.T) {
+	h := &MaxHeadlessJoiner{selfUID: "100"}
+	h.learnPeer(map[string]interface{}{"participantId": "100"})
 
-	// A repeated producer-updated with the same sessionId is a
-	// duplicate/keepalive, not a new negotiation, and must not re-send.
-	h.handleProducerUpdated(map[string]interface{}{
-		"description": offerSDP,
-		"sessionId":   "sess-1",
-	})
-	if len(sent) != 1 {
-		t.Fatalf("duplicate sessionId should not re-send accept-producer, got %d sends", len(sent))
+	h.peerMu.Lock()
+	defer h.peerMu.Unlock()
+	if h.peerAddr != nil {
+		t.Fatalf("learnPeer: should not learn our own uid, got %+v", h.peerAddr)
+	}
+}
+
+// TestOnLocalICECandidateBuffersUntilPeerKnown covers the ICE-buffering rule:
+// local candidates gathered before the peer is learned must be queued, then
+// flushed (as individual transmit-data sends) once setPeerAddr runs.
+func TestOnLocalICECandidateBuffersUntilPeerKnown(t *testing.T) {
+	h := &MaxHeadlessJoiner{selfUID: "100"}
+
+	h.peerMu.Lock()
+	h.pendingLocalICE = append(h.pendingLocalICE, "cand-1")
+	h.peerMu.Unlock()
+
+	// No ws connected, so sendTransmitData -> send is a no-op, but setPeerAddr
+	// must still drain pendingLocalICE and leave peerAddr set.
+	h.setPeerAddr(&maxPeerAddr{ParticipantID: "999", ParticipantType: "USER", DeviceIdx: 0})
+
+	h.peerMu.Lock()
+	defer h.peerMu.Unlock()
+	if h.peerAddr == nil || h.peerAddr.ParticipantID != "999" {
+		t.Fatalf("setPeerAddr: peerAddr = %+v, want participantId=999", h.peerAddr)
+	}
+	if len(h.pendingLocalICE) != 0 {
+		t.Fatalf("setPeerAddr: pendingLocalICE not drained, got %v", h.pendingLocalICE)
 	}
 }

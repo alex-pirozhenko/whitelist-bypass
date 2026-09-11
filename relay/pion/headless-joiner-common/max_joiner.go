@@ -806,15 +806,44 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 		return
 	}
 
-	// CLAUDE-VERIFY (the crux of making SFU media flow): after SetRemoteDescription
-	// the SFU's offer bundles 5 m-lines and our VP8 sampleTrack must be bound to
-	// the us->SFU video m-line (mid:3 in the captured offer) so the answer carries
-	// a real ssrc; otherwise the answer has ssrcs=[] and the SFU re-offers every
-	// ~14s and ICE never settles. AddTracks already added a sendonly video
-	// transceiver, but its m-line ordering vs the SFU's mid map must be reconciled
-	// here (locate the transceiver whose negotiated mid is the recvonly-from-SFU
-	// video line and ReplaceTrack(h.sampleTrack) / set direction sendonly, codec
-	// matching payload types 98-106). Finalize this against the live server.
+	// Bind our VP8 sampleTrack to the SFU's us->SFU video m-line (mid:3 in the
+	// captured offer). The SFU's offer bundles 5 m-lines:
+	//   m=audio       mid:0  sendonly   SFU -> us (audio-mix)
+	//   m=application mid:1             SCTP
+	//   m=audio       mid:2  recvonly   us -> SFU
+	//   m=video       mid:3  recvonly   us -> SFU   <-- OUR VP8 TUNNEL TRACK
+	//   m=video       mid:4  sendonly   SFU -> us
+	// pion mirrors the SFU's "recvonly" as our local "sendonly" direction after
+	// SetRemoteDescription creates matching transceivers. We locate the video
+	// transceiver whose local direction is sendonly (i.e. the one the SFU wants
+	// to receive from us) and ReplaceTrack our sampleTrack onto it. Without a
+	// real track bound here the answer carries ssrcs=[] and the SFU re-offers
+	// every ~14s and ICE never settles.
+	if h.sampleTrack != nil {
+		bound := false
+		for _, tr := range h.pc.GetTransceivers() {
+			if tr.Kind() != webrtc.RTPCodecTypeVideo {
+				continue
+			}
+			mid := tr.Mid()
+			dir := tr.Direction()
+			if dir != webrtc.RTPTransceiverDirectionSendonly && dir != webrtc.RTPTransceiverDirectionSendrecv {
+				continue
+			}
+			if err := tr.Sender().ReplaceTrack(h.sampleTrack); err != nil {
+				h.logFn("max-joiner: ReplaceTrack on mid=%s failed: %v", mid, err)
+				continue
+			}
+			h.logFn("max-joiner: bound VP8 sampleTrack to mid=%s (dir=%s)", mid, dir)
+			bound = true
+			break
+		}
+		if !bound {
+			h.logFn("max-joiner: no sendonly/sendrecv video transceiver found to bind sampleTrack")
+		}
+	} else {
+		h.logFn("max-joiner: sampleTrack is nil, cannot bind to SFU offer")
+	}
 
 	answer, err := h.pc.CreateAnswer(nil)
 	if err != nil {
@@ -871,7 +900,23 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 		return
 	}
 	h.pc = pc
-	h.sampleTrack = h.AddTracks(pc, h.logFn, "max-joiner")
+
+	// Do NOT AddTracks here: in SFU mode the SFU is the offerer, and
+	// pre-adding tracks would create transceivers that conflict with the
+	// SFU's own m-line layout. Instead, create the VP8 sample track object
+	// without attaching it to the PC; handleProducerUpdated binds it to the
+	// right transceiver (mid:3, us->SFU video) via ReplaceTrack once the
+	// SFU's offer has been applied and pion has created matching
+	// transceivers from it.
+	sampleTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
+		"video", "tunnel-video",
+	)
+	if err != nil {
+		h.logFn("max-joiner: failed to create VP8 sample track: %v", err)
+		return
+	}
+	h.sampleTrack = sampleTrack
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		h.logFn("max-joiner: remote track: codec=%s ssrc=%d", track.Codec().MimeType, track.SSRC())

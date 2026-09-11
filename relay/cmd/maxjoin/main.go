@@ -27,6 +27,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/maxproto"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/pion"
 	joiner "github.com/alex-pirozhenko/whitelist-bypass/relay/pion/headless-joiner-common"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
@@ -89,6 +90,7 @@ func main() {
 	tunnelSecret := flag.String("tunnel-secret", "", "optional shared base64 obfuscator secret")
 	secs := flag.Int("secs", 90, "run: seconds to stay up")
 	icePolicy := flag.String("ice-policy", "relay", "run: ICE transport policy (relay|all)")
+	mediaMode := flag.String("media-mode", "direct", "run: media topology (direct|sfu)")
 	flag.Parse()
 
 	if *tokenPath == "" {
@@ -103,7 +105,7 @@ func main() {
 		// uid (obtained from that account's own session), no phone resolution.
 		doCreate(tf, *peerPhone, *calleeUID)
 	case "run":
-		doRun(tf, *role, *joinLink, *conv, *create, *calleePhone, *tunnelSecret, *secs, *icePolicy)
+		doRun(tf, *role, *joinLink, *conv, *create, *calleePhone, *tunnelSecret, *secs, *icePolicy, *mediaMode, *calleeUID)
 	default:
 		log.Fatalf("unknown mode %q", *mode)
 	}
@@ -150,13 +152,13 @@ func doCreate(tf tokenFile, peerPhone string, calleeUID int64) {
 }
 
 // doRun constructs a MaxHeadlessJoiner and pumps test bytes over the tunnel.
-func doRun(tf tokenFile, role, joinLink, conv string, create bool, calleePhone, tunnelSecret string, secs int, icePolicy string) {
+func doRun(tf tokenFile, role, joinLink, conv string, create bool, calleePhone, tunnelSecret string, secs int, icePolicy, mediaMode string, calleeUID int64) {
 	logFn := func(f string, a ...any) { log.Printf("[%s] "+f, append([]any{role}, a...)...) }
 
 	j := joiner.NewMaxHeadlessJoiner(
 		logFn, joiner.ResolveFunc(resolve), statusEmitter{}, pcConfigurer{},
-		func(*webrtc.PeerConnection, func(string, ...any), string) *webrtc.TrackLocalStaticSample { return nil },
-		func(*webrtc.TrackRemote, func([]byte), func(string, ...any), string) {},
+		pion.AddTunnelTracks,
+		pion.ReadTrack,
 	)
 
 	var recvCount atomic.Int64
@@ -175,16 +177,18 @@ func doRun(tf tokenFile, role, joinLink, conv string, create bool, calleePhone, 
 	}
 
 	params := joiner.MaxHeadlessAuthParams{
-		Token:          tf.Token,
-		DeviceID:       tf.DeviceID,
-		JoinLink:       joinLink,
-		ConversationID: conv,
+		Token:              tf.Token,
+		DeviceID:           tf.DeviceID,
+		JoinLink:           joinLink,
+		ConversationID:     conv,
 		Role:               role,
 		ICETransportPolicy: icePolicy,
-		TunnelMode:     "dc",
-		TunnelSecret:   tunnelSecret,
-		CreateRoom:     create,
-		CalleePhone:    calleePhone,
+		TunnelMode:         "dc",
+		TunnelSecret:       tunnelSecret,
+		CreateRoom:         create,
+		CalleePhone:        calleePhone,
+		CalleeUID:          calleeUID,
+		MediaMode:          mediaMode,
 	}
 	pj, _ := json.Marshal(params)
 

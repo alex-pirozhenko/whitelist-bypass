@@ -228,11 +228,17 @@ func authParams(tf tokenFile, o runOpts) string {
 	return string(pj)
 }
 
-func newJoiner(logFn func(string, ...any)) *joiner.MaxHeadlessJoiner {
+func newJoiner(logFn func(string, ...any), mediaMode string) *joiner.MaxHeadlessJoiner {
+	// The SFU forwards our VP8 under a payload type its consumer m-line maps
+	// to another codec, so the codec-checking reader would discard everything.
+	readTrackFn := pion.ReadTrack
+	if mediaMode == "sfu" {
+		readTrackFn = pion.ReadTrackForceVP8
+	}
 	return joiner.NewMaxHeadlessJoiner(
 		logFn, joiner.ResolveFunc(resolve), statusEmitter{}, pcConfigurer{},
 		pion.AddTunnelTracks,
-		pion.ReadTrack,
+		readTrackFn,
 	)
 }
 
@@ -241,7 +247,7 @@ func newJoiner(logFn func(string, ...any)) *joiner.MaxHeadlessJoiner {
 // grants and are printed; the account token never is.
 func doCallInfo(tf tokenFile, o runOpts) {
 	logFn := func(f string, a ...any) { log.Printf("[callinfo] "+f, a...) }
-	j := newJoiner(logFn)
+	j := newJoiner(logFn, o.mediaMode)
 	ci, jl, conv, err := j.CallInfoOnly(authParams(tf, o))
 	if err != nil {
 		log.Fatalf("callinfo: %v", err)
@@ -272,7 +278,7 @@ func doRun(tf tokenFile, o runOpts) {
 	role := o.role
 	logFn := func(f string, a ...any) { log.Printf("[%s] "+f, append([]any{role}, a...)...) }
 
-	j := newJoiner(logFn)
+	j := newJoiner(logFn, o.mediaMode)
 
 	if o.transcriptPath != "" {
 		f, err := os.OpenFile(o.transcriptPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)

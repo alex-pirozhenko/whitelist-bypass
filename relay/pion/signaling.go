@@ -5,12 +5,12 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 	"github.com/gorilla/websocket"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
-	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
-	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
 
 type SignalingMessage struct {
@@ -177,13 +177,29 @@ func ReadTrack(track *webrtc.TrackRemote, handler func([]byte), logFn func(strin
 			}
 		}
 	}
+	readVP8Track(track, handler, logFn, prefix, false)
+}
 
+// ReadTrackForceVP8 is ReadTrack without the codec check. The OK-Calls SFU
+// forwards our VP8 RTP with the payload type we sent, but the consumer
+// m-line it hands us maps that payload type to a different codec (observed:
+// pion labels the forwarded track VP9), so the MimeType lookup lies. The bytes
+// are our own VP8 tunnel frames; parse them as such. Also logs the first
+// frames unconditionally so a live run shows whether anything decodes.
+func ReadTrackForceVP8(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string) {
+	logFn("%s: reading track ssrc=%d pt=%d codec=%s as VP8 (forced)", prefix, track.SSRC(), track.PayloadType(), track.Codec().MimeType)
+	readVP8Track(track, handler, logFn, prefix, true)
+}
+
+func readVP8Track(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string, verbose bool) {
 	var vp8Pkt codecs.VP8Packet
 	var frameBuf []byte
 	var lastSeq uint16
 	var haveLastSeq bool
 	frameValid := false
 	recvCount := 0
+	recvPkts := 0
+	badCount := 0
 	buf := make([]byte, common.RTPBufSize)
 	for {
 		n, _, err := track.Read(buf)
@@ -203,10 +219,20 @@ func ReadTrack(track *webrtc.TrackRemote, handler func([]byte), logFn func(strin
 
 		vp8Payload, err := vp8Pkt.Unmarshal(pkt.Payload)
 		if err != nil {
+			if verbose {
+				badCount++
+				if badCount <= 3 {
+					logFn("%s: rtp pt=%d seq=%d marker=%v payload=%d bytes: not a VP8 packet: %v", prefix, pkt.PayloadType, pkt.SequenceNumber, pkt.Marker, len(pkt.Payload), err)
+				}
+			}
 			frameValid = false
 			frameBuf = frameBuf[:0]
 			continue
 		}
+		if verbose && recvPkts < 3 {
+			logFn("%s: rtp pt=%d seq=%d marker=%v S=%d payload=%d bytes", prefix, pkt.PayloadType, pkt.SequenceNumber, pkt.Marker, vp8Pkt.S, len(pkt.Payload))
+		}
+		recvPkts++
 		if vp8Pkt.S == 1 {
 			frameBuf = frameBuf[:0]
 			frameValid = true
@@ -219,7 +245,7 @@ func ReadTrack(track *webrtc.TrackRemote, handler func([]byte), logFn func(strin
 			continue
 		}
 		recvCount++
-		if common.Debug && (recvCount <= 3 || recvCount%200 == 0) {
+		if (common.Debug || verbose) && (recvCount <= 3 || recvCount%200 == 0) {
 			logFn("%s: recv vp8 frame #%d %d bytes", prefix, recvCount, len(frameBuf))
 		}
 		if handler != nil {

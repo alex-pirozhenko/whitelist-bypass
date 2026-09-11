@@ -108,7 +108,9 @@ type runOpts struct {
 	calleeUID                 int64
 	transcriptPath, who       string
 	vp8FPS, vp8Batch          int
+	sfuWidth, sfuHeight       int
 	bench                     bool
+	benchSender               bool
 	benchSize, benchIntervalMS int
 }
 
@@ -129,9 +131,12 @@ func main() {
 	mediaMode := flag.String("media-mode", "direct", "run: media topology (direct|sfu)")
 	vp8FPS := flag.Int("vp8-fps", 0, "run/sfu: VP8 tunnel nominal fps (0 = tunnel default)")
 	vp8Batch := flag.Int("vp8-batch", 0, "run/sfu: VP8 tunnel samples per frame interval (0 = tunnel default)")
+	sfuWidth := flag.Int("sfu-width", 1280, "run/sfu: requested SFU video width (default 1280)")
+	sfuHeight := flag.Int("sfu-height", 720, "run/sfu: requested SFU video height (default 720)")
 	transcriptPath := flag.String("transcript", "", "run: write the JSONL diagnostic transcript to this file")
 	who := flag.String("who", "", "run: participant label for the transcript (default pion-<role>)")
 	bench := flag.Bool("bench", false, "run: throughput benchmark mode")
+	benchSender := flag.Bool("bench-sender", true, "run/bench: enable benchmark sender loop (set false for recv-only)")
 	benchSize := flag.Int("bench-size", 800, "run/bench: payload bytes per frame (default 800)")
 	benchIntervalMS := flag.Int("bench-interval-ms", 50, "run/bench: interval between sends in ms (default 50)")
 	flag.Parse()
@@ -156,8 +161,9 @@ func main() {
 		calleePhone: *calleePhone, tunnelSecret: *tunnelSecret, secs: *secs,
 		icePolicy: *icePolicy, mediaMode: *mediaMode, calleeUID: *calleeUID,
 		vp8FPS: *vp8FPS, vp8Batch: *vp8Batch,
+		sfuWidth: *sfuWidth, sfuHeight: *sfuHeight,
 		transcriptPath: *transcriptPath, who: *who,
-		bench: *bench, benchSize: *benchSize, benchIntervalMS: *benchIntervalMS,
+		bench: *bench, benchSender: *benchSender, benchSize: *benchSize, benchIntervalMS: *benchIntervalMS,
 	}
 
 	switch *mode {
@@ -236,6 +242,8 @@ func authParams(tf tokenFile, o runOpts) string {
 		MediaMode:          o.mediaMode,
 		VP8FPS:             o.vp8FPS,
 		VP8Batch:           o.vp8Batch,
+		SFUVideoWidth:      o.sfuWidth,
+		SFUVideoHeight:     o.sfuHeight,
 	}
 	pj, _ := json.Marshal(params)
 	return string(pj)
@@ -329,23 +337,26 @@ func doRun(tf tokenFile, o runOpts) {
 			tot := recvBytes.Add(int64(len(b)))
 			if !o.bench {
 				logFn("<<< RECV %d bytes: %q", len(b), string(b))
-			} else if cnt%20 == 0 {
+			} else if cnt%20 == 0 || tot >= 500*1024 {
 				el := time.Duration(now - firstRecv.Load()).Seconds()
 				if el > 0 {
 					rateKBps := (float64(tot) / 1024.0) / el
-					logFn("<<< RECV #%d: total %d bytes (%.2f KB/s, %.2f kbps)", cnt, tot, rateKBps, rateKBps*8)
+					rateMbps := (float64(tot) * 8.0) / (el * 1000.0 * 1000.0)
+					logFn("<<< RECV #%d: total %d bytes (%.2f KB/s, %.2f Mbps)", cnt, tot, rateKBps, rateMbps)
 				}
 			}
 		})
 		go func() {
-			if o.bench {
+			if o.bench && o.benchSender {
 				chunkSize := o.benchSize
 				if chunkSize <= 0 {
 					chunkSize = 800
 				}
 				interval := time.Duration(o.benchIntervalMS) * time.Millisecond
-				if interval <= 0 {
+				if interval < 0 {
 					interval = 50 * time.Millisecond
+				} else if interval == 0 {
+					interval = 2 * time.Millisecond
 				}
 				buf := make([]byte, chunkSize)
 				for i := range buf {
@@ -389,8 +400,9 @@ func doRun(tf tokenFile, o runOpts) {
 		if o.bench && firstRecv.Load() > 0 && lastRecv.Load() > firstRecv.Load() {
 			dur := time.Duration(lastRecv.Load() - firstRecv.Load()).Seconds()
 			rateKBps := (float64(rb) / 1024.0) / dur
-			log.Printf("[%s] *** THROUGHPUT BENCHMARK: %.2f KB/s (%.2f kbps) over %.2f seconds ***",
-				role, rateKBps, rateKBps*8, dur)
+			rateMbps := (float64(rb) * 8.0) / (dur * 1000.0 * 1000.0)
+			log.Printf("[%s] *** THROUGHPUT BENCHMARK: %.2f KB/s (%.2f Mbps) over %.2f seconds ***",
+				role, rateKBps, rateMbps, dur)
 		}
 	}
 }

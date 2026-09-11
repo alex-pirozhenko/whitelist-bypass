@@ -340,3 +340,22 @@ func TestHandleMessagePingRepliesPong(t *testing.T) {
 		t.Errorf("transcript missing mirrored log line:\n%s", buf.String())
 	}
 }
+
+func TestSanitizeCandidateAndSDP(t *testing.T) {
+	cand := "candidate:3381240166 1 udp 2130706431 10.0.0.1 50992 typ host ufrag oldUfrag"
+	sanitized := sanitizeCandidate(cand, "newUfrag")
+	want := "candidate:3381240166 1 udp 2130706431 10.0.0.1 50992 typ host ufrag newUfrag"
+	if sanitized != want {
+		t.Errorf("sanitizeCandidate = %q, want %q", sanitized, want)
+	}
+
+	sdp := "v=0\r\na=ice-ufrag:sess123\r\na=candidate:1 1 udp 100 1.2.3.4 5000 typ host ufrag old123\r\na=candidate:2 1 udp 100 1.2.3.4 5001 typ host\r\n"
+	sanitizedSDP := sanitizeSDPCandidates(sdp)
+	if !strings.Contains(sanitizedSDP, "ufrag sess123") {
+		t.Errorf("sanitizedSDP missing rewritten ufrag:\n%s", sanitizedSDP)
+	}
+	if strings.Contains(sanitizedSDP, "old123") {
+		t.Errorf("sanitizedSDP still contains old ufrag:\n%s", sanitizedSDP)
+	}
+}
+

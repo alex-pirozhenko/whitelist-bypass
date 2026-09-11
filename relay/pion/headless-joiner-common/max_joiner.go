@@ -265,10 +265,11 @@ type MaxHeadlessJoiner struct {
 	pendingLocalICE []interface{}
 	pendingEmptyICE bool // ICE gathering completed before peer was learned; send end-of-candidates on flush
 
-	pc         *webrtc.PeerConnection
-	dc         *webrtc.DataChannel
-	remoteSet  bool
-	pendingICE []webrtc.ICECandidateInit
+	pc          *webrtc.PeerConnection
+	dc          *webrtc.DataChannel
+	remoteSet   bool
+	remoteUfrag string
+	pendingICE  []webrtc.ICECandidateInit
 
 	offerOnce sync.Once
 
@@ -461,6 +462,7 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 		h.ctl = nil
 	}
 	h.remoteSet = false
+	h.remoteUfrag = ""
 	h.pendingICE = nil
 	h.peerMu.Lock()
 	h.peerAddr = nil
@@ -1922,6 +1924,16 @@ func (h *MaxHeadlessJoiner) initPC() {
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.DisableCloseByDTLS(true)
 	settingEngine.DetachDataChannels()
+	if h.params != nil && h.params.Role == maxRoleAnswerer {
+		settingEngine.SetAnsweringDTLSRole(webrtc.DTLSRoleClient)
+	}
+	settingEngine.SetNetworkTypes([]webrtc.NetworkType{
+		webrtc.NetworkTypeUDP4,
+		webrtc.NetworkTypeTCP4,
+	})
+	lf := plog.NewDefaultLoggerFactory()
+	lf.DefaultLogLevel = plog.LogLevelTrace
+	settingEngine.LoggerFactory = lf
 	if h.PCConfig != nil {
 		h.PCConfig.ConfigureSettingEngine(&settingEngine)
 	}
@@ -2121,6 +2133,66 @@ func sdpUfragSummary(sdp string) string {
 		}
 	}
 	return fmt.Sprintf("sessUfrag=%s candUfrags=%v", sess, seen)
+}
+
+// parseSessionUfrag returns the first a=ice-ufrag: value found in sdp.
+func parseSessionUfrag(sdp string) string {
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "a=ice-ufrag:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "a=ice-ufrag:"))
+		}
+	}
+	return ""
+}
+
+// sanitizeCandidate rewrites the ufrag attribute on an ICE candidate string
+// so that it matches targetUfrag, preventing Pion's ICE agent from dropping
+// candidates whose ufrag differs from the session's.
+func sanitizeCandidate(cand string, targetUfrag string) string {
+	if targetUfrag == "" || cand == "" {
+		return cand
+	}
+	if i := strings.Index(cand, " ufrag "); i >= 0 {
+		prefix := cand[:i+7]
+		rest := cand[i+7:]
+		fields := strings.Fields(rest)
+		if len(fields) > 0 {
+			oldUfrag := fields[0]
+			rem := rest[len(oldUfrag):]
+			return prefix + targetUfrag + rem
+		}
+	}
+	return cand
+}
+
+// sanitizeSDPCandidates rewrites all candidate lines in sdp to match the
+// active session-level ice-ufrag.
+func sanitizeSDPCandidates(sdp string) string {
+	targetUfrag := parseSessionUfrag(sdp)
+	if targetUfrag == "" {
+		return sdp
+	}
+	lines := strings.Split(sdp, "\n")
+	modified := false
+	for i, line := range lines {
+		trimmed := strings.TrimRight(line, "\r")
+		if strings.HasPrefix(trimmed, "a=candidate:") {
+			sanitized := sanitizeCandidate(trimmed, targetUfrag)
+			if sanitized != trimmed {
+				if strings.HasSuffix(line, "\r") {
+					lines[i] = sanitized + "\r"
+				} else {
+					lines[i] = sanitized
+				}
+				modified = true
+			}
+		}
+	}
+	if modified {
+		return strings.Join(lines, "\n")
+	}
+	return sdp
 }
 
 // gatheredLocalDescription blocks until ICE gathering finishes and returns the
@@ -2406,6 +2478,9 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 		candidateJSON, _ := json.Marshal(candidate)
 		var candidateInit webrtc.ICECandidateInit
 		if err := json.Unmarshal(candidateJSON, &candidateInit); err == nil && candidateInit.Candidate != "" {
+			if h.remoteUfrag != "" {
+				candidateInit.Candidate = sanitizeCandidate(candidateInit.Candidate, h.remoteUfrag)
+			}
 			// A non-empty inner .candidate distinguishes a real candidate from the
 			// end-of-candidates sentinel {candidate:""}, which the real client
 			// drops on receipt (the marker is for the server, not the peer).
@@ -2413,7 +2488,7 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 				h.OnRemoteCandidate(0, candidateInit.Candidate)
 			}
 			if h.remoteSet {
-				h.logFn("max-joiner: <- server ICE candidate")
+				h.logFn("max-joiner: <- server ICE candidate: %s", candidateInit.Candidate)
 				h.trPC("addIceCandidate", candidateInit, nil, h.pc.AddICECandidate(candidateInit))
 			} else {
 				h.pendingICE = append(h.pendingICE, candidateInit)
@@ -2431,7 +2506,10 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 	if h.OnRemoteCandidate != nil {
 		h.OnRemoteCandidate(-1, sdpStr)
 	}
-	h.logFn("max-joiner: remote SDP: %s [%s]", sdpType, sdpUfragSummary(sdpStr))
+	h.logFn("max-joiner: remote SDP: %s [%s]\n--- SDP RAW ---\n%s\n--- END SDP ---", sdpType, sdpUfragSummary(sdpStr), sdpStr)
+
+	sdpStr = sanitizeSDPCandidates(sdpStr)
+	h.remoteUfrag = parseSessionUfrag(sdpStr)
 
 	switch sdpType {
 	case "answer":
@@ -2439,6 +2517,10 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 		h.trPC("setRemoteDescription", sdpArgs(remote), nil, h.pc.SetRemoteDescription(remote))
 		h.remoteSet = true
 		for _, candidate := range h.pendingICE {
+			if h.remoteUfrag != "" {
+				candidate.Candidate = sanitizeCandidate(candidate.Candidate, h.remoteUfrag)
+			}
+			h.logFn("max-joiner: <- buffered ICE candidate: %s", candidate.Candidate)
 			h.trPC("addIceCandidate", candidate, nil, h.pc.AddICECandidate(candidate))
 		}
 		h.pendingICE = nil
@@ -2448,6 +2530,10 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 		h.trPC("setRemoteDescription", sdpArgs(remote), nil, h.pc.SetRemoteDescription(remote))
 		h.remoteSet = true
 		for _, candidate := range h.pendingICE {
+			if h.remoteUfrag != "" {
+				candidate.Candidate = sanitizeCandidate(candidate.Candidate, h.remoteUfrag)
+			}
+			h.logFn("max-joiner: <- buffered ICE candidate: %s", candidate.Candidate)
 			h.trPC("addIceCandidate", candidate, nil, h.pc.AddICECandidate(candidate))
 		}
 		h.pendingICE = nil

@@ -387,24 +387,14 @@ func (t *VP8DataTunnel) writerLoop() {
 		}
 
 		sendFrame := func(data []byte) {
-			isKf := t.needKeyframe.Swap(false) || (t.sentFrames.Load()%uint64(t.keyframePeriod) == 0)
-			var s []byte
-			if isKf {
-				s = t.obf.EncodeDataKeyframe(data)
-			} else {
-				s = t.obf.EncodeData(data)
-			}
+			isKf := true
+			s := t.obf.EncodeDataKeyframe(data)
 			emit(s, isKf, false)
 		}
 
 		sendKeepalive := func() {
-			isKf := t.needKeyframe.Swap(false) || (t.sentFrames.Load()%uint64(t.keyframePeriod) == 0)
-			var s []byte
-			if isKf {
-				s = t.obf.EncodeKeepalive(16)
-			} else {
-				s = t.obf.EncodeKeepaliveInterframe(16)
-			}
+			isKf := true
+			s := t.obf.EncodeKeepalive(16)
 			emit(s, isKf, true)
 		}
 

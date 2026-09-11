@@ -153,11 +153,32 @@ candidates, and apply the SERVER's trickled candidates — ICE then runs client<
 server relays to the peer. This is the same server-terminated model as the SFU path, and it is
 whitelist-friendly by construction.
 
-**Current status / next debug step:** with relay-only + no p2pRelay + inline candidates, the
-ANSWERER buffers and applies the server's 2 trickled candidates correctly, but the OFFERER
-receives NO server candidates at all (no `<- server ICE candidate` on that side), so it forms no
-pairs and ICE fails. Chase that asymmetry first — likely the offerer must (re)send/announce
-something before the server trickles to it, or its candidates arrive on a notification we drop.
+**Offerer-candidate asymmetry — ROOT CAUSE (from the web-bundle reference,
+`MAX_WS2_REFERENCE.md` §3d):** the real client forwards an
+**end-of-candidates sentinel** — `transmit-data {data:{candidate:{candidate:""}}}` —
+when local ICE gathering completes (`onicecandidate` fires with a null candidate),
+gated by its `forwardEmptyIceCandidate` SDK flag. Crucially, this marker is **for the
+server, not the peer**: the receiving client drops it (`_handleTransmittedData` requires
+`t.candidate.candidate` to be non-empty), so its only consumer is OK-Calls itself, which
+uses it as the "I'm done gathering, you may trickle your own candidates now" signal.
+Our joiner dropped the null candidate (`if candidate == nil { return }`) and so never
+told the server it was done — the server therefore withheld its trickled candidates from
+that side. Fixed: `onLocalICEComplete` now sends the sentinel (buffered until the peer
+address is known, so it always follows the real candidates), on both offerer and
+answerer, exactly as the reference does.
+
+Aligned at the same time, per the reference (§3b/§3c): dropped the phantom `label:"call"`
+field (no such field exists in the client) and added `animojiVersion:1` to every SDP
+`transmit-data` (the client's `sendSdp` always attaches it and sends no other extra).
+`participantId`/`participantType`/`deviceIdx` are correct as-is — the client's `_send`
+injects exactly those three by decomposing a composite participant id. The candidate wire
+shape `{candidate:{candidate,sdpMid,sdpMLineIndex,…}}` already matched. Incoming empty
+candidates are now guarded (dropped) on our side too, mirroring the client.
+
+**Next debug step:** re-run the two-host DIRECT test and confirm the offerer now receives
+`<- server ICE candidate` after emitting the end-of-candidates marker, and that ICE
+reaches `connected`. Full command/notification tables, payload shapes, the state machine,
+and the SFU path are documented in `MAX_WS2_REFERENCE.md`.
 
 ## Next step
 Build a `CONSUMER`/`PRODUCER` SFU media flow in `max_joiner.go` (video/VP8 tunnel), driven by

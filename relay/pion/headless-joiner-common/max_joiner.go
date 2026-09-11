@@ -179,6 +179,7 @@ type MaxHeadlessJoiner struct {
 	peerMu          sync.Mutex
 	peerAddr        *maxPeerAddr
 	pendingLocalICE []interface{}
+	pendingEmptyICE bool // ICE gathering completed before peer was learned; send end-of-candidates on flush
 
 	pc         *webrtc.PeerConnection
 	dc         *webrtc.DataChannel
@@ -316,6 +317,7 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	h.peerMu.Lock()
 	h.peerAddr = nil
 	h.pendingLocalICE = nil
+	h.pendingEmptyICE = false
 	h.peerMu.Unlock()
 	h.offerOnce = sync.Once{}
 	h.ci = nil
@@ -682,6 +684,15 @@ func (h *MaxHeadlessJoiner) initPC() {
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
+			// End-of-candidates. The real web client forwards an empty-candidate
+			// sentinel {candidate:""} when local ICE gathering completes (gated by
+			// its forwardEmptyIceCandidate flag). The *peer* ignores it — the
+			// receiving side checks data.candidate.candidate is non-empty — so it
+			// is meant for the SERVER: it is how the client tells OK-Calls "I'm
+			// done gathering, you may trickle your own candidates now". Without it
+			// the server withholds its trickled candidates from us, which is
+			// exactly the offerer-receives-no-server-candidates asymmetry we hit.
+			h.onLocalICEComplete()
 			return
 		}
 		h.onLocalICECandidate(candidate)
@@ -734,6 +745,31 @@ func (h *MaxHeadlessJoiner) onLocalICECandidate(candidate *webrtc.ICECandidate) 
 	h.peerMu.Unlock()
 	h.logFn("max-joiner: -> local ICE candidate (%s)", candidate.Typ)
 	h.sendTransmitData(addr, map[string]interface{}{"candidate": parsed})
+}
+
+// emptyICECandidate is the end-of-candidates sentinel the real client sends to
+// the server: transmit-data with data:{candidate:{candidate:""}}. The peer
+// ignores it (empty inner .candidate), but OK-Calls uses it as the signal to
+// begin trickling its own candidates back.
+func emptyICECandidate() map[string]interface{} {
+	return map[string]interface{}{"candidate": map[string]interface{}{"candidate": ""}}
+}
+
+// onLocalICEComplete fires when local ICE gathering finishes (nil candidate).
+// It forwards the end-of-candidates sentinel to the server, buffering until the
+// peer address is known so the marker always follows the real candidates.
+func (h *MaxHeadlessJoiner) onLocalICEComplete() {
+	h.peerMu.Lock()
+	addr := h.peerAddr
+	if addr == nil {
+		h.pendingEmptyICE = true
+		h.peerMu.Unlock()
+		h.logFn("max-joiner: local ICE gathering complete (peer unknown, deferring end-of-candidates)")
+		return
+	}
+	h.peerMu.Unlock()
+	h.logFn("max-joiner: -> end-of-candidates marker")
+	h.sendTransmitData(addr, emptyICECandidate())
 }
 
 // maybeSendOffer sends the initial offer exactly once, and only once the
@@ -823,12 +859,15 @@ func (h *MaxHeadlessJoiner) sendOffer(addr *maxPeerAddr) {
 		return
 	}
 	offer = h.gatheredLocalDescription(offer)
+	// data:{sdp, animojiVersion}. The real client's sendSdp always attaches
+	// animojiVersion (the vmoji protocol version, default 1) to every SDP and
+	// sends no other extra field — in particular there is no "label" field.
 	h.sendTransmitData(addr, map[string]interface{}{
 		"sdp": map[string]interface{}{
 			"type": "offer",
 			"sdp":  offer.SDP,
 		},
-		"label": "call",
+		"animojiVersion": 1,
 	})
 	h.logFn("max-joiner: sent OFFER [%s]", sdpUfragSummary(offer.SDP))
 }
@@ -957,10 +996,16 @@ func (h *MaxHeadlessJoiner) setPeerAddr(addr *maxPeerAddr) {
 	h.peerAddr = addr
 	pending := h.pendingLocalICE
 	h.pendingLocalICE = nil
+	emptyPending := h.pendingEmptyICE
+	h.pendingEmptyICE = false
 	h.peerMu.Unlock()
 
 	for _, cand := range pending {
 		h.sendTransmitData(addr, map[string]interface{}{"candidate": cand})
+	}
+	if emptyPending {
+		h.logFn("max-joiner: -> end-of-candidates marker (flushed)")
+		h.sendTransmitData(addr, emptyICECandidate())
 	}
 
 	if h.params != nil && h.params.Role == maxRoleOfferer {
@@ -985,7 +1030,10 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 		// buffering until then.
 		candidateJSON, _ := json.Marshal(candidate)
 		var candidateInit webrtc.ICECandidateInit
-		if err := json.Unmarshal(candidateJSON, &candidateInit); err == nil {
+		if err := json.Unmarshal(candidateJSON, &candidateInit); err == nil && candidateInit.Candidate != "" {
+			// A non-empty inner .candidate distinguishes a real candidate from the
+			// end-of-candidates sentinel {candidate:""}, which the real client
+			// drops on receipt (the marker is for the server, not the peer).
 			if h.OnRemoteCandidate != nil {
 				h.OnRemoteCandidate(0, candidateInit.Candidate)
 			}
@@ -1049,7 +1097,7 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 				"type": "answer",
 				"sdp":  answer.SDP,
 			},
-			"label": "call",
+			"animojiVersion": 1,
 		})
 		h.logFn("max-joiner: sent ANSWER [%s]", sdpUfragSummary(answer.SDP))
 	}

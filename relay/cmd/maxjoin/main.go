@@ -96,9 +96,8 @@ func main() {
 
 	switch *mode {
 	case "create":
-		if *peerPhone == "" {
-			log.Fatal("-peer-phone is required in create mode")
-		}
+		// peer-phone optional: empty => a creator-only room (the creator's own
+		// devices can still join it).
 		doCreate(tf, *peerPhone)
 	case "run":
 		doRun(tf, *role, *joinLink, *conv, *create, *calleePhone, *tunnelSecret, *secs)
@@ -123,14 +122,20 @@ func doCreate(tf tokenFile, peerPhone string) {
 	if _, err := c.Login(ctx); err != nil {
 		log.Fatalf("login: %v", err)
 	}
-	uid, err := c.ResolveUID(ctx, peerPhone)
-	if err != nil {
-		log.Fatalf("resolve peer: %v", err)
+	var callees []int64
+	if peerPhone != "" {
+		uid, err := c.ResolveUID(ctx, peerPhone)
+		if err != nil {
+			log.Fatalf("resolve peer: %v", err)
+		}
+		callees = []int64{uid}
 	}
 	// conversationId MUST be a UUID — the ws2 signaling server rejects other
 	// formats with {"error":"invalid-request","message":"Invalid conversationId"}.
+	// Empty callees => a creator-only room; the creator's own devices can still
+	// op166-join it (only a DIFFERENT account is refused).
 	convID := uuid.NewString()
-	resp, err := c.VideoChatStart(ctx, []int64{uid}, convID)
+	resp, err := c.VideoChatStart(ctx, callees, convID)
 	if err != nil {
 		log.Fatalf("op76: %v", err)
 	}

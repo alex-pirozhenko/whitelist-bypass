@@ -79,7 +79,8 @@ func loadToken(path string) tokenFile {
 func main() {
 	mode := flag.String("mode", "run", "create | run")
 	tokenPath := flag.String("token-file", "", "token JSON {token,device_id,phone}")
-	peerPhone := flag.String("peer-phone", "", "create: callee phone for op76")
+	peerPhone := flag.String("peer-phone", "", "create: callee phone for op76 (op46 resolve)")
+	calleeUID := flag.Int64("callee-uid", 0, "create: callee uid to invite directly (skips op46; from the callee's own session)")
 	role := flag.String("role", "answerer", "run: offerer | answerer")
 	joinLink := flag.String("join-link", "", "run/answerer: the room joinLink")
 	conv := flag.String("conv", "", "run/answerer: the conversationId")
@@ -87,6 +88,7 @@ func main() {
 	calleePhone := flag.String("callee-phone", "", "run/offerer -create: callee phone")
 	tunnelSecret := flag.String("tunnel-secret", "", "optional shared base64 obfuscator secret")
 	secs := flag.Int("secs", 90, "run: seconds to stay up")
+	icePolicy := flag.String("ice-policy", "relay", "run: ICE transport policy (relay|all)")
 	flag.Parse()
 
 	if *tokenPath == "" {
@@ -97,17 +99,18 @@ func main() {
 	switch *mode {
 	case "create":
 		// peer-phone optional: empty => a creator-only room (the creator's own
-		// devices can still join it).
-		doCreate(tf, *peerPhone)
+		// devices can still join it). -callee-uid invites a specific account by
+		// uid (obtained from that account's own session), no phone resolution.
+		doCreate(tf, *peerPhone, *calleeUID)
 	case "run":
-		doRun(tf, *role, *joinLink, *conv, *create, *calleePhone, *tunnelSecret, *secs)
+		doRun(tf, *role, *joinLink, *conv, *create, *calleePhone, *tunnelSecret, *secs, *icePolicy)
 	default:
 		log.Fatalf("unknown mode %q", *mode)
 	}
 }
 
 // doCreate performs op76 and prints {joinLink, conversationId} as JSON.
-func doCreate(tf tokenFile, peerPhone string) {
+func doCreate(tf tokenFile, peerPhone string, calleeUID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
@@ -123,7 +126,9 @@ func doCreate(tf tokenFile, peerPhone string) {
 		log.Fatalf("login: %v", err)
 	}
 	var callees []int64
-	if peerPhone != "" {
+	if calleeUID != 0 {
+		callees = []int64{calleeUID}
+	} else if peerPhone != "" {
 		uid, err := c.ResolveUID(ctx, peerPhone)
 		if err != nil {
 			log.Fatalf("resolve peer: %v", err)
@@ -145,7 +150,7 @@ func doCreate(tf tokenFile, peerPhone string) {
 }
 
 // doRun constructs a MaxHeadlessJoiner and pumps test bytes over the tunnel.
-func doRun(tf tokenFile, role, joinLink, conv string, create bool, calleePhone, tunnelSecret string, secs int) {
+func doRun(tf tokenFile, role, joinLink, conv string, create bool, calleePhone, tunnelSecret string, secs int, icePolicy string) {
 	logFn := func(f string, a ...any) { log.Printf("[%s] "+f, append([]any{role}, a...)...) }
 
 	j := joiner.NewMaxHeadlessJoiner(
@@ -174,7 +179,8 @@ func doRun(tf tokenFile, role, joinLink, conv string, create bool, calleePhone, 
 		DeviceID:       tf.DeviceID,
 		JoinLink:       joinLink,
 		ConversationID: conv,
-		Role:           role,
+		Role:               role,
+		ICETransportPolicy: icePolicy,
 		TunnelMode:     "dc",
 		TunnelSecret:   tunnelSecret,
 		CreateRoom:     create,

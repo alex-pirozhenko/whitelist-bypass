@@ -99,6 +99,17 @@ type MaxHeadlessAuthParams struct {
 	CalleePhone string `json:"calleePhone"`
 	CalleeUID   int64  `json:"calleeUid"`
 
+	// ICETransportPolicy selects the WebRTC ICE policy, mirroring the web
+	// client's `iceTransportPolicy: forceRelayPolicy ? "relay" : "all"`.
+	// "relay" (default) forces all media through OK's TURN — whitelist-safe;
+	// "all" also tries host/srflx, useful on an open network for diagnosing
+	// whether DIRECT completes at all. Configurable per the topology work.
+	ICETransportPolicy string `json:"iceTransportPolicy"`
+
+	// MediaMode selects the media topology: "direct" (default, 1:1 p2p with
+	// server-terminated ICE) or "sfu" (SERVER topology, producer/consumer VP8).
+	MediaMode string `json:"mediaMode"`
+
 	// ws2 client params (all have defaults; only override if set).
 	AppVersion      string `json:"appVersion"`
 	ProtocolVersion string `json:"protocolVersion"`
@@ -139,6 +150,12 @@ func (p *MaxHeadlessAuthParams) applyDefaults() {
 	}
 	if p.TunnelMode == "" {
 		p.TunnelMode = maxDefaultTunnelMode
+	}
+	if p.ICETransportPolicy == "" {
+		p.ICETransportPolicy = "relay"
+	}
+	if p.MediaMode == "" {
+		p.MediaMode = "direct"
 	}
 }
 
@@ -654,9 +671,14 @@ func (h *MaxHeadlessJoiner) initPC() {
 	// what a censor's allowlist permits (only MAX/OK IPs are reachable) and what
 	// makes ICE work here: host/srflx pairs against the peer are exactly what the
 	// TURN server refuses with "CreatePermission 403 Forbidden IP".
+	icePolicy := webrtc.ICETransportPolicyRelay
+	if h.params != nil && h.params.ICETransportPolicy == "all" {
+		icePolicy = webrtc.ICETransportPolicyAll
+	}
+	h.logFn("max-joiner: ICE transport policy=%s", icePolicy)
 	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(webrtc.Configuration{
 		ICEServers:         iceServers,
-		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
+		ICETransportPolicy: icePolicy,
 	})
 	if err != nil {
 		h.logFn("max-joiner: failed to create PC: %v", err)
@@ -785,13 +807,18 @@ func (h *MaxHeadlessJoiner) maybeSendOffer() {
 	addr := h.peerAddr
 	h.peerMu.Unlock()
 	if addr == nil {
-		if h.ci != nil && h.ci.PeerID != nil {
-			addr = &maxPeerAddr{ParticipantID: fmt.Sprint(h.ci.PeerID), ParticipantType: "USER", DeviceIdx: 0}
-		} else {
-			return
-		}
+		// Wait for the REAL peer's participantId (participant-joined /
+		// registered-peer) before offering. The old ci.PeerID fallback sent the
+		// offer + trickled candidates to the wrong participant, so the server
+		// never associated them with the actual peer and never trickled its own
+		// candidates back to us — the offerer-gets-no-server-candidates
+		// asymmetry. Offer only once a real peer is known; a later trigger
+		// (the notification) will call us again with a valid addr.
+		h.logFn("max-joiner: offer deferred — real peer not learned yet")
+		return
 	}
 	h.offerOnce.Do(func() {
+		h.logFn("max-joiner: offering to peer participantId=%s type=%s deviceIdx=%d", addr.ParticipantID, addr.ParticipantType, addr.DeviceIdx)
 		h.sendOffer(addr)
 	})
 }

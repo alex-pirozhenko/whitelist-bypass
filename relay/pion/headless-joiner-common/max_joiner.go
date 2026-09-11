@@ -110,6 +110,11 @@ type MaxHeadlessAuthParams struct {
 	// server-terminated ICE) or "sfu" (SERVER topology, producer/consumer VP8).
 	MediaMode string `json:"mediaMode"`
 
+	// VP8FPS/VP8Batch tune the VP8 data-tunnel (SFU mode only), mirroring the
+	// VK/Telemost joiners. Zero uses the tunnel's own defaults.
+	VP8FPS   int `json:"vp8Fps"`
+	VP8Batch int `json:"vp8Batch"`
+
 	// ws2 client params (all have defaults; only override if set).
 	AppVersion      string `json:"appVersion"`
 	ProtocolVersion string `json:"protocolVersion"`
@@ -205,10 +210,20 @@ type MaxHeadlessJoiner struct {
 
 	offerOnce sync.Once
 
+	// SFU (MediaMode=="sfu") media plane: the tunnel rides a VP8 media track
+	// through the SERVER-topology SFU (an SFU cannot carry an SCTP DataChannel).
+	sampleTrack       *webrtc.TrackLocalStaticSample
+	vp8tunnel         *tunnel.VP8DataTunnel
+	producerSessionID string
+	configAck         configAckTracker
+
 	reconnectAttempt atomic.Int32
 	stopCh           chan struct{}
 	stopOnce         sync.Once
 }
+
+// maxTopologyServer is the SFU/producer-consumer topology (vs "DIRECT" p2p).
+const maxTopologyServer = "SERVER"
 
 func NewMaxHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, status StatusEmitter, pcConfig PeerConnectionConfigurer, addTracks AddTunnelTracksFunc, readTrackFn ReadTrackFunc) *MaxHeadlessJoiner {
 	return &MaxHeadlessJoiner{
@@ -222,10 +237,10 @@ func NewMaxHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, sta
 	}
 }
 
-// MarkConfigAcked is a no-op: DC tunnel mode (the only mode MAX supports)
-// never pushes a VP8 config, but the method is kept for interface parity
-// with the VK/Telemost joiners.
-func (h *MaxHeadlessJoiner) MarkConfigAcked() {}
+// MarkConfigAcked confirms the peer received our VP8 tunnel config (SFU mode).
+// The DIRECT/DataChannel mode never pushes a VP8 config, so this is harmless
+// there.
+func (h *MaxHeadlessJoiner) MarkConfigAcked() { h.configAck.mark() }
 
 func (h *MaxHeadlessJoiner) RunWithParams(jsonParams string) {
 	var params MaxHeadlessAuthParams
@@ -337,6 +352,10 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	h.pendingEmptyICE = false
 	h.peerMu.Unlock()
 	h.offerOnce = sync.Once{}
+	// SFU media plane.
+	h.sampleTrack = nil
+	h.vp8tunnel = nil
+	h.producerSessionID = ""
 	h.ci = nil
 	h.selfUID = ""
 	h.selfAltUID = ""
@@ -556,13 +575,15 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	// Declare media settings immediately, mirroring vk_joiner (VK Calls == this
 	// OK-Calls stack). The SFU does not begin ICE/media until the client states
 	// its media settings; without this, connectivity checks go unanswered and
-	// ICE fails. Data-only tunnel, so audio/video/screen are all disabled.
+	// ICE fails. In SFU mode the tunnel rides a VP8 VIDEO track, so video MUST be
+	// enabled; the DIRECT/DataChannel mode is data-only (all media disabled).
+	videoEnabled := h.params.MediaMode == "sfu"
 	h.send("update-media-modifiers", map[string]interface{}{
 		"mediaModifiers": map[string]interface{}{"denoise": true, "denoiseAnn": true},
 	})
 	h.send("change-media-settings", map[string]interface{}{
 		"mediaSettings": map[string]interface{}{
-			"isAudioEnabled": false, "isVideoEnabled": false,
+			"isAudioEnabled": false, "isVideoEnabled": videoEnabled,
 			"isScreenSharingEnabled": false, "isFastScreenSharingEnabled": false,
 			"isAudioSharingEnabled": false, "isAnimojiEnabled": false,
 		},
@@ -575,7 +596,10 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	// CreatePermission with "403 Forbidden IP". handleConnection overrides the
 	// ICE servers and then calls initPC — same order as vk_joiner.go.
 
-	if h.params.Role == maxRoleOfferer {
+	// DIRECT mode only: the offerer sends its p2p offer over transmit-data. In
+	// SFU mode there is no peer offerer/answerer — the SFU is always the offerer
+	// (producer-updated), so no transmit-data offer is sent.
+	if h.params.MediaMode != "sfu" && h.params.Role == maxRoleOfferer {
 		go func() {
 			select {
 			case <-time.After(3 * time.Second):
@@ -601,8 +625,9 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 // Forbidden IP", so ICE can never leave checking. Mirrors vk_joiner.go:
 // adopt the credentials, then build the PC.
 func (h *MaxHeadlessJoiner) handleConnection(m map[string]interface{}) {
+	topology := ""
 	if conv, ok := m["conversation"].(map[string]interface{}); ok {
-		// DIRECT is the peer-to-peer topology this transport relies on.
+		topology, _ = conv["topology"].(string)
 		h.logFn("max-joiner: <- connection topology=%v state=%v", conv["topology"], conv["state"])
 	}
 
@@ -625,7 +650,27 @@ func (h *MaxHeadlessJoiner) handleConnection(m map[string]interface{}) {
 
 	if h.pc == nil {
 		h.initPC()
+		// SFU mode: a 2-party call starts in DIRECT, where the server never
+		// produces anything to consume. Nudge it to SERVER (best-effort; force
+		// is rejected as feature-is-disabled until a 3rd participant joins, at
+		// which point the server flips topology on its own — see
+		// handleMessage's topology-changed case), then set up the receive side.
+		if h.params.MediaMode == "sfu" {
+			if topology != maxTopologyServer {
+				h.sendSwitchTopology()
+			}
+			h.sendAllocateConsumer()
+		}
 	}
+}
+
+// sendSwitchTopology asks the conversation to move to SERVER (SFU) topology.
+func (h *MaxHeadlessJoiner) sendSwitchTopology() {
+	h.send("switch-topology", map[string]interface{}{
+		"topology": maxTopologyServer,
+		"force":    true,
+	})
+	h.logFn("max-joiner: -> switch-topology %s (force)", maxTopologyServer)
 }
 
 // toStringSlice converts a decoded JSON array into []string, skipping non-strings.
@@ -643,7 +688,156 @@ func toStringSlice(v interface{}) []string {
 	return out
 }
 
-func (h *MaxHeadlessJoiner) initPC() {
+// sfuCapabilities is the STRUCTURED capabilities feature-descriptor the SFU
+// requires in allocate-consumer (the hex bitmask is rejected "Invalid message
+// format"). Shape taken verbatim from the web.max.ru bundle's capabilities
+// getter; we advertise one video track (the VP8 tunnel) and disable everything
+// unimplemented. See MAX_OKCALLS_NOTES.md.
+func (h *MaxHeadlessJoiner) sfuCapabilities() map[string]interface{} {
+	return map[string]interface{}{
+		"estimatedPerformanceIndex":              1,
+		"audioMix":                               true,
+		"consumerUpdate":                         true,
+		"producerNotificationDataChannelVersion": 8,
+		"producerCommandDataChannelVersion":      3,
+		"consumerScreenDataChannelVersion":       1,
+		"producerScreenDataChannelVersion":       1,
+		"asrDataChannelVersion":                  0,
+		"animojiDataChannelVersion":              1,
+		"animojiBackendRender":                   false,
+		"onDemandTracks":                         true,
+		"unifiedPlan":                            true,
+		"singleSession":                          true,
+		"videoTracksCount":                       1,
+		"red":                                    true,
+		"audioShare":                             false,
+		"fastScreenShare":                        false,
+		"videoSuspend":                           false,
+		"simulcast":                              false,
+		"simulcastNativeOrder":                   true,
+		"consumerFastScreenShare":                false,
+		"consumerFastScreenShareQualityOnDemand": false,
+		"transparentAudio":                       false,
+	}
+}
+
+// sendAllocateConsumer sets up the SFU receive side. First call carries no
+// description, so the wire payload is just {"capabilities": ...}.
+func (h *MaxHeadlessJoiner) sendAllocateConsumer() {
+	h.send("allocate-consumer", map[string]interface{}{
+		"capabilities": h.sfuCapabilities(),
+	})
+	h.logFn("max-joiner: -> allocate-consumer (structured capabilities)")
+}
+
+// parseSFUDescription decodes a producer-updated "description" (raw SDP string
+// or {type,sdp}) — the SFU's SDP OFFER unless an explicit type says otherwise.
+func parseSFUDescription(raw interface{}) (webrtc.SessionDescription, bool) {
+	switch v := raw.(type) {
+	case string:
+		if v == "" {
+			return webrtc.SessionDescription{}, false
+		}
+		return webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: v}, true
+	case map[string]interface{}:
+		sdpStr, _ := v["sdp"].(string)
+		if sdpStr == "" {
+			return webrtc.SessionDescription{}, false
+		}
+		sdpType := webrtc.SDPTypeOffer
+		if typeStr, ok := v["type"].(string); ok && typeStr != "" {
+			if t := webrtc.NewSDPType(typeStr); t != webrtc.SDPTypeUnknown {
+				sdpType = t
+			}
+		}
+		return webrtc.SessionDescription{Type: sdpType, SDP: sdpStr}, true
+	default:
+		return webrtc.SessionDescription{}, false
+	}
+}
+
+// extractSSRCs pulls distinct "a=ssrc:<id> ..." SSRCs from an SDP in first-seen
+// order, for accept-producer's "ssrcs" field (web client's Object.keys(ssrcMap)).
+func extractSSRCs(sdp string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, "a=ssrc:") {
+			continue
+		}
+		rest := strings.TrimPrefix(line, "a=ssrc:")
+		id := rest
+		if i := strings.IndexByte(rest, ' '); i >= 0 {
+			id = rest[:i]
+		}
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// handleProducerUpdated drives the SFU producer/consumer offer-answer: the SFU
+// offers (asking us to send our VP8 tunnel track on the us->SFU video m-line),
+// we answer and push accept-producer with our SSRCs. Duplicate sessionId = a
+// keepalive, ignored.
+func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
+	if h.pc == nil {
+		h.logFn("max-joiner: producer-updated but PC not ready, ignoring")
+		return
+	}
+	sessionID := fmt.Sprint(m["sessionId"])
+	if sessionID != "" && sessionID == h.producerSessionID {
+		h.logFn("max-joiner: producer-updated duplicate sessionId=%s, ignoring", sessionID)
+		return
+	}
+	desc, ok := parseSFUDescription(m["description"])
+	if !ok {
+		h.logFn("max-joiner: producer-updated missing/unparseable description")
+		return
+	}
+	h.logFn("max-joiner: <- producer-updated sessionId=%s [%s]", sessionID, sdpUfragSummary(desc.SDP))
+
+	if err := h.pc.SetRemoteDescription(desc); err != nil {
+		h.logFn("max-joiner: set remote description (producer offer) failed: %v", err)
+		return
+	}
+
+	// CLAUDE-VERIFY (the crux of making SFU media flow): after SetRemoteDescription
+	// the SFU's offer bundles 5 m-lines and our VP8 sampleTrack must be bound to
+	// the us->SFU video m-line (mid:3 in the captured offer) so the answer carries
+	// a real ssrc; otherwise the answer has ssrcs=[] and the SFU re-offers every
+	// ~14s and ICE never settles. AddTracks already added a sendonly video
+	// transceiver, but its m-line ordering vs the SFU's mid map must be reconciled
+	// here (locate the transceiver whose negotiated mid is the recvonly-from-SFU
+	// video line and ReplaceTrack(h.sampleTrack) / set direction sendonly, codec
+	// matching payload types 98-106). Finalize this against the live server.
+
+	answer, err := h.pc.CreateAnswer(nil)
+	if err != nil {
+		h.logFn("max-joiner: create answer failed: %v", err)
+		return
+	}
+	if err := h.pc.SetLocalDescription(answer); err != nil {
+		h.logFn("max-joiner: set local description failed: %v", err)
+		return
+	}
+
+	final := h.gatheredLocalDescription(answer)
+	ssrcs := extractSSRCs(final.SDP)
+	h.producerSessionID = sessionID
+	h.logFn("max-joiner: -> accept-producer sessionId=%s ssrcs=%v [%s]", sessionID, ssrcs, sdpUfragSummary(final.SDP))
+	h.send("accept-producer", map[string]interface{}{
+		"description": final.SDP,
+		"sessionId":   m["sessionId"],
+		"ssrcs":       ssrcs,
+	})
+}
+
+func (h *MaxHeadlessJoiner) iceServers() []webrtc.ICEServer {
 	var iceServers []webrtc.ICEServer
 	if len(h.ci.Stun.URLs) > 0 {
 		iceServers = append(iceServers, webrtc.ICEServer{URLs: h.ci.Stun.URLs})
@@ -655,6 +849,73 @@ func (h *MaxHeadlessJoiner) initPC() {
 			Credential: h.ci.Turn.Credential,
 		})
 	}
+	return iceServers
+}
+
+// initPCSFU builds the PeerConnection for SFU (SERVER-topology) mode: the SFU
+// is always the OFFERER (producer-updated), we answer, and the tunnel rides a
+// VP8 media track (AddTracks/ReadTrackFn) — there is no DataChannel (an SFU
+// cannot carry SCTP). Mirrors telemost_joiner.go's video mode.
+func (h *MaxHeadlessJoiner) initPCSFU() {
+	iceServers := h.iceServers()
+	settingEngine := webrtc.SettingEngine{}
+	settingEngine.DisableCloseByDTLS(true)
+	if h.PCConfig != nil {
+		h.PCConfig.ConfigureSettingEngine(&settingEngine)
+	}
+	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(webrtc.Configuration{
+		ICEServers: iceServers,
+	})
+	if err != nil {
+		h.logFn("max-joiner: failed to create SFU PC: %v", err)
+		return
+	}
+	h.pc = pc
+	h.sampleTrack = h.AddTracks(pc, h.logFn, "max-joiner")
+
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		h.logFn("max-joiner: remote track: codec=%s ssrc=%d", track.Codec().MimeType, track.SSRC())
+		go h.ReadTrackFn(track, func(frame []byte) {
+			if h.vp8tunnel != nil {
+				h.vp8tunnel.HandleFrame(frame)
+			}
+		}, h.logFn, "max-joiner")
+	})
+
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		h.logFn("max-joiner: PC state: %s", state.String())
+		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
+			h.logFn("max-joiner: PC %s, closing transport to trigger reconnect", state.String())
+			h.closeTransport()
+			return
+		}
+		if state == webrtc.PeerConnectionStateConnected && h.vp8tunnel == nil {
+			h.reconnectAttempt.Store(0)
+			h.logFn("max-joiner: === VP8 TUNNEL CONNECTED ===")
+			h.Status.EmitStatus(common.StatusTunnelConnected)
+			h.vp8tunnel = tunnel.NewVP8DataTunnel(h.sampleTrack, h.obf, h.logFn)
+			vp8tun := h.vp8tunnel
+			vp8tun.Start(h.params.VP8FPS, h.params.VP8Batch)
+			if !h.configAck.acknowledged() {
+				acked, cancel := h.configAck.arm()
+				go sendVP8ConfigUntilAcked(acked, cancel, h.stopCh, vp8tun,
+					vp8tun.FPS(), vp8tun.Batch(), 1, h.logFn, "max-joiner")
+				h.logFn("max-joiner: pushed vp8 config fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
+			}
+			if h.OnConnected != nil {
+				h.OnConnected(vp8tun)
+			}
+		}
+	})
+	h.logFn("max-joiner: SFU PC ready with %d ICE servers, waiting for producer offer", len(iceServers))
+}
+
+func (h *MaxHeadlessJoiner) initPC() {
+	if h.params.MediaMode == "sfu" {
+		h.initPCSFU()
+		return
+	}
+	iceServers := h.iceServers()
 
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.DisableCloseByDTLS(true)
@@ -974,8 +1235,23 @@ func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
 
 	switch notif {
 	case "transmitted-data":
+		// DIRECT p2p offer/answer/candidate relay. Not used in SFU mode.
 		if data, ok := m["data"].(map[string]interface{}); ok {
 			h.onTransmittedData(data)
+		}
+	case "producer-updated":
+		// SFU's SDP offer for the producer/consumer negotiation.
+		h.handleProducerUpdated(m)
+	case "consumer-answered":
+		// Confirms our allocate-consumer; nothing else to do.
+		h.logFn("max-joiner: <- consumer-answered sessionId=%v", m["sessionId"])
+	case "topology-changed":
+		topo, _ := m["topology"].(string)
+		h.logFn("max-joiner: <- topology-changed topology=%v", topo)
+		// On a flip to SERVER (a 3rd participant joined), the DIRECT-era
+		// allocate-consumer does not carry over — re-send it so the SFU offers.
+		if h.params.MediaMode == "sfu" && topo == maxTopologyServer {
+			h.sendAllocateConsumer()
 		}
 	case "participant-joined", "registered-peer":
 		pid := m["participantId"]
@@ -985,7 +1261,11 @@ func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
 			}
 		}
 		h.logFn("max-joiner: <- %s participantId=%v", notif, pid)
-		h.maybeSendOffer()
+		// DIRECT only: a peer joining triggers our p2p offer. SFU has no peer
+		// offer (the SFU offers via producer-updated).
+		if h.params.MediaMode != "sfu" {
+			h.maybeSendOffer()
+		}
 	case "connection":
 		h.handleConnection(m)
 	case "settings-update":

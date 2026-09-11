@@ -287,6 +287,7 @@ func main() {
 	}
 	var firstLive *acct
 	live := 0
+	anyRotated := false
 	for i := range pool {
 		a := &pool[i]
 		cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
@@ -307,11 +308,22 @@ func main() {
 			if rotated != "" {
 				note = "rotated=" + redact(rotated)
 				a.Token = rotated
+				anyRotated = true
 			}
 		}
 		fmt.Printf("  %-16s pw=%-3v %-5s %s\n", a.Phone, a.Password != "", status, note)
 	}
 	fmt.Printf("liveness: %d/%d alive\n", live, len(pool))
+	// A successful op19 may rotate a master token; the server keeps accepting
+	// the previous one for a while but not forever, so persist every rotation
+	// the sweep observed (the per-phone paths already do this).
+	if anyRotated {
+		if err := savePool(*poolPath, pool); err != nil {
+			fmt.Fprintf(os.Stderr, "persisting rotated tokens to %s failed: %v\n", *poolPath, err)
+			os.Exit(1)
+		}
+		fmt.Printf("pool updated with rotated tokens\n")
+	}
 
 	if firstLive == nil {
 		fmt.Println("no live master — cannot run -qr/-set-password; refresh a token first")

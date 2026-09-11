@@ -52,11 +52,14 @@ func (c *Client) QRApprove(ctx context.Context, qrLink string) error {
 }
 
 // QRComplete (op291) completes an approved track and returns the newly minted
-// session token.
-func (c *Client) QRComplete(ctx context.Context, trackID string) (token string, err error) {
+// session token plus the account's own user id (profile.contact.id) — the uid
+// is what a caller needs to op76-invite this account into a room, and it is
+// available here WITHOUT phone resolution (op46/op41), which fails for numbers
+// not in MAX's directory.
+func (c *Client) QRComplete(ctx context.Context, trackID string) (token string, uid int64, err error) {
 	resp, err := c.Cmd(ctx, opQRComplete, map[string]any{"trackId": trackID})
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	return parseQRComplete(resp)
 }
@@ -69,32 +72,32 @@ func (c *Client) QRComplete(ctx context.Context, trackID string) (token string, 
 //
 // Returns the session token and the fresh web device id it was bound to (the
 // caller pairs the two when using the session).
-func DeriveWebSession(ctx context.Context, master *Client, resolve ResolveFunc) (sessionToken, webDeviceID string, err error) {
+func DeriveWebSession(ctx context.Context, master *Client, resolve ResolveFunc) (sessionToken, webDeviceID string, uid int64, err error) {
 	if master == nil {
-		return "", "", errors.New("nil master client")
+		return "", "", 0, errors.New("nil master client")
 	}
 	webDeviceID, err = randHex16()
 	if err != nil {
-		return "", "", fmt.Errorf("generate web device id: %w", err)
+		return "", "", 0, fmt.Errorf("generate web device id: %w", err)
 	}
 
 	// The web leg MUST identify as WEB: op288 (QR create-track) is refused
 	// ("qr_login.disabled") on an ANDROID-identified session.
 	web := NewWeb("", webDeviceID)
 	if err := web.Connect(ctx, resolve); err != nil {
-		return "", "", fmt.Errorf("web connect: %w", err)
+		return "", "", 0, fmt.Errorf("web connect: %w", err)
 	}
 	defer web.Close()
 	if _, err := web.SessionInit(ctx); err != nil {
-		return "", "", fmt.Errorf("web session init: %w", err)
+		return "", "", 0, fmt.Errorf("web session init: %w", err)
 	}
 
 	trackID, qrLink, pollMs, err := web.QRCreateTrack(ctx)
 	if err != nil {
-		return "", "", fmt.Errorf("qr create track: %w", err)
+		return "", "", 0, fmt.Errorf("qr create track: %w", err)
 	}
 	if err := master.QRApprove(ctx, qrLink); err != nil {
-		return "", "", fmt.Errorf("qr approve: %w", err)
+		return "", "", 0, fmt.Errorf("qr approve: %w", err)
 	}
 
 	pollInterval := time.Duration(pollMs) * time.Millisecond
@@ -107,26 +110,26 @@ func DeriveWebSession(ctx context.Context, master *Client, resolve ResolveFunc) 
 	for {
 		ok, err := web.QRPoll(waitCtx, trackID)
 		if err != nil {
-			return "", "", fmt.Errorf("qr poll: %w", err)
+			return "", "", 0, fmt.Errorf("qr poll: %w", err)
 		}
 		if ok {
 			break
 		}
 		select {
 		case <-waitCtx.Done():
-			return "", "", fmt.Errorf("qr approval not observed: %w", waitCtx.Err())
+			return "", "", 0, fmt.Errorf("qr approval not observed: %w", waitCtx.Err())
 		case <-time.After(pollInterval):
 		}
 	}
 
-	sessionToken, err = web.QRComplete(waitCtx, trackID)
+	sessionToken, uid, err = web.QRComplete(waitCtx, trackID)
 	if err != nil {
-		return "", "", fmt.Errorf("qr complete: %w", err)
+		return "", "", 0, fmt.Errorf("qr complete: %w", err)
 	}
 	if sessionToken == "" {
-		return "", "", errors.New("qr complete returned empty token")
+		return "", "", 0, errors.New("qr complete returned empty token")
 	}
-	return sessionToken, webDeviceID, nil
+	return sessionToken, webDeviceID, uid, nil
 }
 
 // CheckAlive verifies whether a token is still valid by running the standard
@@ -219,23 +222,29 @@ func parseQRPoll(resp any) (loginAvailable bool, err error) {
 	return b, nil
 }
 
-func parseQRComplete(resp any) (token string, err error) {
+func parseQRComplete(resp any) (token string, uid int64, err error) {
 	m, ok := resp.(map[string]any)
 	if !ok {
-		return "", fmt.Errorf("unexpected QRComplete response type: %T", resp)
+		return "", 0, fmt.Errorf("unexpected QRComplete response type: %T", resp)
+	}
+	// uid = profile.contact.id (the account's own user id), when present.
+	if profile, ok := m["profile"].(map[string]any); ok {
+		if contact, ok := profile["contact"].(map[string]any); ok {
+			uid, _ = toInt64(contact["id"])
+		}
 	}
 	if t, _ := m["token"].(string); t != "" {
-		return t, nil
+		return t, uid, nil
 	}
 	// Fall back to tokenAttrs.LOGIN.token.
 	if attrs, ok := m["tokenAttrs"].(map[string]any); ok {
 		if login, ok := attrs["LOGIN"].(map[string]any); ok {
 			if t, _ := login["token"].(string); t != "" {
-				return t, nil
+				return t, uid, nil
 			}
 		}
 	}
-	return "", errors.New("no token in QRComplete response")
+	return "", 0, errors.New("no token in QRComplete response")
 }
 
 // parseAlive interprets a successful Login response. A successful Login means

@@ -113,13 +113,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  master login: %v\n", err)
 			os.Exit(1)
 		}
-		session, webDev, err := maxproto.DeriveWebSession(dctx, mc, nil)
+		session, webDev, uid, err := maxproto.DeriveWebSession(dctx, mc, nil)
 		mc.Close()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  DeriveWebSession: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("  derived session=%s webDeviceID=%s\n", redact(session), webDev)
+		fmt.Printf("  derived session=%s webDeviceID=%s uid=%d\n", redact(session), webDev, uid)
 		// Confirm the derived session is usable, probed WEB-style (a WEB session
 		// must be used over a WEB-identified connection, like the web client).
 		vctx, vcancel := context.WithTimeout(ctx, 25*time.Second)

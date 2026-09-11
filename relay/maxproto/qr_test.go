@@ -86,7 +86,7 @@ func TestParseQRPoll_WrongType(t *testing.T) {
 
 func TestParseQRComplete_TopLevel(t *testing.T) {
 	resp := map[string]any{"token": "An_Sx6HQ9top"}
-	tok, err := parseQRComplete(resp)
+	tok, _, err := parseQRComplete(resp)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestParseQRComplete_TokenAttrsFallback(t *testing.T) {
 			"LOGIN": map[string]any{"token": "An_Sx6HQ9nested"},
 		},
 	}
-	tok, err := parseQRComplete(resp)
+	tok, _, err := parseQRComplete(resp)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -115,12 +115,30 @@ func TestParseQRComplete_TopLevelPreferred(t *testing.T) {
 		"token":      "top",
 		"tokenAttrs": map[string]any{"LOGIN": map[string]any{"token": "nested"}},
 	}
-	tok, err := parseQRComplete(resp)
+	tok, _, err := parseQRComplete(resp)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if tok != "top" {
 		t.Errorf("token = %q, want top-level preferred", tok)
+	}
+}
+
+func TestParseQRComplete_UID(t *testing.T) {
+	// op291 returns profile.contact.id = the account's own uid; capture it.
+	resp := map[string]any{
+		"tokenAttrs": map[string]any{"LOGIN": map[string]any{"token": "tok1"}},
+		"profile":    map[string]any{"contact": map[string]any{"id": int64(1125900244249497)}},
+	}
+	tok, uid, err := parseQRComplete(resp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tok != "tok1" {
+		t.Errorf("token = %q", tok)
+	}
+	if uid != 1125900244249497 {
+		t.Errorf("uid = %d, want 1125900244249497", uid)
 	}
 }
 
@@ -136,7 +154,7 @@ func TestParseQRComplete_Missing(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := parseQRComplete(tc.resp); err == nil {
+			if _, _, err := parseQRComplete(tc.resp); err == nil {
 				t.Fatal("expected error, got nil")
 			}
 		})

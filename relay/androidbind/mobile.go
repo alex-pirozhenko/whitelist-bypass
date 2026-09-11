@@ -11,7 +11,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	_ "golang.org/x/mobile/bind"
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 const (

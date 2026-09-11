@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -12,7 +11,7 @@ import (
 	"github.com/pion/datachannel"
 	"github.com/pion/webrtc/v4"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 // Telemost chunk size
@@ -169,10 +168,7 @@ func (t *DCTunnel) deliverMessage(data []byte) {
 		data = pt
 	}
 	if t.onData != nil && len(data) > 0 {
-		frame := make([]byte, 4+len(data))
-		binary.BigEndian.PutUint32(frame[0:4], uint32(len(data)))
-		copy(frame[4:], data)
-		t.onData(frame)
+		t.onData(data)
 	}
 }
 
@@ -230,24 +226,21 @@ func (t *DCTunnel) sendRaw(data []byte) {
 }
 
 func (t *DCTunnel) SendData(data []byte) {
-	DecodeFrames(data, func(connID uint32, msgType byte, payload []byte) {
-		buf := make([]byte, 5+len(payload))
-		binary.BigEndian.PutUint32(buf[0:4], connID)
-		buf[4] = msgType
-		copy(buf[5:], payload)
-		wire := buf
-		if t.obf != nil {
-			wire = t.obf.EncryptPayload(buf)
-			if wire == nil {
-				return
-			}
+	if len(data) == 0 {
+		return
+	}
+	wire := data
+	if t.obf != nil {
+		wire = t.obf.EncryptPayload(data)
+		if wire == nil {
+			return
 		}
-		if t.chunked {
-			t.sendChunked(wire)
-		} else {
-			t.sendRaw(wire)
-		}
-	})
+	}
+	if t.chunked {
+		t.sendChunked(wire)
+	} else {
+		t.sendRaw(wire)
+	}
 }
 
 func (t *DCTunnel) SetOnData(fn func([]byte))  { t.onData = fn }

@@ -16,9 +16,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
-	"whitelist-bypass/relay/common"
-	tmapi "whitelist-bypass/relay/telemost"
-	"whitelist-bypass/relay/tunnel"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
+	tmapi "github.com/alex-pirozhenko/whitelist-bypass/relay/telemost"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
 
 const (
@@ -115,6 +115,7 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 		VP8Batch    int    `json:"vp8Batch"`
 		Reliable    bool   `json:"reliable"`
 		DualTrack   bool   `json:"dualTrack"`
+		TunnelSecret string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
 	}
 	if err := json.Unmarshal([]byte(jsonParams), &params); err != nil {
 		j.logFn("telemost-joiner: failed to parse params: %v", err)
@@ -126,7 +127,7 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	if j.displayName == "" {
 		j.displayName = "Joiner"
 	}
-	obf, err := tunnel.NewTunnelObfuscator(tunnel.DeriveSecretFromJoinLink(params.JoinLink))
+	obf, err := tunnel.NewTunnelObfuscator(callpathTunnelSecret(params.TunnelSecret, params.JoinLink))
 	if err != nil {
 		j.logFn("telemost-joiner: obfuscator init failed: %v", err)
 		j.Status.EmitStatusError("obfuscator init: " + err.Error())

@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
-	"whitelist-bypass/relay/common"
-	"whitelist-bypass/relay/tunnel"
-	"whitelist-bypass/relay/wbstream"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/wbstream"
 )
 
 type WBStreamHeadlessJoiner struct {
@@ -49,6 +49,7 @@ func (j *WBStreamHeadlessJoiner) RunWithParams(jsonParams string) {
 		VP8Batch    int    `json:"vp8Batch"`
 		DualTrack   bool   `json:"dualTrack"`
 		Reliable    *bool  `json:"reliable"`
+		TunnelSecret string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
 	}
 	if err := json.Unmarshal([]byte(jsonParams), &params); err != nil {
 		j.logFn("wbstream-joiner: failed to parse params: %v", err)
@@ -68,7 +69,7 @@ func (j *WBStreamHeadlessJoiner) RunWithParams(jsonParams string) {
 	httpClient := j.makeHTTPClient()
 	j.logFn("wbstream-joiner: room=%s name=%s vp8Fps=%d vp8Batch=%d dualTrack=%v", params.RoomID, params.DisplayName, params.VP8FPS, params.VP8Batch, params.DualTrack)
 
-	obf, err := tunnel.NewTunnelObfuscator(tunnel.DeriveSecretFromJoinLink(params.RoomID))
+	obf, err := tunnel.NewTunnelObfuscator(callpathTunnelSecret(params.TunnelSecret, params.RoomID))
 	if err != nil {
 		j.logFn("wbstream-joiner: obfuscator init failed: %v", err)
 		j.Status.EmitStatusError("obfuscator init: " + err.Error())

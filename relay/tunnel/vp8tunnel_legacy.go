@@ -9,7 +9,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 var legacyVP8Keyframe = []byte{

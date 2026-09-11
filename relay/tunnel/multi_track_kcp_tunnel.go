@@ -8,7 +8,7 @@ import (
 
 	kcp "github.com/xtaci/kcp-go/v5"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 const (

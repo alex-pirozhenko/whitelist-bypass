@@ -6,7 +6,7 @@ import (
 	"log"
 	"regexp"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 type TMConfig struct {

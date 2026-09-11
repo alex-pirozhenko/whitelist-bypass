@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"strings"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 const (

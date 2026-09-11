@@ -24,13 +24,13 @@ import (
 	"syscall"
 	"time"
 
-	joinerCommon "whitelist-bypass/relay/pion/headless-joiner-common"
-	"whitelist-bypass/relay/common"
-	"whitelist-bypass/relay/dion"
-	"whitelist-bypass/relay/pion"
-	"whitelist-bypass/relay/tunnel"
-	"whitelist-bypass/relay/wbstream"
-	"whitelist-bypass/relay/desktoptun"
+	joinerCommon "github.com/alex-pirozhenko/whitelist-bypass/relay/pion/headless-joiner-common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/dion"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/pion"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/wbstream"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/desktoptun"
 )
 
 type statusEmitter struct{}

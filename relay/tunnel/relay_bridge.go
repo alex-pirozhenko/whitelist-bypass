@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"whitelist-bypass/relay/common"
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 const acceptErrorRetryDelay = 100 * time.Millisecond

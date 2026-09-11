@@ -1478,6 +1478,16 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.DisableCloseByDTLS(true)
 	settingEngine.SetICEMaxBindingRequests(50)
+	// The SFU is ice-lite and offers a=setup:actpass. Pion's CreateAnswer
+	// picks the DTLS SERVER role (a=setup:passive) whenever the remote is
+	// ice-lite and we are not (peerconnection.go, RFC 8445 §6.1.1 heuristic),
+	// while fixSFUAnswerSDP told the SFU a=setup:active. Both sides then sat
+	// waiting for the other's ClientHello: ICE reached connected (verified
+	// 2026-09-11 with the browser oracle) but the PeerConnection never left
+	// "connecting" and the SFU's 20 s watchdog re-offered forever. Pin the
+	// answering role to client so what we do matches what we say — and what
+	// the real web client does (its answer is a=setup:active).
+	settingEngine.SetAnsweringDTLSRole(webrtc.DTLSRoleClient)
 	settingEngine.SetNetworkTypes([]webrtc.NetworkType{
 		webrtc.NetworkTypeUDP4,
 		webrtc.NetworkTypeTCP4,

@@ -41,6 +41,7 @@ func main() {
 	doQR := flag.Bool("qr", false, "derive a web session from the first live master")
 	doSetPw := flag.Bool("set-password", false, "set a 2FA password on the first live password-less master")
 	addPhone := flag.String("add-phone", "", "op41: resolve+add this phone as a contact of the first live master")
+	injectJSON := flag.Bool("inject-json", false, "derive a web session from the first live master and print localStorage inject JSON (UNREDACTED)")
 	flag.Parse()
 	if *poolPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: maxverify -pool tokens.json [-qr] [-set-password]")
@@ -139,6 +140,38 @@ func main() {
 		}()
 		vcancel()
 		fmt.Printf("  derived session usable WEB-style: ok=%v err=%v\n", werr == nil, werr)
+	}
+
+	if *injectJSON {
+		mc := maxproto.New(firstLive.Token, firstLive.DeviceID)
+		dctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		if err := mc.Connect(dctx, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "connect: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := mc.SessionInit(dctx); err != nil {
+			fmt.Fprintf(os.Stderr, "session-init: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := mc.Login(dctx); err != nil {
+			fmt.Fprintf(os.Stderr, "login: %v\n", err)
+			os.Exit(1)
+		}
+		session, webDev, uid, err := maxproto.DeriveWebSession(dctx, mc, nil)
+		mc.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "DeriveWebSession: %v\n", err)
+			os.Exit(1)
+		}
+		inj := map[string]any{
+			"phone":          firstLive.Phone,
+			"__oneme_auth":   map[string]any{"viewerId": uid, "token": session},
+			"__oneme_device_id": webDev,
+		}
+		b, _ := json.MarshalIndent(inj, "", "  ")
+		fmt.Println(string(b))
+		return
 	}
 
 	if *addPhone != "" {

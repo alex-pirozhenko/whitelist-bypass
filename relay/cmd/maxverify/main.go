@@ -124,7 +124,7 @@ func loginAs(ctx context.Context, c *maxproto.Client) error {
 // back to the pool file atomically. Returns the account and a non-zero exit
 // code (with the reason already printed) when it cannot be used: 2 = not in
 // pool, 3 = token dead, 1 = indeterminate/transport error.
-func selectLiveMaster(ctx context.Context, pool []acct, poolPath, phone, tag string) (*acct, int) {
+func selectLiveMaster(ctx context.Context, pool []acct, poolPath, phone, tag string, persist bool) (*acct, int) {
 	var target *acct
 	for i := range pool {
 		if pool[i].Phone == phone {
@@ -149,7 +149,7 @@ func selectLiveMaster(ctx context.Context, pool []acct, poolPath, phone, tag str
 		fmt.Fprintf(os.Stderr, "%s: %s master token is DEAD (server rejected the login); refresh the token first\n", tag, phone)
 		return nil, 3
 	}
-	if rotated != "" {
+	if rotated != "" && persist {
 		target.Token = rotated
 		if err := savePool(poolPath, pool); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: master token rotated (%s) but persisting the pool failed: %v\n", tag, redact(rotated), err)
@@ -165,8 +165,8 @@ func selectLiveMaster(ctx context.Context, pool []acct, poolPath, phone, tag str
 // master and approve a browser's web.max.ru login QR link (op290). The browser
 // then completes its own login and mints its own session — no token is ever
 // injected into it. Returns the process exit code.
-func approveQR(ctx context.Context, pool []acct, poolPath, phone, qrLink string) int {
-	target, code := selectLiveMaster(ctx, pool, poolPath, phone, "approve-qr")
+func approveQR(ctx context.Context, pool []acct, poolPath, phone, qrLink string, persist bool) int {
+	target, code := selectLiveMaster(ctx, pool, poolPath, phone, "approve-qr", persist)
 	if code != 0 {
 		return code
 	}
@@ -190,8 +190,8 @@ func approveQR(ctx context.Context, pool []acct, poolPath, phone, qrLink string)
 // phone), persist a rotated token, derive a WEB session from it, prove the
 // derived session logs in WEB-style, and write the maxjoin token file. Returns
 // the process exit code. Nothing it prints contains a token.
-func derivePhone(ctx context.Context, pool []acct, poolPath, phone, outPath string) int {
-	target, code := selectLiveMaster(ctx, pool, poolPath, phone, "derive")
+func derivePhone(ctx context.Context, pool []acct, poolPath, phone, outPath string, persist bool) int {
+	target, code := selectLiveMaster(ctx, pool, poolPath, phone, "derive", persist)
 	if code != 0 {
 		return code
 	}
@@ -249,6 +249,7 @@ func main() {
 	doSetPw := flag.Bool("set-password", false, "set a 2FA password on the first live password-less master")
 	addPhone := flag.String("add-phone", "", "op41: resolve+add this phone as a contact of the first live master")
 	addUID := flag.Int64("add-uid", 0, "op34: add this uid as a contact of the first live master (by uid, no phone directory)")
+	persistRotation := flag.Bool("persist-rotation", false, "write op19-returned (\"rotated\") master tokens back to the pool file; off by default because the real APK keeps using its original master token")
 	injectJSON := flag.Bool("inject-json", false, "derive a web session from the first live master and print localStorage inject JSON (UNREDACTED)")
 	flag.Parse()
 	if *poolPath == "" {
@@ -275,7 +276,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: maxverify -pool tokens.json -phone <phone> -approve-qr <https://max.ru/:auth/...> (both flags required)")
 			os.Exit(2)
 		}
-		os.Exit(approveQR(ctx, pool, *poolPath, *phoneFlag, *approveQRFlag))
+		os.Exit(approveQR(ctx, pool, *poolPath, *phoneFlag, *approveQRFlag, *persistRotation))
 	}
 
 	if *derivePhoneFlag != "" || *outPath != "" {
@@ -283,7 +284,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: maxverify -pool tokens.json -derive-phone <phone> -out <path> (both flags required)")
 			os.Exit(2)
 		}
-		os.Exit(derivePhone(ctx, pool, *poolPath, *derivePhoneFlag, *outPath))
+		os.Exit(derivePhone(ctx, pool, *poolPath, *derivePhoneFlag, *outPath, *persistRotation))
 	}
 	var firstLive *acct
 	live := 0
@@ -317,7 +318,7 @@ func main() {
 	// A successful op19 may rotate a master token; the server keeps accepting
 	// the previous one for a while but not forever, so persist every rotation
 	// the sweep observed (the per-phone paths already do this).
-	if anyRotated {
+	if anyRotated && *persistRotation {
 		if err := savePool(*poolPath, pool); err != nil {
 			fmt.Fprintf(os.Stderr, "persisting rotated tokens to %s failed: %v\n", *poolPath, err)
 			os.Exit(1)

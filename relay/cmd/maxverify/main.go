@@ -41,6 +41,7 @@ func main() {
 	doQR := flag.Bool("qr", false, "derive a web session from the first live master")
 	doSetPw := flag.Bool("set-password", false, "set a 2FA password on the first live password-less master")
 	addPhone := flag.String("add-phone", "", "op41: resolve+add this phone as a contact of the first live master")
+	addUID := flag.Int64("add-uid", 0, "op34: add this uid as a contact of the first live master (by uid, no phone directory)")
 	injectJSON := flag.Bool("inject-json", false, "derive a web session from the first live master and print localStorage inject JSON (UNREDACTED)")
 	flag.Parse()
 	if *poolPath == "" {
@@ -198,6 +199,32 @@ func main() {
 			return
 		}
 		fmt.Printf("  op41 OK: contact uid=%d new=%v\n", uid, isNew)
+	}
+
+	if *addUID != 0 {
+		fmt.Printf("\n[add-uid] %s adds contact uid=%d (op34 CONTACT_ACTION ADD, by uid) ...\n", firstLive.Phone, *addUID)
+		mc := maxproto.New(firstLive.Token, firstLive.DeviceID)
+		actx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		defer cancel()
+		if err := mc.Connect(actx, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "  connect: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := mc.SessionInit(actx); err != nil {
+			fmt.Fprintf(os.Stderr, "  session-init: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := mc.Login(actx); err != nil {
+			fmt.Fprintf(os.Stderr, "  login: %v\n", err)
+			os.Exit(1)
+		}
+		err := mc.ContactAction(actx, *addUID, "ADD", "PeerByUID", "")
+		mc.Close()
+		if err != nil {
+			fmt.Printf("  op34 err: %v\n", err)
+			return
+		}
+		fmt.Printf("  op34 OK: added uid=%d as a contact (bypassed the phone directory)\n", *addUID)
 	}
 
 	if *doSetPw {

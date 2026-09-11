@@ -12,28 +12,57 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// vp8Keepalive is a keyframe-tagged VP8 header: frame tag, start code
-// 9d 01 2a, then width/height. The dimensions used to be 16x16; the OK-Calls
-// SFU forwards on-demand layers by requested size (consumers ask for
-// 320x240), so declare 320x240 (little-endian 14-bit + 2 scale bits).
-var vp8Keepalive = []byte{
-	0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x01,
+// vp8Keyframe is a valid, complete 320x240 VP8 keyframe (160 bytes) produced
+// by libvpx. It contains:
+// - 3-byte uncompressed header (frame tag, keyframe, version 0, show_frame=1, first_part_size=145)
+// - 3-byte start code (0x9d, 0x01, 0x2a)
+// - 4-byte dimensions (320x240, 14-bit with 2 scale bits)
+// - 150 bytes partition 0 boolean entropy-coded macroblocks covering all 300 macroblocks of 320x240
+// Trailing bytes (epoch, nonce, ciphertext) appended after this complete frame
+// are ignored by VP8 parsers/decoders since all macroblocks are already decoded.
+var vp8Keyframe = []byte{
+	0x30, 0x12, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x01,
 	0xf0, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
-	0x99, 0x84, 0x88, 0xfc,
+	0x85, 0x84, 0x88, 0x02, 0x02, 0x00, 0x06, 0x16,
+	0x04, 0xf7, 0x06, 0x81, 0x64, 0x9f, 0x6b, 0xdb,
+	0x9b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27,
+	0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b,
+	0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38,
+	0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27,
+	0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b,
+	0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38,
+	0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27,
+	0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b,
+	0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38,
+	0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27,
+	0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b,
+	0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38,
+	0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27,
+	0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b,
+	0x27, 0x38, 0x7b, 0x27, 0x38, 0x7b, 0x27, 0x38,
+	0x7a, 0xf4, 0x00, 0xfe, 0xff, 0xab, 0x50, 0x80,
 }
 
+// vp8Interframe is a valid, complete 320x240 VP8 interframe (26 bytes) produced
+// by libvpx. It encodes an all-skip / zero-motion update across all 300 macroblocks.
 var vp8Interframe = []byte{
-	0xb1, 0x01, 0x00, 0x08, 0x11, 0x18, 0x00, 0x18,
-	0x00, 0x18, 0x58, 0x2f, 0xf4, 0x00, 0x08, 0x00,
-	0x00,
+	0xd1, 0x02, 0x00, 0x05, 0x10, 0xac, 0x00, 0x18,
+	0x00, 0x18, 0x58, 0x2f, 0xf4, 0x00, 0x08, 0x80,
+	0x04, 0x33, 0x5f, 0xad, 0x72, 0x4f, 0x9c, 0x73,
+	0x00, 0x00,
 }
+
+var vp8Keepalive = vp8Keyframe
 
 const (
-	vp8KeepaliveLen  = 20
-	vp8InterframeLen = 17
+	vp8KeyframeLen   = 160
+	vp8InterframeLen = 26
 	epochFieldLen    = 4
-	keepaliveHdrLen  = vp8KeepaliveLen + epochFieldLen
+	keyframeHdrLen   = vp8KeyframeLen + epochFieldLen
 	interframeHdrLen = vp8InterframeLen + epochFieldLen
+
+	vp8KeepaliveLen = vp8KeyframeLen
+	keepaliveHdrLen = keyframeHdrLen
 )
 
 var ErrEmptySecret = errors.New("tunnel: obfuscator requires a non-empty secret")
@@ -101,11 +130,15 @@ func NewTunnelObfuscator(secret []byte) (*TunnelObfuscator, error) {
 
 func (o *TunnelObfuscator) LocalEpoch() uint32 { return o.localEpoch }
 
-func (o *TunnelObfuscator) keepaliveHeader() []byte {
-	hdr := make([]byte, keepaliveHdrLen)
-	copy(hdr, vp8Keepalive)
-	binary.BigEndian.PutUint32(hdr[vp8KeepaliveLen:], o.localEpoch)
+func (o *TunnelObfuscator) keyframeHeader() []byte {
+	hdr := make([]byte, keyframeHdrLen)
+	copy(hdr, vp8Keyframe)
+	binary.BigEndian.PutUint32(hdr[vp8KeyframeLen:], o.localEpoch)
 	return hdr
+}
+
+func (o *TunnelObfuscator) keepaliveHeader() []byte {
+	return o.keyframeHeader()
 }
 
 func (o *TunnelObfuscator) dataHeader() []byte {
@@ -120,16 +153,36 @@ func (o *TunnelObfuscator) EncodeKeepalive(padLen int) []byte {
 	if padLen <= 0 {
 		return hdr
 	}
-	out := make([]byte, keepaliveHdrLen+padLen)
+	out := make([]byte, keyframeHdrLen+padLen)
 	copy(out, hdr)
-	if _, err := rand.Read(out[keepaliveHdrLen:]); err != nil {
+	if _, err := rand.Read(out[keyframeHdrLen:]); err != nil {
+		return hdr
+	}
+	return out
+}
+
+func (o *TunnelObfuscator) EncodeKeepaliveInterframe(padLen int) []byte {
+	hdr := o.dataHeader()
+	if padLen <= 0 {
+		return hdr
+	}
+	out := make([]byte, interframeHdrLen+padLen)
+	copy(out, hdr)
+	if _, err := rand.Read(out[interframeHdrLen:]); err != nil {
 		return hdr
 	}
 	return out
 }
 
 func (o *TunnelObfuscator) EncodeData(payload []byte) []byte {
-	hdr := o.dataHeader()
+	return o.encodeDataWithHeader(o.dataHeader(), payload)
+}
+
+func (o *TunnelObfuscator) EncodeDataKeyframe(payload []byte) []byte {
+	return o.encodeDataWithHeader(o.keyframeHeader(), payload)
+}
+
+func (o *TunnelObfuscator) encodeDataWithHeader(hdr []byte, payload []byte) []byte {
 	nonce := make([]byte, o.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil
@@ -176,12 +229,12 @@ func (o *TunnelObfuscator) Decode(frame []byte) DecodeResult {
 		return DecodeResult{}
 	}
 	var hdrLen, epochOff int
-	isKeepaliveFrame := false
+	isKeyframe := false
 	switch frame[0] {
-	case vp8Keepalive[0]:
-		hdrLen = keepaliveHdrLen
-		epochOff = vp8KeepaliveLen
-		isKeepaliveFrame = true
+	case vp8Keyframe[0]:
+		hdrLen = keyframeHdrLen
+		epochOff = vp8KeyframeLen
+		isKeyframe = true
 	case vp8Interframe[0]:
 		hdrLen = interframeHdrLen
 		epochOff = vp8InterframeLen
@@ -207,20 +260,20 @@ func (o *TunnelObfuscator) Decode(frame []byte) DecodeResult {
 	}
 	o.mu.Unlock()
 
-	if isKeepaliveFrame || len(frame) == hdrLen {
-		res.Keepalive = true
-		return res
-	}
-
 	body := frame[hdrLen:]
 	nonceSize := o.aead.NonceSize()
 	if len(body) < nonceSize+o.aead.Overhead() {
-		return DecodeResult{}
+		res.Keepalive = true
+		return res
 	}
 	nonce := body[:nonceSize]
 	ciphertext := body[nonceSize:]
 	plaintext, err := o.aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
+		if isKeyframe {
+			res.Keepalive = true
+			return res
+		}
 		return DecodeResult{}
 	}
 	res.Payload = plaintext

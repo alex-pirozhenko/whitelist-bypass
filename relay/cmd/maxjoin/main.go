@@ -315,7 +315,9 @@ func doRun(tf tokenFile, o runOpts) {
 		})
 		go func() {
 			for i := 0; i < 100; i++ {
-				dt.SendData([]byte(fmt.Sprintf("%s-msg-%d", role, i)))
+				msg := fmt.Sprintf("%s-msg-%d", role, i)
+				dt.SendData([]byte(msg))
+				logFn(">>> SEND %d bytes: %q", len(msg), msg)
 				time.Sleep(2 * time.Second)
 			}
 		}()

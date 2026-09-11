@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -273,7 +274,7 @@ type MaxHeadlessJoiner struct {
 
 	// SFU (MediaMode=="sfu") media plane: the tunnel rides a VP8 media track
 	// through the SERVER-topology SFU (an SFU cannot carry an SCTP DataChannel).
-	sampleTrack       *webrtc.TrackLocalStaticSample
+	rtpTrack          *webrtc.TrackLocalStaticRTP
 	sampleAudioTrack  *webrtc.TrackLocalStaticSample
 	sfuTrackBound     bool
 	vp8tunnel         *tunnel.VP8DataTunnel
@@ -468,7 +469,10 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	h.peerMu.Unlock()
 	h.offerOnce = sync.Once{}
 	// SFU media plane.
-	h.sampleTrack = nil
+	if h.vp8tunnel != nil {
+		h.vp8tunnel.Stop()
+	}
+	h.rtpTrack = nil
 	h.sfuTrackBound = false
 	h.vp8tunnel = nil
 	h.producerSessionID = ""
@@ -835,9 +839,9 @@ func (h *MaxHeadlessJoiner) handleConnection(m map[string]interface{}) {
 func (h *MaxHeadlessJoiner) sendSwitchTopology() {
 	h.send("switch-topology", map[string]interface{}{
 		"topology": maxTopologyServer,
-		"force":    true,
+		"force":    false,
 	})
-	h.logFn("max-joiner: -> switch-topology %s (force)", maxTopologyServer)
+	h.logFn("max-joiner: -> switch-topology %s", maxTopologyServer)
 }
 
 // toStringSlice converts a decoded JSON array into []string, skipping non-strings.
@@ -1114,15 +1118,19 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 	// This ensures the answer SDP carries real SSRCs (not ssrcs=[]) and the
 	// SFU does not re-offer every ~14s. On repeat offers (realloc) the track
 	// is already bound so we just ReplaceTrack on the existing sender.
-	if h.sampleTrack != nil && !h.sfuTrackBound {
-		sender, addErr := h.pc.AddTrack(h.sampleTrack)
-		h.trPC("addTrack", trackArgs(h.sampleTrack), nil, addErr)
+	if h.rtpTrack != nil && !h.sfuTrackBound {
+		sender, addErr := h.pc.AddTrack(h.rtpTrack)
+		h.trPC("addTrack", trackArgs(h.rtpTrack), nil, addErr)
 		if addErr != nil {
 			h.logFn("max-joiner: AddTrack (pre-SRD) failed: %v", addErr)
 		} else {
 			h.sfuTrackBound = true
-			go tunnel.DrainSenderRTCPLogging(sender, h.logFn, "max-joiner: video-sender")
-			h.logFn("max-joiner: AddTrack VP8 sampleTrack (pre-SRD), sender=%v", sender != nil)
+			go tunnel.DrainSenderRTCPWithHandler(sender, h.logFn, "max-joiner: video-sender", func() {
+				if h.vp8tunnel != nil {
+					h.vp8tunnel.RequestKeyframe()
+				}
+			})
+			h.logFn("max-joiner: AddTrack VP8 rtpTrack (pre-SRD), sender=%v", sender != nil)
 		}
 		// Bind the silent audio track too, so the SFU's audio-send m-line (mid:2)
 		// is answered sendonly with a real SSRC (see initPCSFU rationale).
@@ -1578,19 +1586,19 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	h.attachTranscriptStateHandlers(pc)
 	h.startStatsLoop(pc)
 
-	// Create the VP8 sample track object but do NOT add it to the PC yet.
-	// handleProducerUpdated calls pc.AddTrack(sampleTrack) right before
+	// Create the VP8 RTP track object but do NOT add it to the PC yet.
+	// handleProducerUpdated calls pc.AddTrack(rtpTrack) right before
 	// SetRemoteDescription so pion's transceiver matching binds it to the
 	// SFU's mid:3 (us->SFU video recvonly).
-	sampleTrack, err := webrtc.NewTrackLocalStaticSample(
+	rtpTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
 		"video", "tunnel-video",
 	)
 	if err != nil {
-		h.logFn("max-joiner: failed to create VP8 sample track: %v", err)
+		h.logFn("max-joiner: failed to create VP8 RTP track: %v", err)
 		return
 	}
-	h.sampleTrack = sampleTrack
+	h.rtpTrack = rtpTrack
 
 	// Silent Opus audio track for the SFU's audio-send m-line (mid:2). The web
 	// client always binds BOTH a mic and a camera track before answering; if we
@@ -1666,7 +1674,7 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 			h.reconnectAttempt.Store(0)
 			h.logFn("max-joiner: === VP8 TUNNEL CONNECTED ===")
 			h.Status.EmitStatus(common.StatusTunnelConnected)
-			h.vp8tunnel = tunnel.NewVP8DataTunnel(h.sampleTrack, h.obf, h.logFn)
+			h.vp8tunnel = tunnel.NewVP8DataTunnelRTP(h.rtpTrack, h.obf, h.logFn)
 			vp8tun := h.vp8tunnel
 			vp8tun.Start(h.params.VP8FPS, h.params.VP8Batch)
 			if !h.configAck.acknowledged() {
@@ -1675,8 +1683,9 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 					vp8tun.FPS(), vp8tun.Batch(), 1, h.logFn, "max-joiner")
 				h.logFn("max-joiner: pushed vp8 config fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
 			}
+			wrapped := newSFUTunnelWrapper(vp8tun, h)
 			if h.OnConnected != nil {
-				h.OnConnected(vp8tun)
+				h.OnConnected(wrapped)
 			}
 		}
 	})
@@ -2474,3 +2483,53 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 		h.logFn("max-joiner: sent ANSWER [%s]", sdpUfragSummary(answer.SDP))
 	}
 }
+
+// sfuTunnelWrapper wraps a VP8 DataTunnel in SFU mode to intercept control-plane
+// frames (MsgConfig and MsgConfigAck on ControlConnID), automatically acknowledging
+// incoming config requests and confirming handshake completion without leaking
+// control frames into the user payload stream.
+type sfuTunnelWrapper struct {
+	tunnel.DataTunnel
+	h          *MaxHeadlessJoiner
+	userOnData func([]byte)
+	mu         sync.Mutex
+}
+
+func newSFUTunnelWrapper(dt tunnel.DataTunnel, h *MaxHeadlessJoiner) *sfuTunnelWrapper {
+	w := &sfuTunnelWrapper{
+		DataTunnel: dt,
+		h:          h,
+	}
+	dt.SetOnData(w.onData)
+	return w
+}
+
+func (w *sfuTunnelWrapper) SetOnData(fn func([]byte)) {
+	w.mu.Lock()
+	w.userOnData = fn
+	w.mu.Unlock()
+}
+
+func (w *sfuTunnelWrapper) onData(data []byte) {
+	if len(data) >= 9 && binary.BigEndian.Uint32(data[4:8]) == tunnel.ControlConnID {
+		msgType := data[8]
+		if msgType == tunnel.MsgConfig {
+			w.h.logFn("max-joiner: received peer vp8 config, marking acked and sending MsgConfigAck")
+			w.h.MarkConfigAcked()
+			w.DataTunnel.SendData(tunnel.EncodeFrame(tunnel.ControlConnID, tunnel.MsgConfigAck, nil))
+			return
+		}
+		if msgType == tunnel.MsgConfigAck {
+			w.h.logFn("max-joiner: received vp8 config ack from peer")
+			w.h.MarkConfigAcked()
+			return
+		}
+	}
+	w.mu.Lock()
+	cb := w.userOnData
+	w.mu.Unlock()
+	if cb != nil {
+		cb(data)
+	}
+}
+

@@ -12,6 +12,10 @@ import (
 // NACKs, REMB, transport-cc, receiver reports). An SFU that keeps asking for
 // keyframes is telling us it does not accept the frames we produce.
 func DrainSenderRTCPLogging(sender *webrtc.RTPSender, logFn func(string, ...any), tag string) {
+	DrainSenderRTCPWithHandler(sender, logFn, tag, nil)
+}
+
+func DrainSenderRTCPWithHandler(sender *webrtc.RTPSender, logFn func(string, ...any), tag string, onKeyframeReq func()) {
 	if sender == nil {
 		return
 	}
@@ -27,8 +31,14 @@ func DrainSenderRTCPLogging(sender *webrtc.RTPSender, logFn func(string, ...any)
 			switch p.(type) {
 			case *rtcp.PictureLossIndication:
 				counts["PLI"]++
+				if onKeyframeReq != nil {
+					onKeyframeReq()
+				}
 			case *rtcp.FullIntraRequest:
 				counts["FIR"]++
+				if onKeyframeReq != nil {
+					onKeyframeReq()
+				}
 			case *rtcp.TransportLayerNack:
 				counts["NACK"]++
 			case *rtcp.ReceiverEstimatedMaximumBitrate:

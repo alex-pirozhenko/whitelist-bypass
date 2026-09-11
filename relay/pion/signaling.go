@@ -218,9 +218,17 @@ func readVP8Track(track *webrtc.TrackRemote, handler func([]byte), logFn func(st
 		if pkt.Unmarshal(buf[:n]) != nil {
 			continue
 		}
-		if haveLastSeq && pkt.SequenceNumber != lastSeq+1 {
-			frameValid = false
-			frameBuf = frameBuf[:0]
+		if len(pkt.Payload) == 0 {
+			continue
+		}
+		if haveLastSeq {
+			if pkt.SequenceNumber == lastSeq {
+				continue
+			}
+			if pkt.SequenceNumber != lastSeq+1 {
+				frameValid = false
+				frameBuf = frameBuf[:0]
+			}
 		}
 		lastSeq = pkt.SequenceNumber
 		haveLastSeq = true

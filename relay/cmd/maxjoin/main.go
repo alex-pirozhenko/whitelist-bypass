@@ -7,9 +7,19 @@
 //	maxjoin -mode run -token-file A.json -role offerer -create -callee-phone +B [-secs 90]
 //	  (offerer creates the room itself and offers; prints the joinLink/conv it made)
 //	maxjoin -mode run -token-file B.json -role answerer -join-link <jl> -conv <uuid> [-secs 90]
+//	maxjoin -mode callinfo -token-file B.json -join-link <jl> -conv <uuid> [-platform web]
+//	  (control-plane join only: op166 CallInfo as JSON on stdout, for a browser
+//	  page that opens the ws2 socket itself; the account token is never printed)
 //
-// A/B token files are {"token","device_id","phone"} JSON. Both run peers derive
-// the same obfuscator secret from the shared joinLink (or pass -tunnel-secret).
+// A/B token files are {"token","device_id","phone","platform"?} JSON;
+// platform is "android" (default, a master token) or "web" (a session derived
+// with `maxverify -derive-phone`). -platform overrides the file. Both run peers
+// derive the same obfuscator secret from the shared joinLink (or pass
+// -tunnel-secret).
+//
+// -transcript <path> writes the JSONL diagnostic transcript (tools/maxref/
+// TRANSCRIPT.md in letmeout) with -who as the participant label (default
+// pion-<role>).
 package main
 
 import (
@@ -36,6 +46,7 @@ type tokenFile struct {
 	Token    string `json:"token"`
 	DeviceID string `json:"device_id"`
 	Phone    string `json:"phone"`
+	Platform string `json:"platform"` // "android" (default) | "web"
 }
 
 // statusEmitter / pcConfigurer are trivial stubs of the joiner's deps.
@@ -77,26 +88,66 @@ func loadToken(path string) tokenFile {
 	return tf
 }
 
+// newControlClient builds the maxproto client for the token's platform: a WEB
+// session must be used over a WEB-identified connection (maxproto.NewWeb).
+func newControlClient(tf tokenFile) *maxproto.Client {
+	if tf.Platform == "web" {
+		return maxproto.NewWeb(tf.Token, tf.DeviceID)
+	}
+	return maxproto.New(tf.Token, tf.DeviceID)
+}
+
+// runOpts carries the -mode run / callinfo settings.
+type runOpts struct {
+	role, joinLink, conv      string
+	create                    bool
+	calleePhone, tunnelSecret string
+	secs                      int
+	icePolicy, mediaMode      string
+	calleeUID                 int64
+	transcriptPath, who       string
+}
+
 func main() {
-	mode := flag.String("mode", "run", "create | run")
-	tokenPath := flag.String("token-file", "", "token JSON {token,device_id,phone}")
+	mode := flag.String("mode", "run", "create | run | callinfo")
+	tokenPath := flag.String("token-file", "", "token JSON {token,device_id,phone,platform?}")
+	platform := flag.String("platform", "", "session platform: android | web (overrides the token file's \"platform\")")
 	peerPhone := flag.String("peer-phone", "", "create: callee phone for op76 (op46 resolve)")
 	calleeUID := flag.Int64("callee-uid", 0, "create: callee uid to invite directly (skips op46; from the callee's own session)")
 	role := flag.String("role", "answerer", "run: offerer | answerer")
-	joinLink := flag.String("join-link", "", "run/answerer: the room joinLink")
-	conv := flag.String("conv", "", "run/answerer: the conversationId")
+	joinLink := flag.String("join-link", "", "run/answerer, callinfo: the room joinLink")
+	conv := flag.String("conv", "", "run/answerer, callinfo: the conversationId")
 	create := flag.Bool("create", false, "run/offerer: create the room via op76 itself")
 	calleePhone := flag.String("callee-phone", "", "run/offerer -create: callee phone")
 	tunnelSecret := flag.String("tunnel-secret", "", "optional shared base64 obfuscator secret")
 	secs := flag.Int("secs", 90, "run: seconds to stay up")
 	icePolicy := flag.String("ice-policy", "relay", "run: ICE transport policy (relay|all)")
 	mediaMode := flag.String("media-mode", "direct", "run: media topology (direct|sfu)")
+	transcriptPath := flag.String("transcript", "", "run: write the JSONL diagnostic transcript to this file")
+	who := flag.String("who", "", "run: participant label for the transcript (default pion-<role>)")
 	flag.Parse()
 
 	if *tokenPath == "" {
 		log.Fatal("-token-file is required")
 	}
 	tf := loadToken(*tokenPath)
+	if *platform != "" {
+		tf.Platform = *platform
+	}
+	if tf.Platform == "" {
+		tf.Platform = "android"
+	}
+	if tf.Platform != "android" && tf.Platform != "web" {
+		log.Fatalf("unknown platform %q (want android|web)", tf.Platform)
+	}
+	log.Printf("token file %s: phone=%s platform=%s", *tokenPath, tf.Phone, tf.Platform)
+
+	opts := runOpts{
+		role: *role, joinLink: *joinLink, conv: *conv, create: *create,
+		calleePhone: *calleePhone, tunnelSecret: *tunnelSecret, secs: *secs,
+		icePolicy: *icePolicy, mediaMode: *mediaMode, calleeUID: *calleeUID,
+		transcriptPath: *transcriptPath, who: *who,
+	}
 
 	switch *mode {
 	case "create":
@@ -105,7 +156,12 @@ func main() {
 		// uid (obtained from that account's own session), no phone resolution.
 		doCreate(tf, *peerPhone, *calleeUID)
 	case "run":
-		doRun(tf, *role, *joinLink, *conv, *create, *calleePhone, *tunnelSecret, *secs, *icePolicy, *mediaMode, *calleeUID)
+		doRun(tf, opts)
+	case "callinfo":
+		if opts.joinLink == "" && !opts.create {
+			log.Fatal("callinfo: -join-link is required (or -create with -callee-phone/-callee-uid)")
+		}
+		doCallInfo(tf, opts)
 	default:
 		log.Fatalf("unknown mode %q", *mode)
 	}
@@ -116,7 +172,7 @@ func doCreate(tf tokenFile, peerPhone string, calleeUID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
-	c := maxproto.New(tf.Token, tf.DeviceID)
+	c := newControlClient(tf)
 	if err := c.Connect(ctx, resolve); err != nil {
 		log.Fatalf("connect: %v", err)
 	}
@@ -151,15 +207,86 @@ func doCreate(tf tokenFile, peerPhone string, calleeUID int64) {
 	fmt.Println(string(out))
 }
 
-// doRun constructs a MaxHeadlessJoiner and pumps test bytes over the tunnel.
-func doRun(tf tokenFile, role, joinLink, conv string, create bool, calleePhone, tunnelSecret string, secs int, icePolicy, mediaMode string, calleeUID int64) {
-	logFn := func(f string, a ...any) { log.Printf("[%s] "+f, append([]any{role}, a...)...) }
+// authParams builds the joiner's JSON auth params from the token file + opts.
+func authParams(tf tokenFile, o runOpts) string {
+	params := joiner.MaxHeadlessAuthParams{
+		Token:              tf.Token,
+		DeviceID:           tf.DeviceID,
+		Platform:           tf.Platform,
+		JoinLink:           o.joinLink,
+		ConversationID:     o.conv,
+		Role:               o.role,
+		ICETransportPolicy: o.icePolicy,
+		TunnelMode:         "dc",
+		TunnelSecret:       o.tunnelSecret,
+		CreateRoom:         o.create,
+		CalleePhone:        o.calleePhone,
+		CalleeUID:          o.calleeUID,
+		MediaMode:          o.mediaMode,
+	}
+	pj, _ := json.Marshal(params)
+	return string(pj)
+}
 
-	j := joiner.NewMaxHeadlessJoiner(
+func newJoiner(logFn func(string, ...any)) *joiner.MaxHeadlessJoiner {
+	return joiner.NewMaxHeadlessJoiner(
 		logFn, joiner.ResolveFunc(resolve), statusEmitter{}, pcConfigurer{},
 		pion.AddTunnelTracks,
 		pion.ReadTrack,
 	)
+}
+
+// doCallInfo performs the control-plane join only and prints the CallInfo a
+// browser page needs to open ws2 itself. TURN credentials are short-lived call
+// grants and are printed; the account token never is.
+func doCallInfo(tf tokenFile, o runOpts) {
+	logFn := func(f string, a ...any) { log.Printf("[callinfo] "+f, a...) }
+	j := newJoiner(logFn)
+	ci, jl, conv, err := j.CallInfoOnly(authParams(tf, o))
+	if err != nil {
+		log.Fatalf("callinfo: %v", err)
+	}
+	out := map[string]any{
+		"platform":       tf.Platform,
+		"phone":          tf.Phone,
+		"joinLink":       jl,
+		"conversationId": conv,
+		"endpoint":       ci.Endpoint,
+		"wtEndpoint":     ci.WtEndpoint,
+		"turn":           ci.Turn,
+		"stun":           map[string]any{"urls": ci.Stun.URLs},
+		"id":             map[string]any{"internal": ci.ID.Internal, "external": ci.ID.External},
+		"clientType":     ci.ClientType,
+		"peerId":         ci.PeerID,
+		"deviceIdx":      ci.DeviceIdx,
+	}
+	b, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		log.Fatalf("callinfo: marshal: %v", err)
+	}
+	fmt.Println(string(b))
+}
+
+// doRun constructs a MaxHeadlessJoiner and pumps test bytes over the tunnel.
+func doRun(tf tokenFile, o runOpts) {
+	role := o.role
+	logFn := func(f string, a ...any) { log.Printf("[%s] "+f, append([]any{role}, a...)...) }
+
+	j := newJoiner(logFn)
+
+	if o.transcriptPath != "" {
+		f, err := os.OpenFile(o.transcriptPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			log.Fatalf("open transcript: %v", err)
+		}
+		defer f.Close()
+		who := o.who
+		if who == "" {
+			who = "pion-" + role
+		}
+		j.Transcript = joiner.NewJSONLTranscript(f, who)
+		log.Printf("[%s] transcript -> %s (who=%s)", role, o.transcriptPath, who)
+	}
 
 	var recvCount atomic.Int64
 	j.OnConnected = func(dt tunnel.DataTunnel) {
@@ -176,25 +303,9 @@ func doRun(tf tokenFile, role, joinLink, conv string, create bool, calleePhone, 
 		}()
 	}
 
-	params := joiner.MaxHeadlessAuthParams{
-		Token:              tf.Token,
-		DeviceID:           tf.DeviceID,
-		JoinLink:           joinLink,
-		ConversationID:     conv,
-		Role:               role,
-		ICETransportPolicy: icePolicy,
-		TunnelMode:         "dc",
-		TunnelSecret:       tunnelSecret,
-		CreateRoom:         create,
-		CalleePhone:        calleePhone,
-		CalleeUID:          calleeUID,
-		MediaMode:          mediaMode,
-	}
-	pj, _ := json.Marshal(params)
+	go j.RunWithParams(authParams(tf, o))
 
-	go j.RunWithParams(string(pj))
-
-	time.Sleep(time.Duration(secs) * time.Second)
+	time.Sleep(time.Duration(o.secs) * time.Second)
 	j.Close()
 	log.Printf("[%s] DONE — received %d messages", role, recvCount.Load())
 	if recvCount.Load() > 0 {

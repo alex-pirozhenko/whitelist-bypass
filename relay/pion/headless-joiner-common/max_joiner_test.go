@@ -1,11 +1,17 @@
 package joiner
 
 import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/maxproto"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
+	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -194,5 +200,136 @@ func TestOnLocalICECandidateBuffersUntilPeerKnown(t *testing.T) {
 	}
 	if len(h.pendingLocalICE) != 0 {
 		t.Fatalf("setPeerAddr: pendingLocalICE not drained, got %v", h.pendingLocalICE)
+	}
+}
+
+// TestApplyDefaultsPlatform: android is the default; "web" (case-insensitive)
+// switches the ws2 defaults to the web client's (device=browser, appVersion
+// from maxproto.WebUA) and leaves ClientType empty so CallInfo's wins.
+func TestApplyDefaultsPlatform(t *testing.T) {
+	p := &MaxHeadlessAuthParams{}
+	p.applyDefaults()
+	if p.Platform != maxPlatformAndroid {
+		t.Fatalf("default Platform = %q, want android", p.Platform)
+	}
+
+	w := &MaxHeadlessAuthParams{Platform: " WEB "}
+	w.applyDefaults()
+	if w.Platform != maxPlatformWeb {
+		t.Fatalf("Platform = %q, want web", w.Platform)
+	}
+	if w.Device != maxDefaultWebDevice {
+		t.Errorf("web Device = %q, want %q", w.Device, maxDefaultWebDevice)
+	}
+	if w.ClientType != "" {
+		t.Errorf("web ClientType = %q, want empty (CallInfo must win)", w.ClientType)
+	}
+	if want, _ := maxproto.WebUA["appVersion"].(string); w.AppVersion != want || want == "" {
+		t.Errorf("web AppVersion = %q, want WebUA appVersion %q", w.AppVersion, want)
+	}
+	// Explicit overrides survive on web too.
+	w2 := &MaxHeadlessAuthParams{Platform: "web", Device: "custom", ClientType: "X"}
+	w2.applyDefaults()
+	if w2.Device != "custom" || w2.ClientType != "X" {
+		t.Errorf("applyDefaults overwrote explicit web values: %+v", w2)
+	}
+}
+
+// TestBuildWSURLWeb mirrors the web client's _buildUrl (MAX_WS2_REFERENCE.md
+// §2b): platform=WEB, device=browser, clientType from CallInfo (else PORTAL),
+// and no locale/osVersion params.
+func TestBuildWSURLWeb(t *testing.T) {
+	h := &MaxHeadlessJoiner{}
+	params := &MaxHeadlessAuthParams{Platform: "web"}
+	params.applyDefaults()
+	h.params = params
+	h.ci = &maxproto.CallInfo{Endpoint: "wss://example.max/ws2?tgt=join", ClientType: "FROM_CALLINFO"}
+
+	got := h.buildWSURL()
+	for _, want := range []string{"platform=WEB", "device=browser", "clientType=FROM_CALLINFO", "version=5", "capabilities=1877f", "appVersion=" + params.AppVersion} {
+		if !strings.Contains(got, want) {
+			t.Errorf("buildWSURL() = %q, missing %q", got, want)
+		}
+	}
+	for _, reject := range []string{"locale=", "osVersion=", "platform=ANDROID", "ONE_ME"} {
+		if strings.Contains(got, reject) {
+			t.Errorf("buildWSURL() = %q, must not contain %q on web", got, reject)
+		}
+	}
+
+	// No CallInfo clientType -> web SDK default PORTAL.
+	h.ci = &maxproto.CallInfo{Endpoint: "wss://example.max/ws2"}
+	if got := h.buildWSURL(); !strings.Contains(got, "clientType=PORTAL") {
+		t.Errorf("buildWSURL() = %q, want clientType=PORTAL fallback", got)
+	}
+}
+
+// TestHandleMessagePingRepliesPong: the ws2 server's bare text "ping" must be
+// answered with a bare text "pong" (not dropped by the JSON decode), logged
+// once, and both frames must land in the transcript.
+func TestHandleMessagePingRepliesPong(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	got := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		for i := 0; i < 2; i++ {
+			mt, msg, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			if mt != websocket.TextMessage {
+				got <- fmt.Sprintf("non-text frame type %d", mt)
+				return
+			}
+			got <- string(msg)
+		}
+	}))
+	defer srv.Close()
+
+	var logs []string
+	h := NewMaxHeadlessJoiner(func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+		stubMaxResolve, stubMaxStatusEmitter{}, stubMaxPCConfigurer{}, stubMaxAddTracks, stubMaxReadTrack)
+	var buf bytes.Buffer
+	h.Transcript = NewJSONLTranscript(&buf, "pion-test")
+
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer ws.Close()
+	h.ws = ws
+
+	h.handleMessage([]byte("ping"))
+	h.handleMessage([]byte("ping"))
+	for i := 0; i < 2; i++ {
+		select {
+		case m := <-got:
+			if m != "pong" {
+				t.Fatalf("server got %q, want bare text pong", m)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("server never received pong")
+		}
+	}
+
+	pongLogs := 0
+	for _, l := range logs {
+		if strings.Contains(l, "ping -> pong") {
+			pongLogs++
+		}
+	}
+	if pongLogs != 1 {
+		t.Errorf("keepalive logged %d times, want exactly once: %v", pongLogs, logs)
+	}
+	if n := strings.Count(buf.String(), `"raw":"pong"`); n != 2 {
+		t.Errorf("transcript has %d tx pong lines, want 2:\n%s", n, buf.String())
+	}
+	// The log line is mirrored into the transcript as kind:"log".
+	if !strings.Contains(buf.String(), `"kind":"log"`) {
+		t.Errorf("transcript missing mirrored log line:\n%s", buf.String())
 	}
 }

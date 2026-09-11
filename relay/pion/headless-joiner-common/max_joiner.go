@@ -41,6 +41,16 @@ const (
 	maxDefaultLocale          = "en"
 	maxDefaultOSVersion       = "34"
 	maxDefaultTunnelMode      = "dc"
+
+	// WEB-platform ws2 defaults. The reference bundle's SDK defaults are
+	// platform:"WEB", device:"browser", clientType:"PORTAL" (MAX_WS2_REFERENCE.md
+	// "Open items"); web.max.ru may override them, and op166's CallInfo
+	// clientType wins when present. appVersion follows maxproto.WebUA.
+	maxDefaultWebDevice     = "browser"
+	maxDefaultWebClientType = "PORTAL"
+
+	maxPlatformAndroid = "android"
+	maxPlatformWeb     = "web"
 )
 
 const (
@@ -94,6 +104,14 @@ type MaxHeadlessAuthParams struct {
 	TunnelMode     string `json:"tunnelMode"`
 	TunnelSecret   string `json:"tunnelSecret"`
 
+	// Platform is the session platform the Token belongs to: "android" (the
+	// default; a master token) or "web" (a session derived from a master via
+	// maxproto.DeriveWebSession). Operator rule: Android master tokens are never
+	// used as call participants — participants run on WEB sessions. "web" makes
+	// the control client identify as WEB (maxproto.NewWeb) and the ws2 URL carry
+	// the web client's platform/device/clientType instead of the ANDROID ones.
+	Platform string `json:"platform"`
+
 	// CreateRoom, when true, makes joinCall create the room itself via op76
 	// (VideoChatStart) on the same session before op166-joining it, then fills
 	// JoinLink/ConversationID from the result. Used by the room-owning side
@@ -130,11 +148,21 @@ type MaxHeadlessAuthParams struct {
 }
 
 func (p *MaxHeadlessAuthParams) applyDefaults() {
+	p.Platform = strings.ToLower(strings.TrimSpace(p.Platform))
+	if p.Platform == "" {
+		p.Platform = maxPlatformAndroid
+	}
+	web := p.Platform == maxPlatformWeb
 	if p.APIHost == "" {
 		p.APIHost = maxDefaultAPIHost
 	}
 	if p.AppVersion == "" {
 		p.AppVersion = maxDefaultAppVersion
+		if web {
+			if v, ok := maxproto.WebUA["appVersion"].(string); ok && v != "" {
+				p.AppVersion = v
+			}
+		}
 	}
 	if p.ProtocolVersion == "" {
 		p.ProtocolVersion = maxDefaultProtocolVersion
@@ -142,11 +170,17 @@ func (p *MaxHeadlessAuthParams) applyDefaults() {
 	if p.Capabilities == "" {
 		p.Capabilities = maxDefaultCapabilities
 	}
-	if p.ClientType == "" {
+	// ClientType: android defaults to ONE_ME here; web leaves it empty so
+	// buildWSURL can prefer the clientType op166's CallInfo reports, falling
+	// back to the web SDK default (PORTAL).
+	if p.ClientType == "" && !web {
 		p.ClientType = maxDefaultClientType
 	}
 	if p.Device == "" {
 		p.Device = maxDefaultDevice
+		if web {
+			p.Device = maxDefaultWebDevice
+		}
 	}
 	if p.Locale == "" {
 		p.Locale = maxDefaultLocale
@@ -188,6 +222,9 @@ type MaxHeadlessJoiner struct {
 	PCConfig          PeerConnectionConfigurer
 	AddTracks         AddTunnelTracksFunc
 	ReadTrackFn       ReadTrackFunc
+	// Transcript, when non-nil, receives the JSONL diagnostic transcript
+	// (ws frames, pc calls, state changes, stats, logs). See max_transcript.go.
+	Transcript Transcript
 
 	params *MaxHeadlessAuthParams
 	obf    *tunnel.TunnelObfuscator
@@ -198,9 +235,10 @@ type MaxHeadlessJoiner struct {
 	selfUID    string
 	selfAltUID string
 
-	ws   *websocket.Conn
-	wsMu sync.Mutex
-	seq  int
+	ws         *websocket.Conn
+	wsMu       sync.Mutex
+	seq        int
+	pongLogged bool // ws2 keepalive: log the first ping->pong per session only
 
 	peerMu          sync.Mutex
 	peerAddr        *maxPeerAddr
@@ -232,8 +270,7 @@ type MaxHeadlessJoiner struct {
 const maxTopologyServer = "SERVER"
 
 func NewMaxHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, status StatusEmitter, pcConfig PeerConnectionConfigurer, addTracks AddTunnelTracksFunc, readTrackFn ReadTrackFunc) *MaxHeadlessJoiner {
-	return &MaxHeadlessJoiner{
-		logFn:       logFn,
+	h := &MaxHeadlessJoiner{
 		ResolveFn:   resolveFn,
 		Status:      status,
 		PCConfig:    pcConfig,
@@ -241,6 +278,9 @@ func NewMaxHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, sta
 		ReadTrackFn: readTrackFn,
 		stopCh:      make(chan struct{}),
 	}
+	// Every log line is mirrored into the Transcript (if one is attached later).
+	h.logFn = h.logAndTranscript(logFn)
+	return h
 }
 
 // MarkConfigAcked confirms the peer received our VP8 tunnel config (SFU mode).
@@ -256,6 +296,11 @@ func (h *MaxHeadlessJoiner) RunWithParams(jsonParams string) {
 		return
 	}
 	params.applyDefaults()
+	if params.Platform != maxPlatformAndroid && params.Platform != maxPlatformWeb {
+		h.logFn("max-joiner: unknown platform %q (want android|web)", params.Platform)
+		h.Status.EmitStatusError("bad params: unknown platform " + params.Platform)
+		return
+	}
 	h.params = &params
 
 	// Validate an explicit tunnelSecret early (fast failure), but defer building
@@ -308,6 +353,35 @@ func (h *MaxHeadlessJoiner) RunWithParams(jsonParams string) {
 	}
 }
 
+// CallInfoOnly performs the control-plane join only — connect, session-init,
+// login and op166 VideoChatJoin via the same joinCall path RunWithParams uses
+// (so Platform, CreateRoom etc. are honoured) — then closes the control
+// connection and returns the parsed CallInfo plus the joinLink/conversationId
+// that were actually used. It never opens ws2 or builds a PeerConnection: the
+// caller (maxjoin -mode callinfo) hands the CallInfo to something else, e.g. a
+// browser page that opens the ws2 socket itself.
+func (h *MaxHeadlessJoiner) CallInfoOnly(jsonParams string) (ci *maxproto.CallInfo, joinLink, conversationID string, err error) {
+	var params MaxHeadlessAuthParams
+	if err := json.Unmarshal([]byte(jsonParams), &params); err != nil {
+		return nil, "", "", fmt.Errorf("parse params: %w", err)
+	}
+	params.applyDefaults()
+	if params.Platform != maxPlatformAndroid && params.Platform != maxPlatformWeb {
+		return nil, "", "", fmt.Errorf("unknown platform %q (want android|web)", params.Platform)
+	}
+	h.params = &params
+	defer func() {
+		if h.ctl != nil {
+			h.ctl.Close()
+			h.ctl = nil
+		}
+	}()
+	if err := h.joinCall(); err != nil {
+		return nil, "", "", err
+	}
+	return h.ci, h.params.JoinLink, h.params.ConversationID, nil
+}
+
 func (h *MaxHeadlessJoiner) runOnce() error {
 	h.resetSessionState()
 	if err := h.joinCall(); err != nil {
@@ -334,6 +408,7 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	ws := h.ws
 	h.ws = nil
 	h.seq = 0
+	h.pongLogged = false
 	h.wsMu.Unlock()
 	if ws != nil {
 		ws.Close()
@@ -343,7 +418,7 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 		h.dc = nil
 	}
 	if h.pc != nil {
-		h.pc.Close()
+		h.closePC(h.pc)
 		h.pc = nil
 	}
 	if h.ctl != nil {
@@ -378,7 +453,7 @@ func (h *MaxHeadlessJoiner) Close() {
 		ws.Close()
 	}
 	if h.pc != nil {
-		h.pc.Close()
+		h.closePC(h.pc)
 	}
 	if h.ctl != nil {
 		h.ctl.Close()
@@ -421,7 +496,13 @@ func (h *MaxHeadlessJoiner) buildObfuscator() error {
 
 func (h *MaxHeadlessJoiner) joinCall() error {
 	p := h.params
-	h.ctl = maxproto.New(p.Token, p.DeviceID)
+	// A WEB session (derived from a master) must be used over a WEB-identified
+	// connection, exactly like the web client; an ANDROID master uses New.
+	if p.Platform == maxPlatformWeb {
+		h.ctl = maxproto.NewWeb(p.Token, p.DeviceID)
+	} else {
+		h.ctl = maxproto.New(p.Token, p.DeviceID)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -498,9 +579,15 @@ func (h *MaxHeadlessJoiner) joinCall() error {
 // server requires to accept the ws2 upgrade (see okcalls_peer.py
 // _full_ws_url). Without these the server accepts the handshake but then
 // replies {"type":"error","error":"invalid-request"}.
+//
+// Platform "web" mirrors the web client's _buildUrl (MAX_WS2_REFERENCE.md §2b):
+// platform=WEB, device=browser, clientType from CallInfo (else the SDK default
+// PORTAL), and no locale/osVersion — the web client never appends those two.
+// Android keeps the values the ANDROID app sends.
 func (h *MaxHeadlessJoiner) buildWSURL() string {
 	p := h.params
 	base := h.ci.Endpoint
+	web := p.Platform == maxPlatformWeb
 
 	clientType := p.ClientType
 	if clientType == "" {
@@ -508,17 +595,26 @@ func (h *MaxHeadlessJoiner) buildWSURL() string {
 	}
 	if clientType == "" {
 		clientType = maxDefaultClientType
+		if web {
+			clientType = maxDefaultWebClientType
+		}
+	}
+	platform := "ANDROID"
+	if web {
+		platform = "WEB"
 	}
 
 	values := url.Values{}
 	values.Set("version", p.ProtocolVersion)
 	values.Set("capabilities", p.Capabilities)
-	values.Set("platform", "ANDROID")
+	values.Set("platform", platform)
 	values.Set("clientType", clientType)
 	values.Set("appVersion", p.AppVersion)
 	values.Set("device", p.Device)
-	values.Set("locale", p.Locale)
-	values.Set("osVersion", p.OSVersion)
+	if !web {
+		values.Set("locale", p.Locale)
+		values.Set("osVersion", p.OSVersion)
+	}
 
 	sep := "?"
 	if strings.Contains(base, "?") {
@@ -542,6 +638,11 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 
 	wsHeader := http.Header{}
 	wsHeader.Set("User-Agent", common.UserAgent)
+	if h.params.Platform == maxPlatformWeb {
+		if ua, ok := maxproto.WebUA["headerUserAgent"].(string); ok && ua != "" {
+			wsHeader.Set("User-Agent", ua)
+		}
+	}
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
@@ -559,6 +660,7 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	}
 
 	h.logFn("max-joiner: connecting to %s", wsURL)
+	h.trWSOpen(wsURL)
 	ws, resp, err := dialer.Dial(wsURL, wsHeader)
 	if err != nil {
 		status := "?"
@@ -940,7 +1042,7 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 		h.logFn("max-joiner: sessionId changed %s -> %s, recreating PeerConnection",
 			h.producerSessionID, sessionID)
 		if h.pc != nil {
-			_ = h.pc.Close()
+			h.closePC(h.pc)
 		}
 		h.sfuTrackBound = false
 		h.initPCSFU()
@@ -960,6 +1062,7 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 	// is already bound so we just ReplaceTrack on the existing sender.
 	if h.sampleTrack != nil && !h.sfuTrackBound {
 		sender, addErr := h.pc.AddTrack(h.sampleTrack)
+		h.trPC("addTrack", trackArgs(h.sampleTrack), nil, addErr)
 		if addErr != nil {
 			h.logFn("max-joiner: AddTrack (pre-SRD) failed: %v", addErr)
 		} else {
@@ -971,6 +1074,7 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 		// is answered sendonly with a real SSRC (see initPCSFU rationale).
 		if h.sampleAudioTrack != nil {
 			asender, aErr := h.pc.AddTrack(h.sampleAudioTrack)
+			h.trPC("addTrack", trackArgs(h.sampleAudioTrack), nil, aErr)
 			if aErr != nil {
 				h.logFn("max-joiner: AddTrack audio (pre-SRD) failed: %v", aErr)
 			} else {
@@ -989,9 +1093,11 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 	// thus learns our ufrag/pwd — is covered by retries rather than an
 	// artificial sleep + manual candidate injection (which broke ICE restart).
 	if err := h.pc.SetRemoteDescription(desc); err != nil {
+		h.trPC("setRemoteDescription", sdpArgs(desc), nil, err)
 		h.logFn("max-joiner: set remote description (producer offer) failed: %v", err)
 		return
 	}
+	h.trPC("setRemoteDescription", sdpArgs(desc), nil, nil)
 
 	for _, tr := range h.pc.GetTransceivers() {
 		h.logFn("max-joiner: transceiver mid=%s kind=%s dir=%s sender=%v",
@@ -1000,13 +1106,17 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 
 	answer, err := h.pc.CreateAnswer(nil)
 	if err != nil {
+		h.trPC("createAnswer", nil, nil, err)
 		h.logFn("max-joiner: create answer failed: %v", err)
 		return
 	}
+	h.trPC("createAnswer", nil, sdpArgs(answer), nil)
 	if err := h.pc.SetLocalDescription(answer); err != nil {
+		h.trPC("setLocalDescription", sdpArgs(answer), nil, err)
 		h.logFn("max-joiner: set local description failed: %v", err)
 		return
 	}
+	h.trPC("setLocalDescription", sdpArgs(answer), nil, nil)
 
 	// Build accept-producer. The ssrcs field MUST echo the SFU's OFFERED
 	// producer ssrcs (the a=ssrc lines carrying label:audio-/video- in the
@@ -1382,15 +1492,19 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	if h.params != nil && h.params.ICETransportPolicy == "all" {
 		icePolicy = webrtc.ICETransportPolicyAll
 	}
-	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(webrtc.Configuration{
+	pcCfg := webrtc.Configuration{
 		ICEServers:         iceServers,
 		ICETransportPolicy: icePolicy,
-	})
+	}
+	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(pcCfg)
+	h.trPC("new", pcConfigArgs(pcCfg), nil, err)
 	if err != nil {
 		h.logFn("max-joiner: failed to create SFU PC: %v", err)
 		return
 	}
 	h.pc = pc
+	h.attachTranscriptStateHandlers(pc)
+	h.startStatsLoop(pc)
 
 	// Create the VP8 sample track object but do NOT add it to the PC yet.
 	// handleProducerUpdated calls pc.AddTrack(sampleTrack) right before
@@ -1429,9 +1543,13 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	// pion's SCTP association so mid:1 is answered as a real datachannel section
 	// rather than a dead one — another layout the SFU media core rejects.
 	for _, name := range []string{"producerNotification", "producerCommand", "producerScreenShare", "consumerScreenShare"} {
-		if _, derr := pc.CreateDataChannel(name, nil); derr != nil {
+		dc, derr := pc.CreateDataChannel(name, nil)
+		h.trPC("createDataChannel", map[string]any{"label": name, "options": nil}, nil, derr)
+		if derr != nil {
 			h.logFn("max-joiner: failed to create %s datachannel: %v", name, derr)
+			continue
 		}
+		h.attachDCStateHandlers(dc)
 	}
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
@@ -1444,6 +1562,7 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	})
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		h.trState("ice", state.String(), "")
 		h.logFn("max-joiner: ICE state: %s", state.String())
 	})
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -1452,6 +1571,7 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 		}
 	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		h.trState("conn", state.String(), "")
 		h.logFn("max-joiner: PC state: %s", state.String())
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
 			h.logFn("max-joiner: PC %s, closing transport to trigger reconnect", state.String())
@@ -1511,20 +1631,28 @@ func (h *MaxHeadlessJoiner) initPC() {
 		icePolicy = webrtc.ICETransportPolicyAll
 	}
 	h.logFn("max-joiner: ICE transport policy=%s", icePolicy)
-	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(webrtc.Configuration{
+	pcCfg := webrtc.Configuration{
 		ICEServers:         iceServers,
 		ICETransportPolicy: icePolicy,
-	})
+	}
+	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(pcCfg)
+	h.trPC("new", pcConfigArgs(pcCfg), nil, err)
 	if err != nil {
 		h.logFn("max-joiner: failed to create PC: %v", err)
 		return
 	}
 	h.pc = pc
+	h.attachTranscriptStateHandlers(pc)
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		h.trState("ice", state.String(), "")
+	})
+	h.startStatsLoop(pc)
 
 	h.logFn("max-joiner: role=%s tunnelMode=%s", h.params.Role, h.params.TunnelMode)
 
 	if h.params.Role == maxRoleOfferer {
 		dc, err := pc.CreateDataChannel("tunnel", nil)
+		h.trPC("createDataChannel", map[string]any{"label": "tunnel", "options": nil}, nil, err)
 		if err != nil {
 			h.logFn("max-joiner: warning: could not create tunnel DC: %v", err)
 		} else {
@@ -1555,6 +1683,7 @@ func (h *MaxHeadlessJoiner) initPC() {
 		h.onLocalICECandidate(candidate)
 	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		h.trState("conn", state.String(), "")
 		h.logFn("max-joiner: PC state: %s", state.String())
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
 			h.logFn("max-joiner: PC %s, closing transport to trigger reconnect", state.String())
@@ -1568,6 +1697,7 @@ func (h *MaxHeadlessJoiner) initPC() {
 func (h *MaxHeadlessJoiner) onTunnelDC(dc *webrtc.DataChannel) {
 	h.dc = dc
 	dc.OnOpen(func() {
+		h.trState("dc", "open", dc.Label())
 		h.logFn("max-joiner: tunnel DC open")
 		h.reconnectAttempt.Store(0)
 		h.logFn("max-joiner: === DC TUNNEL CONNECTED ===")
@@ -1577,6 +1707,7 @@ func (h *MaxHeadlessJoiner) onTunnelDC(dc *webrtc.DataChannel) {
 		}
 	})
 	dc.OnClose(func() {
+		h.trState("dc", "close", dc.Label())
 		h.logFn("max-joiner: tunnel DC closed")
 	})
 }
@@ -1717,13 +1848,17 @@ func (h *MaxHeadlessJoiner) sendOffer(addr *maxPeerAddr) {
 	}
 	offer, err := h.pc.CreateOffer(nil)
 	if err != nil {
+		h.trPC("createOffer", nil, nil, err)
 		h.logFn("max-joiner: create offer failed: %v", err)
 		return
 	}
+	h.trPC("createOffer", nil, sdpArgs(offer), nil)
 	if err := h.pc.SetLocalDescription(offer); err != nil {
+		h.trPC("setLocalDescription", sdpArgs(offer), nil, err)
 		h.logFn("max-joiner: set local description failed: %v", err)
 		return
 	}
+	h.trPC("setLocalDescription", sdpArgs(offer), nil, nil)
 	offer = h.gatheredLocalDescription(offer)
 	// data:{sdp, animojiVersion}. The real client's sendSdp always attaches
 	// animojiVersion (the vmoji protocol version, default 1) to every SDP and
@@ -1748,12 +1883,29 @@ func (h *MaxHeadlessJoiner) send(command string, fields map[string]interface{}) 
 	h.seq++
 	fields["command"] = command
 	fields["sequence"] = h.seq
-	if raw, err := json.Marshal(fields); err == nil {
-		h.logFn("max-joiner: ws send raw JSON: %s", string(raw))
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		h.logFn("max-joiner: ws marshal failed: %v", err)
+		return
 	}
-	if err := h.ws.WriteJSON(fields); err != nil {
+	h.logFn("max-joiner: ws send raw JSON: %s", string(raw))
+	// Write the exact bytes we transcribe (WriteJSON would append a newline).
+	h.trWS("tx", string(raw))
+	if err := h.ws.WriteMessage(websocket.TextMessage, raw); err != nil {
 		h.logFn("max-joiner: ws write failed: %v", err)
 	}
+}
+
+// sendRawText writes a bare (non-JSON) text frame under the write mutex.
+// Used for the ws2 keepalive reply ("pong").
+func (h *MaxHeadlessJoiner) sendRawText(text string) error {
+	h.wsMu.Lock()
+	defer h.wsMu.Unlock()
+	if h.ws == nil {
+		return errors.New("ws not connected")
+	}
+	h.trWS("tx", text)
+	return h.ws.WriteMessage(websocket.TextMessage, []byte(text))
 }
 
 // sendTransmitData mirrors okcalls_peer.py Peer.transmit: the participantId/
@@ -1782,6 +1934,7 @@ func (h *MaxHeadlessJoiner) readLoop() {
 			h.Status.EmitStatus(common.StatusTunnelLost)
 			return
 		}
+		h.trWS("rx", string(raw))
 		h.handleMessage(raw)
 	}
 }
@@ -1791,6 +1944,23 @@ func (h *MaxHeadlessJoiner) readLoop() {
 // transmitted-data — the answerer needs it to address the answer back to
 // the offerer), then dispatch.
 func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
+	// ws2 keepalive: the server sends a bare text frame "ping" (not JSON) and
+	// the web client answers with a bare text frame "pong" (MAX_WS2_REFERENCE.md
+	// §6.1). Before this check the frame fell through the JSON decode below
+	// and was silently dropped, so the server never got a pong from us.
+	if string(raw) == "ping" {
+		h.wsMu.Lock()
+		first := !h.pongLogged
+		h.pongLogged = true
+		h.wsMu.Unlock()
+		if err := h.sendRawText("pong"); err != nil {
+			h.logFn("max-joiner: ws2 pong failed: %v", err)
+		} else if first {
+			h.logFn("max-joiner: ws2 ping -> pong (keepalive; further pings not logged)")
+		}
+		return
+	}
+
 	// UseNumber so a peer's 16-digit internal participantId keeps its exact
 	// integer form: a plain interface{} decode yields float64, and fmt.Sprint
 	// of that renders scientific notation ("1.125...e+15"), which the server
@@ -1933,7 +2103,7 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 			}
 			if h.remoteSet {
 				h.logFn("max-joiner: <- server ICE candidate")
-				h.pc.AddICECandidate(candidateInit)
+				h.trPC("addIceCandidate", candidateInit, nil, h.pc.AddICECandidate(candidateInit))
 			} else {
 				h.pendingICE = append(h.pendingICE, candidateInit)
 				h.logFn("max-joiner: server ICE candidate buffered (no remote desc yet)")
@@ -1954,30 +2124,36 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 
 	switch sdpType {
 	case "answer":
-		h.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdpStr})
+		remote := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdpStr}
+		h.trPC("setRemoteDescription", sdpArgs(remote), nil, h.pc.SetRemoteDescription(remote))
 		h.remoteSet = true
 		for _, candidate := range h.pendingICE {
-			h.pc.AddICECandidate(candidate)
+			h.trPC("addIceCandidate", candidate, nil, h.pc.AddICECandidate(candidate))
 		}
 		h.pendingICE = nil
 
 	case "offer":
-		h.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdpStr})
+		remote := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdpStr}
+		h.trPC("setRemoteDescription", sdpArgs(remote), nil, h.pc.SetRemoteDescription(remote))
 		h.remoteSet = true
 		for _, candidate := range h.pendingICE {
-			h.pc.AddICECandidate(candidate)
+			h.trPC("addIceCandidate", candidate, nil, h.pc.AddICECandidate(candidate))
 		}
 		h.pendingICE = nil
 
 		answer, err := h.pc.CreateAnswer(nil)
 		if err != nil {
+			h.trPC("createAnswer", nil, nil, err)
 			h.logFn("max-joiner: create answer failed: %v", err)
 			return
 		}
+		h.trPC("createAnswer", nil, sdpArgs(answer), nil)
 		if err := h.pc.SetLocalDescription(answer); err != nil {
+			h.trPC("setLocalDescription", sdpArgs(answer), nil, err)
 			h.logFn("max-joiner: set local description failed: %v", err)
 			return
 		}
+		h.trPC("setLocalDescription", sdpArgs(answer), nil, nil)
 		answer = h.gatheredLocalDescription(answer)
 		h.peerMu.Lock()
 		addr := h.peerAddr

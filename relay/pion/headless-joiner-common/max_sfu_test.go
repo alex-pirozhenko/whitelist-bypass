@@ -9,8 +9,10 @@ func TestExtractSSRCs(t *testing.T) {
 		"a=ssrc:22222 cname:def\r\n" +
 		"a=ssrc:\r\n" + // empty -> skipped
 		"m=video 9 UDP/TLS/RTP/SAVPF 98\r\n"
+	// extractSSRCs returns numeric ids ([]int64); the wire-facing
+	// extractOfferSSRCs is the string-token variant, tested separately.
 	got := extractSSRCs(sdp)
-	if len(got) != 2 || got[0] != "11111" || got[1] != "22222" {
+	if len(got) != 2 || got[0] != 11111 || got[1] != 22222 {
 		t.Fatalf("extractSSRCs = %v, want [11111 22222]", got)
 	}
 	if len(extractSSRCs("m=video 9 UDP 98\r\n")) != 0 {
@@ -54,5 +56,17 @@ func TestSFUCapabilitiesShape(t *testing.T) {
 		if _, ok := c[k]; !ok {
 			t.Errorf("capabilities missing required key %q", k)
 		}
+	}
+}
+
+func TestExtractOfferSSRCs(t *testing.T) {
+	sdp := "a=ssrc:1598412891 cname:x\r\n" +
+		"a=ssrc:1598412891 label:audio-mix\r\n" + // labeled producer -> kept
+		"a=ssrc:777 label:video-pat-0\r\n" +
+		"a=ssrc:777 label:video-pat-0\r\n" + // duplicate -> once
+		"a=ssrc:888 cname:rtx-only\r\n" // no label -> skipped
+	got := extractOfferSSRCs(sdp)
+	if len(got) != 2 || got[0] != "1598412891" || got[1] != "777" {
+		t.Fatalf("extractOfferSSRCs = %v, want [1598412891 777] (string tokens)", got)
 	}
 }

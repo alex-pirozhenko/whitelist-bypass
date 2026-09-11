@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,9 @@ import (
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	plog "github.com/pion/logging"
+	"github.com/pion/stun/v3"
+	"github.com/pion/turn/v4"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -213,6 +217,8 @@ type MaxHeadlessJoiner struct {
 	// SFU (MediaMode=="sfu") media plane: the tunnel rides a VP8 media track
 	// through the SERVER-topology SFU (an SFU cannot carry an SCTP DataChannel).
 	sampleTrack       *webrtc.TrackLocalStaticSample
+	sampleAudioTrack  *webrtc.TrackLocalStaticSample
+	sfuTrackBound     bool
 	vp8tunnel         *tunnel.VP8DataTunnel
 	producerSessionID string
 	configAck         configAckTracker
@@ -354,6 +360,7 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	h.offerOnce = sync.Once{}
 	// SFU media plane.
 	h.sampleTrack = nil
+	h.sfuTrackBound = false
 	h.vp8tunnel = nil
 	h.producerSessionID = ""
 	h.ci = nil
@@ -578,12 +585,16 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	// ICE fails. In SFU mode the tunnel rides a VP8 VIDEO track, so video MUST be
 	// enabled; the DIRECT/DataChannel mode is data-only (all media disabled).
 	videoEnabled := h.params.MediaMode == "sfu"
+	// In SFU mode we bind a (silent) audio track on mid:2, so we must advertise
+	// audio enabled — otherwise the SFU media core sees an active audio producer
+	// slot with the participant reporting audio disabled and rejects the layout.
+	audioEnabled := h.params.MediaMode == "sfu"
 	h.send("update-media-modifiers", map[string]interface{}{
 		"mediaModifiers": map[string]interface{}{"denoise": true, "denoiseAnn": true},
 	})
 	h.send("change-media-settings", map[string]interface{}{
 		"mediaSettings": map[string]interface{}{
-			"isAudioEnabled": false, "isVideoEnabled": videoEnabled,
+			"isAudioEnabled": audioEnabled, "isVideoEnabled": videoEnabled,
 			"isScreenSharingEnabled": false, "isFastScreenSharingEnabled": false,
 			"isAudioSharingEnabled": false, "isAnimojiEnabled": false,
 		},
@@ -758,26 +769,140 @@ func parseSFUDescription(raw interface{}) (webrtc.SessionDescription, bool) {
 
 // extractSSRCs pulls distinct "a=ssrc:<id> ..." SSRCs from an SDP in first-seen
 // order, for accept-producer's "ssrcs" field (web client's Object.keys(ssrcMap)).
-func extractSSRCs(sdp string) []string {
-	seen := make(map[string]bool)
-	var out []string
+func extractSSRCs(sdp string) []int64 {
+	seen := make(map[int64]bool)
+	var out []int64
 	for _, line := range strings.Split(sdp, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if !strings.HasPrefix(line, "a=ssrc:") {
 			continue
 		}
 		rest := strings.TrimPrefix(line, "a=ssrc:")
-		id := rest
+		idStr := rest
 		if i := strings.IndexByte(rest, ' '); i >= 0 {
-			id = rest[:i]
+			idStr = rest[:i]
 		}
-		if id == "" || seen[id] {
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil || seen[id] {
 			continue
 		}
 		seen[id] = true
 		out = append(out, id)
 	}
 	return out
+}
+
+// extractOfferSSRCs pulls the SFU's OFFERED ssrcs — the ones carrying a
+// label: attribute (audio-mix, video-pat-0, …) in the producer-updated offer.
+// accept-producer must echo THESE back so the SFU knows which of its producers
+// we accept. Echoing our own answer ssrcs (or, when our answer has none, an
+// empty list) makes the SFU conclude we accepted no media, tear down, and
+// re-offer a fresh sessionId every ~14s. Mirrors the web client's
+// _updateSSRCMap(remoteOffer) → acceptProducer(answer, Object.keys(ssrcMap)).
+// The SFU's accept-producer ssrcs field must be an array of STRING tokens
+// (the web client sends Object.keys(ssrcMap) = ["1598412891", …]). Sending
+// JSON numbers ([]int64) trips the SFU media core's strict List<String> schema
+// validation, so it discards the accepted-producer list, never arms the ICE
+// socket, and re-offers on the 20s watchdog. Match only the labeled producer
+// ssrcs (label:audio-/video-…), excluding RTX/FID secondaries.
+func extractOfferSSRCs(offerSDP string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, line := range strings.Split(offerSDP, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, "a=ssrc:") || !strings.Contains(line, " label:") {
+			continue
+		}
+		rest := strings.TrimPrefix(line, "a=ssrc:")
+		idStr := rest
+		if i := strings.IndexByte(rest, ' '); i >= 0 {
+			idStr = rest[:i]
+		}
+		if idStr == "" || seen[idStr] {
+			continue
+		}
+		if _, err := strconv.ParseInt(idStr, 10, 64); err != nil {
+			continue
+		}
+		seen[idStr] = true
+		out = append(out, idStr)
+	}
+	return out
+}
+
+// stripSDPCandidates removes all a=candidate: and a=end-of-candidates lines
+// from an SDP. The real MAX app sends the SDP answer before ICE gathering, so
+// its accept-producer never contains candidate lines. Including them confuses
+// the OK-Calls SFU (which discovers us via peer-reflexive candidates from our
+// STUN binding requests, not from the SDP).
+func stripSDPCandidates(sdp string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(sdp, "\n") {
+		trimmed := strings.TrimRight(line, "\r")
+		if strings.HasPrefix(trimmed, "a=candidate:") || trimmed == "a=end-of-candidates" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// extractSDPCandidates parses candidate lines from the first media section
+// of an SDP and returns them as ICECandidateInit values suitable for
+// AddICECandidate. Only the BUNDLE-master section (mid:0) is used.
+func extractSDPCandidates(sdp string) []webrtc.ICECandidateInit {
+	var candidates []webrtc.ICECandidateInit
+	inFirstMedia := false
+	mediaCount := 0
+	sdpMid := "0"
+	sdpMLineIndex := uint16(0)
+	for _, line := range strings.Split(sdp, "\n") {
+		trimmed := strings.TrimRight(line, "\r")
+		if strings.HasPrefix(trimmed, "m=") {
+			mediaCount++
+			if mediaCount == 1 {
+				inFirstMedia = true
+			} else {
+				break
+			}
+			continue
+		}
+		if inFirstMedia && strings.HasPrefix(trimmed, "a=candidate:") {
+			cand := strings.TrimPrefix(trimmed, "a=")
+			candidates = append(candidates, webrtc.ICECandidateInit{
+				Candidate:     cand,
+				SDPMid:        &sdpMid,
+				SDPMLineIndex: &sdpMLineIndex,
+			})
+		}
+	}
+	return candidates
+}
+
+// fixSFUAnswerSDP patches the gathered answer SDP for SFU compatibility:
+//  1. setup:passive → setup:active — with ice-lite remote the SFU is DTLS
+//     server (passive), so our answer must be active (DTLS client).
+//  2. Strip component-2 candidates — pion emits them even with rtcp-mux,
+//     but the SFU only has component-1 candidates and may choke on ours.
+func fixSFUAnswerSDP(sdp string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(sdp, "\n") {
+		trimmed := strings.TrimRight(line, "\r")
+		if trimmed == "a=setup:passive" {
+			b.WriteString("a=setup:active\r\n")
+			continue
+		}
+		if strings.HasPrefix(trimmed, "a=candidate:") {
+			parts := strings.Fields(trimmed)
+			if len(parts) >= 2 && parts[1] == "2" {
+				continue
+			}
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // handleProducerUpdated drives the SFU producer/consumer offer-answer: the SFU
@@ -800,49 +925,77 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 		return
 	}
 	h.logFn("max-joiner: <- producer-updated sessionId=%s [%s]", sessionID, sdpUfragSummary(desc.SDP))
+	h.logFn("max-joiner: SFU offer SDP:\n%s", desc.SDP)
 
+	// Re-offer with a NEW sessionId = the SFU tore down the previous media
+	// session and re-allocated with fresh ICE ufrag/pwd. Reusing the existing
+	// PeerConnection makes pion perform an in-place ICE restart, and across the
+	// SFU's rapid re-offers pion desyncs the outgoing STUN USERNAME/
+	// MESSAGE-INTEGRITY (a ufrag from one generation paired with a pwd from
+	// another) — every packet is then silently dropped by the ice-lite SFU.
+	// The web client rebuilds its RTCPeerConnection on every sessionId change
+	// (ServerTransport._reconnect). Mirror that: tear the PC down and build a
+	// clean one so its ICE agent uses exactly one ufrag/pwd generation.
+	if h.producerSessionID != "" {
+		h.logFn("max-joiner: sessionId changed %s -> %s, recreating PeerConnection",
+			h.producerSessionID, sessionID)
+		if h.pc != nil {
+			_ = h.pc.Close()
+		}
+		h.sfuTrackBound = false
+		h.initPCSFU()
+		if h.pc == nil {
+			h.logFn("max-joiner: PC recreation failed, aborting producer-updated")
+			return
+		}
+	}
+
+	// Bind our VP8 sampleTrack to the SFU's us→SFU video m-line BEFORE
+	// applying the remote description. The SFU's 5-m-line offer includes:
+	//   mid:3  video  recvonly  (SFU perspective — it wants to receive our VP8)
+	// By adding the track via AddTrack FIRST, pion creates a sendonly video
+	// transceiver that gets matched to mid:3 during SetRemoteDescription.
+	// This ensures the answer SDP carries real SSRCs (not ssrcs=[]) and the
+	// SFU does not re-offer every ~14s. On repeat offers (realloc) the track
+	// is already bound so we just ReplaceTrack on the existing sender.
+	if h.sampleTrack != nil && !h.sfuTrackBound {
+		sender, addErr := h.pc.AddTrack(h.sampleTrack)
+		if addErr != nil {
+			h.logFn("max-joiner: AddTrack (pre-SRD) failed: %v", addErr)
+		} else {
+			h.sfuTrackBound = true
+			go tunnel.DrainSenderRTCP(sender)
+			h.logFn("max-joiner: AddTrack VP8 sampleTrack (pre-SRD), sender=%v", sender != nil)
+		}
+		// Bind the silent audio track too, so the SFU's audio-send m-line (mid:2)
+		// is answered sendonly with a real SSRC (see initPCSFU rationale).
+		if h.sampleAudioTrack != nil {
+			asender, aErr := h.pc.AddTrack(h.sampleAudioTrack)
+			if aErr != nil {
+				h.logFn("max-joiner: AddTrack audio (pre-SRD) failed: %v", aErr)
+			} else {
+				go tunnel.DrainSenderRTCP(asender)
+				h.logFn("max-joiner: AddTrack Opus audio (pre-SRD), sender=%v", asender != nil)
+			}
+		}
+	}
+
+	// Apply the SFU offer WITH its inline host candidates. The SFU is ice-lite
+	// and advertises its candidate(s) inline in the offer; the web client never
+	// strips them. Keeping them lets pion form the candidate pair and (as the
+	// controlling agent) begin STUN checks immediately after SetLocalDescription.
+	// pion retransmits binding requests (SetICEMaxBindingRequests(50)), so the
+	// brief window before the SFU processes our accept-producer answer — and
+	// thus learns our ufrag/pwd — is covered by retries rather than an
+	// artificial sleep + manual candidate injection (which broke ICE restart).
 	if err := h.pc.SetRemoteDescription(desc); err != nil {
 		h.logFn("max-joiner: set remote description (producer offer) failed: %v", err)
 		return
 	}
 
-	// Bind our VP8 sampleTrack to the SFU's us->SFU video m-line (mid:3 in the
-	// captured offer). The SFU's offer bundles 5 m-lines:
-	//   m=audio       mid:0  sendonly   SFU -> us (audio-mix)
-	//   m=application mid:1             SCTP
-	//   m=audio       mid:2  recvonly   us -> SFU
-	//   m=video       mid:3  recvonly   us -> SFU   <-- OUR VP8 TUNNEL TRACK
-	//   m=video       mid:4  sendonly   SFU -> us
-	// pion mirrors the SFU's "recvonly" as our local "sendonly" direction after
-	// SetRemoteDescription creates matching transceivers. We locate the video
-	// transceiver whose local direction is sendonly (i.e. the one the SFU wants
-	// to receive from us) and ReplaceTrack our sampleTrack onto it. Without a
-	// real track bound here the answer carries ssrcs=[] and the SFU re-offers
-	// every ~14s and ICE never settles.
-	if h.sampleTrack != nil {
-		bound := false
-		for _, tr := range h.pc.GetTransceivers() {
-			if tr.Kind() != webrtc.RTPCodecTypeVideo {
-				continue
-			}
-			mid := tr.Mid()
-			dir := tr.Direction()
-			if dir != webrtc.RTPTransceiverDirectionSendonly && dir != webrtc.RTPTransceiverDirectionSendrecv {
-				continue
-			}
-			if err := tr.Sender().ReplaceTrack(h.sampleTrack); err != nil {
-				h.logFn("max-joiner: ReplaceTrack on mid=%s failed: %v", mid, err)
-				continue
-			}
-			h.logFn("max-joiner: bound VP8 sampleTrack to mid=%s (dir=%s)", mid, dir)
-			bound = true
-			break
-		}
-		if !bound {
-			h.logFn("max-joiner: no sendonly/sendrecv video transceiver found to bind sampleTrack")
-		}
-	} else {
-		h.logFn("max-joiner: sampleTrack is nil, cannot bind to SFU offer")
+	for _, tr := range h.pc.GetTransceivers() {
+		h.logFn("max-joiner: transceiver mid=%s kind=%s dir=%s sender=%v",
+			tr.Mid(), tr.Kind(), tr.Direction(), tr.Sender() != nil)
 	}
 
 	answer, err := h.pc.CreateAnswer(nil)
@@ -855,16 +1008,341 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 		return
 	}
 
-	final := h.gatheredLocalDescription(answer)
-	ssrcs := extractSSRCs(final.SDP)
+	// Build accept-producer. The ssrcs field MUST echo the SFU's OFFERED
+	// producer ssrcs (the a=ssrc lines carrying label:audio-/video- in the
+	// offer), NOT our answer's ssrcs — the SFU keys the producers we accept by
+	// those ids. An empty list (our answer often has none for recvonly slots)
+	// makes the SFU conclude we accepted nothing and re-offer a new sessionId
+	// every ~14s. Preserve our local candidates in the answer (fixSFUAnswerSDP
+	// only forces setup:active and drops stray component-2 candidates); the SFU
+	// needs our host candidate to complete the pair.
+	answerSDP := strings.TrimRight(fixSFUAnswerSDP(answer.SDP), "\r\n") + "\r\n"
+	ssrcs := extractOfferSSRCs(desc.SDP)
 	h.producerSessionID = sessionID
-	h.logFn("max-joiner: -> accept-producer sessionId=%s ssrcs=%v [%s]", sessionID, ssrcs, sdpUfragSummary(final.SDP))
+	h.logFn("max-joiner: answer SDP:\n%s", answerSDP)
+	h.logFn("max-joiner: -> accept-producer sessionId=%s ssrcs=%v [%s]", sessionID, ssrcs, sdpUfragSummary(answerSDP))
 	h.send("accept-producer", map[string]interface{}{
-		"description": final.SDP,
+		"description": answerSDP,
 		"sessionId":   m["sessionId"],
 		"ssrcs":       ssrcs,
 	})
+
+	// Diagnostic: log ICE transport stats every 2s for the first 10s
+	go func() {
+		for i := 0; i < 5; i++ {
+			time.Sleep(2 * time.Second)
+			stats := h.pc.GetStats()
+			for _, s := range stats {
+				switch v := s.(type) {
+				case webrtc.ICECandidatePairStats:
+					h.logFn("max-joiner: [diag] pair local=%s remote=%s state=%s nominated=%v reqSent=%d respRecv=%d firstReq=%v lastReq=%v lastResp=%v",
+						v.LocalCandidateID, v.RemoteCandidateID, v.State, v.Nominated,
+						v.RequestsSent, v.ResponsesReceived,
+						v.FirstRequestTimestamp, v.LastRequestTimestamp, v.LastResponseTimestamp)
+				case webrtc.ICECandidateStats:
+					h.logFn("max-joiner: [diag] candidate id=%s type=%s ip=%s port=%d protocol=%s statsType=%s",
+						v.ID, v.CandidateType, v.IP, v.Port, v.Protocol, v.Type)
+				}
+			}
+			h.logFn("max-joiner: [diag] ICE connection=%s gathering=%s",
+				h.pc.ICEConnectionState().String(), h.pc.ICEGatheringState().String())
+		}
+	}()
+
+	// Extract ICE credentials from offer and answer for authenticated STUN test
+	sfuUfrag, sfuPwd := extractICECredentials(desc.SDP)
+	ourUfrag, ourPwd := extractICECredentials(answer.SDP)
+	h.logFn("max-joiner: ICE creds for diag: sfu=%s/%s our=%s/%s", sfuUfrag, sfuPwd, ourUfrag, ourPwd)
+
+	// Standalone TURN relay diagnostic — bypasses pion's ICE stack entirely
+	go h.diagTURNRelay(sfuUfrag, sfuPwd, ourUfrag, ourPwd)
 }
+
+func extractICECredentials(sdp string) (ufrag, pwd string) {
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.HasPrefix(line, "a=ice-ufrag:") {
+			ufrag = strings.TrimPrefix(line, "a=ice-ufrag:")
+		}
+		if strings.HasPrefix(line, "a=ice-pwd:") {
+			pwd = strings.TrimPrefix(line, "a=ice-pwd:")
+		}
+		if ufrag != "" && pwd != "" {
+			return
+		}
+	}
+	return
+}
+
+func (h *MaxHeadlessJoiner) diagTURNRelay(sfuUfrag, sfuPwd, ourUfrag, ourPwd string) {
+	if len(h.ci.Turn.URLs) == 0 {
+		h.logFn("max-joiner: [turn-diag] no TURN URLs, skipping")
+		return
+	}
+	turnURL := h.ci.Turn.URLs[0]
+	turnAddr := strings.TrimPrefix(turnURL, "turn:")
+	turnAddr = strings.TrimPrefix(turnAddr, "turns:")
+	sfuAddr := "155.212.199.76:43210"
+
+	h.logFn("max-joiner: [turn-diag] === STANDALONE TURN RELAY TEST ===")
+	h.logFn("max-joiner: [turn-diag] TURN server: %s", turnAddr)
+	h.logFn("max-joiner: [turn-diag] TURN user: %s", h.ci.Turn.Username)
+	h.logFn("max-joiner: [turn-diag] SFU target: %s", sfuAddr)
+
+	conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] ListenPacket failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	turnUDP, err := net.ResolveUDPAddr("udp4", turnAddr)
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] resolve TURN addr failed: %v", err)
+		return
+	}
+
+	cfg := &turn.ClientConfig{
+		STUNServerAddr: turnAddr,
+		TURNServerAddr: turnAddr,
+		Conn:           &diagPacketConn{inner: conn, raddr: turnUDP, logFn: h.logFn},
+		Username:       h.ci.Turn.Username,
+		Password:       h.ci.Turn.Credential,
+		LoggerFactory:  &diagLoggerFactory{logFn: h.logFn},
+	}
+
+	client, err := turn.NewClient(cfg)
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] NewClient failed: %v", err)
+		return
+	}
+	defer client.Close()
+
+	if err := client.Listen(); err != nil {
+		h.logFn("max-joiner: [turn-diag] Listen failed: %v", err)
+		return
+	}
+
+	h.logFn("max-joiner: [turn-diag] calling Allocate...")
+	relayConn, err := client.Allocate()
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] Allocate FAILED: %v", err)
+		return
+	}
+	defer relayConn.Close()
+	h.logFn("max-joiner: [turn-diag] Allocate OK, relay addr: %s", relayConn.LocalAddr())
+
+	sfuUDP, err := net.ResolveUDPAddr("udp4", sfuAddr)
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] resolve SFU addr failed: %v", err)
+		return
+	}
+
+	// Build a bare STUN binding request
+	msg, err := stun.Build(stun.TransactionID, stun.BindingRequest)
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] stun.Build failed: %v", err)
+		return
+	}
+
+	for i := 0; i < 5; i++ {
+		h.logFn("max-joiner: [turn-diag] [%d] sending %d-byte STUN via relay to %s", i+1, len(msg.Raw), sfuAddr)
+		n, err := relayConn.WriteTo(msg.Raw, sfuUDP)
+		if err != nil {
+			h.logFn("max-joiner: [turn-diag] [%d] WriteTo FAILED: %v", i+1, err)
+			continue
+		}
+		h.logFn("max-joiner: [turn-diag] [%d] WriteTo OK, sent %d bytes", i+1, n)
+
+		buf := make([]byte, 1500)
+		if err := relayConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			h.logFn("max-joiner: [turn-diag] [%d] SetReadDeadline failed: %v", i+1, err)
+		}
+		rn, from, rerr := relayConn.ReadFrom(buf)
+		if rerr != nil {
+			h.logFn("max-joiner: [turn-diag] [%d] ReadFrom timeout/error: %v", i+1, rerr)
+		} else {
+			h.logFn("max-joiner: [turn-diag] [%d] GOT RESPONSE! %d bytes from %s", i+1, rn, from)
+			return
+		}
+	}
+	h.logFn("max-joiner: [turn-diag] === NO RESPONSES from bare STUN via TURN relay ===")
+
+	// Now try authenticated STUN with proper ICE credentials
+	if sfuUfrag != "" && ourUfrag != "" {
+		h.logFn("max-joiner: [turn-diag] === Testing AUTHENTICATED STUN via relay ===")
+		h.logFn("max-joiner: [turn-diag] USERNAME=%s:%s, key=%s", sfuUfrag, ourUfrag, sfuPwd)
+		username := sfuUfrag + ":" + ourUfrag
+		for i := 0; i < 5; i++ {
+			authMsg, err := stun.Build(
+				stun.TransactionID,
+				stun.BindingRequest,
+				stun.NewUsername(username),
+				stun.NewShortTermIntegrity(sfuPwd),
+				stun.Fingerprint,
+			)
+			if err != nil {
+				h.logFn("max-joiner: [turn-diag] [auth-%d] stun.Build failed: %v", i+1, err)
+				break
+			}
+			h.logFn("max-joiner: [turn-diag] [auth-%d] sending %d-byte authenticated STUN via relay to %s", i+1, len(authMsg.Raw), sfuAddr)
+			if _, err := relayConn.WriteTo(authMsg.Raw, sfuUDP); err != nil {
+				h.logFn("max-joiner: [turn-diag] [auth-%d] WriteTo FAILED: %v", i+1, err)
+				continue
+			}
+			buf := make([]byte, 1500)
+			relayConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			rn, from, rerr := relayConn.ReadFrom(buf)
+			if rerr != nil {
+				h.logFn("max-joiner: [turn-diag] [auth-%d] no response: %v", i+1, rerr)
+			} else {
+				h.logFn("max-joiner: [turn-diag] [auth-%d] GOT RESPONSE! %d bytes from %s", i+1, rn, from)
+				break
+			}
+		}
+	}
+
+	// Test: does the relay forward to a PUBLIC STUN server?
+	h.logFn("max-joiner: [turn-diag] === Testing relay to PUBLIC STUN (stun.l.google.com:19302) ===")
+	pubSTUN, err := net.ResolveUDPAddr("udp4", "stun.l.google.com:19302")
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] resolve public STUN failed: %v", err)
+	} else {
+		pubMsg, _ := stun.Build(stun.TransactionID, stun.BindingRequest)
+		for i := 0; i < 3; i++ {
+			h.logFn("max-joiner: [turn-diag] [pub-%d] sending %d-byte STUN via relay to %s", i+1, len(pubMsg.Raw), pubSTUN)
+			if _, err := relayConn.WriteTo(pubMsg.Raw, pubSTUN); err != nil {
+				h.logFn("max-joiner: [turn-diag] [pub-%d] WriteTo FAILED: %v", i+1, err)
+				continue
+			}
+			buf := make([]byte, 1500)
+			relayConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			rn, from, rerr := relayConn.ReadFrom(buf)
+			if rerr != nil {
+				h.logFn("max-joiner: [turn-diag] [pub-%d] no response: %v", i+1, rerr)
+			} else {
+				h.logFn("max-joiner: [turn-diag] [pub-%d] GOT RESPONSE! %d bytes from %s — RELAY FORWARDS OK!", i+1, rn, from)
+				break
+			}
+		}
+	}
+
+	// Also test TURN-over-TCP
+	h.logFn("max-joiner: [turn-diag] === Now trying TURN-over-TCP ===")
+	tcpConn, err := net.DialTimeout("tcp4", turnAddr, 5*time.Second)
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] TCP dial to TURN server failed: %v", err)
+		return
+	}
+	defer tcpConn.Close()
+	h.logFn("max-joiner: [turn-diag] TCP connected to TURN server from %s", tcpConn.LocalAddr())
+
+	tcpCfg := &turn.ClientConfig{
+		TURNServerAddr: turnAddr,
+		Conn:           turn.NewSTUNConn(tcpConn),
+		Username:       h.ci.Turn.Username,
+		Password:       h.ci.Turn.Credential,
+		LoggerFactory:  &diagLoggerFactory{logFn: h.logFn},
+	}
+	tcpClient, err := turn.NewClient(tcpCfg)
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] TCP NewClient failed: %v", err)
+		return
+	}
+	defer tcpClient.Close()
+
+	if err := tcpClient.Listen(); err != nil {
+		h.logFn("max-joiner: [turn-diag] TCP Listen failed: %v", err)
+		return
+	}
+
+	h.logFn("max-joiner: [turn-diag] TCP Allocate...")
+	tcpRelayConn, err := tcpClient.Allocate()
+	if err != nil {
+		h.logFn("max-joiner: [turn-diag] TCP Allocate FAILED: %v", err)
+		return
+	}
+	defer tcpRelayConn.Close()
+	h.logFn("max-joiner: [turn-diag] TCP relay addr: %s", tcpRelayConn.LocalAddr())
+
+	for i := 0; i < 5; i++ {
+		h.logFn("max-joiner: [turn-diag] TCP [%d] sending STUN via relay to %s", i+1, sfuAddr)
+		n, err := tcpRelayConn.WriteTo(msg.Raw, sfuUDP)
+		if err != nil {
+			h.logFn("max-joiner: [turn-diag] TCP [%d] WriteTo FAILED: %v", i+1, err)
+			continue
+		}
+		h.logFn("max-joiner: [turn-diag] TCP [%d] WriteTo OK, sent %d bytes", i+1, n)
+
+		buf := make([]byte, 1500)
+		if err := tcpRelayConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			h.logFn("max-joiner: [turn-diag] TCP [%d] SetReadDeadline failed: %v", i+1, err)
+		}
+		rn, from, rerr := tcpRelayConn.ReadFrom(buf)
+		if rerr != nil {
+			h.logFn("max-joiner: [turn-diag] TCP [%d] ReadFrom timeout/error: %v", i+1, rerr)
+		} else {
+			h.logFn("max-joiner: [turn-diag] TCP [%d] GOT RESPONSE! %d bytes from %s", i+1, rn, from)
+			return
+		}
+	}
+	h.logFn("max-joiner: [turn-diag] === TCP TURN also got NO RESPONSES ===")
+}
+
+// diagPacketConn wraps a PacketConn to log all WriteTo/ReadFrom calls and route
+// all outgoing traffic to a fixed remote address (the TURN server).
+type diagPacketConn struct {
+	inner net.PacketConn
+	raddr net.Addr
+	logFn func(string, ...interface{})
+}
+
+func (d *diagPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := d.inner.ReadFrom(p)
+	if err == nil && n > 0 && n >= 4 {
+		d.logFn("max-joiner: [turn-diag-pkt] ReadFrom %d bytes from %s (first4: %02x%02x%02x%02x)", n, addr, p[0], p[1], p[2], p[3])
+	}
+	return n, addr, err
+}
+
+func (d *diagPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if len(p) >= 4 {
+		d.logFn("max-joiner: [turn-diag-pkt] WriteTo %d bytes to %s (first4: %02x%02x%02x%02x)", len(p), d.raddr, p[0], p[1], p[2], p[3])
+	}
+	return d.inner.WriteTo(p, d.raddr)
+}
+
+func (d *diagPacketConn) Close() error                       { return d.inner.Close() }
+func (d *diagPacketConn) LocalAddr() net.Addr                { return d.inner.LocalAddr() }
+func (d *diagPacketConn) SetDeadline(t time.Time) error      { return d.inner.SetDeadline(t) }
+func (d *diagPacketConn) SetReadDeadline(t time.Time) error  { return d.inner.SetReadDeadline(t) }
+func (d *diagPacketConn) SetWriteDeadline(t time.Time) error { return d.inner.SetWriteDeadline(t) }
+
+// diagLoggerFactory routes all pion log output through our logFn so it appears
+// in the test log file instead of going to stderr.
+type diagLoggerFactory struct {
+	logFn func(string, ...interface{})
+}
+
+func (f *diagLoggerFactory) NewLogger(scope string) plog.LeveledLogger {
+	return &diagLogger{scope: scope, logFn: f.logFn}
+}
+
+type diagLogger struct {
+	scope string
+	logFn func(string, ...interface{})
+}
+
+func (l *diagLogger) Trace(msg string)                          { l.logFn("[turn-diag-%s] TRACE: %s", l.scope, msg) }
+func (l *diagLogger) Tracef(format string, args ...interface{}) { l.logFn("[turn-diag-%s] TRACE: "+format, append([]interface{}{l.scope}, args...)...) }
+func (l *diagLogger) Debug(msg string)                          { l.logFn("[turn-diag-%s] DEBUG: %s", l.scope, msg) }
+func (l *diagLogger) Debugf(format string, args ...interface{}) { l.logFn("[turn-diag-%s] DEBUG: "+format, append([]interface{}{l.scope}, args...)...) }
+func (l *diagLogger) Info(msg string)                           { l.logFn("[turn-diag-%s] INFO: %s", l.scope, msg) }
+func (l *diagLogger) Infof(format string, args ...interface{})  { l.logFn("[turn-diag-%s] INFO: "+format, append([]interface{}{l.scope}, args...)...) }
+func (l *diagLogger) Warn(msg string)                           { l.logFn("[turn-diag-%s] WARN: %s", l.scope, msg) }
+func (l *diagLogger) Warnf(format string, args ...interface{})  { l.logFn("[turn-diag-%s] WARN: "+format, append([]interface{}{l.scope}, args...)...) }
+func (l *diagLogger) Error(msg string)                          { l.logFn("[turn-diag-%s] ERROR: %s", l.scope, msg) }
+func (l *diagLogger) Errorf(format string, args ...interface{}) { l.logFn("[turn-diag-%s] ERROR: "+format, append([]interface{}{l.scope}, args...)...) }
 
 func (h *MaxHeadlessJoiner) iceServers() []webrtc.ICEServer {
 	var iceServers []webrtc.ICEServer
@@ -889,11 +1367,24 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	iceServers := h.iceServers()
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.DisableCloseByDTLS(true)
+	settingEngine.SetICEMaxBindingRequests(50)
+	settingEngine.SetNetworkTypes([]webrtc.NetworkType{
+		webrtc.NetworkTypeUDP4,
+		webrtc.NetworkTypeTCP4,
+	})
+	lf := plog.NewDefaultLoggerFactory()
+	lf.DefaultLogLevel = plog.LogLevelTrace
+	settingEngine.LoggerFactory = lf
 	if h.PCConfig != nil {
 		h.PCConfig.ConfigureSettingEngine(&settingEngine)
 	}
+	icePolicy := webrtc.ICETransportPolicyRelay
+	if h.params != nil && h.params.ICETransportPolicy == "all" {
+		icePolicy = webrtc.ICETransportPolicyAll
+	}
 	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(webrtc.Configuration{
-		ICEServers: iceServers,
+		ICEServers:         iceServers,
+		ICETransportPolicy: icePolicy,
 	})
 	if err != nil {
 		h.logFn("max-joiner: failed to create SFU PC: %v", err)
@@ -901,13 +1392,10 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	}
 	h.pc = pc
 
-	// Do NOT AddTracks here: in SFU mode the SFU is the offerer, and
-	// pre-adding tracks would create transceivers that conflict with the
-	// SFU's own m-line layout. Instead, create the VP8 sample track object
-	// without attaching it to the PC; handleProducerUpdated binds it to the
-	// right transceiver (mid:3, us->SFU video) via ReplaceTrack once the
-	// SFU's offer has been applied and pion has created matching
-	// transceivers from it.
+	// Create the VP8 sample track object but do NOT add it to the PC yet.
+	// handleProducerUpdated calls pc.AddTrack(sampleTrack) right before
+	// SetRemoteDescription so pion's transceiver matching binds it to the
+	// SFU's mid:3 (us->SFU video recvonly).
 	sampleTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
 		"video", "tunnel-video",
@@ -918,6 +1406,34 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	}
 	h.sampleTrack = sampleTrack
 
+	// Silent Opus audio track for the SFU's audio-send m-line (mid:2). The web
+	// client always binds BOTH a mic and a camera track before answering; if we
+	// answer mid:2 with a=inactive (no track/ssrc) while the call session has an
+	// active audio producer, the SFU media core rejects the answer layout and
+	// re-offers. handleProducerUpdated AddTracks this before SetRemoteDescription
+	// so pion matches it sendonly with a real local SSRC. We never push audio
+	// frames (the tunnel rides video); the track only satisfies the negotiation.
+	audioTrack, aerr := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		"audio", "tunnel-audio",
+	)
+	if aerr != nil {
+		h.logFn("max-joiner: failed to create Opus audio track: %v", aerr)
+		return
+	}
+	h.sampleAudioTrack = audioTrack
+
+	// SCTP data channels the SFU offers on mid:1 (UDP/DTLS/SCTP). The web
+	// client's ServerTransport opens four (producerNotification, producerCommand,
+	// producerScreenShare, consumerScreenShare); creating them here initializes
+	// pion's SCTP association so mid:1 is answered as a real datachannel section
+	// rather than a dead one — another layout the SFU media core rejects.
+	for _, name := range []string{"producerNotification", "producerCommand", "producerScreenShare", "consumerScreenShare"} {
+		if _, derr := pc.CreateDataChannel(name, nil); derr != nil {
+			h.logFn("max-joiner: failed to create %s datachannel: %v", name, derr)
+		}
+	}
+
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		h.logFn("max-joiner: remote track: codec=%s ssrc=%d", track.Codec().MimeType, track.SSRC())
 		go h.ReadTrackFn(track, func(frame []byte) {
@@ -927,6 +1443,14 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 		}, h.logFn, "max-joiner")
 	})
 
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		h.logFn("max-joiner: ICE state: %s", state.String())
+	})
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c != nil {
+			h.logFn("max-joiner: ICE candidate: %s %s %s:%d", c.Protocol, c.Typ, c.Address, c.Port)
+		}
+	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		h.logFn("max-joiner: PC state: %s", state.String())
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
@@ -952,7 +1476,12 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 			}
 		}
 	})
-	h.logFn("max-joiner: SFU PC ready with %d ICE servers, waiting for producer offer", len(iceServers))
+	turnUser := ""
+	if h.ci.Turn.Username != "" {
+		turnUser = h.ci.Turn.Username[:min(6, len(h.ci.Turn.Username))] + "..."
+	}
+	h.logFn("max-joiner: SFU PC ready with %d ICE servers (turn-user=%q turn-urls=%v), waiting for producer offer",
+		len(iceServers), turnUser, h.ci.Turn.URLs)
 }
 
 func (h *MaxHeadlessJoiner) initPC() {
@@ -1182,6 +1711,10 @@ func (h *MaxHeadlessJoiner) sendOffer(addr *maxPeerAddr) {
 	if h.pc == nil {
 		return
 	}
+	if h.params != nil && h.params.MediaMode == "sfu" {
+		h.logFn("max-joiner: skipping direct offer in SFU mode (SFU will send producer-updated)")
+		return
+	}
 	offer, err := h.pc.CreateOffer(nil)
 	if err != nil {
 		h.logFn("max-joiner: create offer failed: %v", err)
@@ -1215,6 +1748,9 @@ func (h *MaxHeadlessJoiner) send(command string, fields map[string]interface{}) 
 	h.seq++
 	fields["command"] = command
 	fields["sequence"] = h.seq
+	if raw, err := json.Marshal(fields); err == nil {
+		h.logFn("max-joiner: ws send raw JSON: %s", string(raw))
+	}
 	if err := h.ws.WriteJSON(fields); err != nil {
 		h.logFn("max-joiner: ws write failed: %v", err)
 	}
@@ -1273,6 +1809,11 @@ func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
 
 	notif, _ := m["notification"].(string)
 	if notif == "" {
+		if seq, ok := m["sequence"]; ok {
+			h.logFn("max-joiner: <- cmd response seq=%v result=%v error=%v (raw=%s)", seq, m["result"], m["error"], string(raw))
+		} else {
+			h.logFn("max-joiner: <- unknown msg (raw=%s)", string(raw))
+		}
 		return
 	}
 
@@ -1312,11 +1853,12 @@ func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
 			h.maybeSendOffer()
 		}
 	case "connection":
+		h.logFn("max-joiner: <- connection (raw=%s)", string(raw))
 		h.handleConnection(m)
 	case "settings-update":
 		h.logFn("max-joiner: <- %s", notif)
 	default:
-		h.logFn("max-joiner: <- notification %s", notif)
+		h.logFn("max-joiner: <- notification %s (raw=%s)", notif, string(raw))
 	}
 }
 

@@ -191,6 +191,14 @@ func ReadTrackForceVP8(track *webrtc.TrackRemote, handler func([]byte), logFn fu
 	readVP8Track(track, handler, logFn, prefix, true)
 }
 
+// vpX reports the VP8 payload descriptor's extension bit as an int for logging.
+func vpX(p codecs.VP8Packet) int {
+	if p.X == 1 {
+		return 1
+	}
+	return 0
+}
+
 func readVP8Track(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string, verbose bool) {
 	var vp8Pkt codecs.VP8Packet
 	var frameBuf []byte
@@ -229,8 +237,12 @@ func readVP8Track(track *webrtc.TrackRemote, handler func([]byte), logFn func(st
 			frameBuf = frameBuf[:0]
 			continue
 		}
-		if verbose && recvPkts < 3 {
-			logFn("%s: rtp pt=%d seq=%d marker=%v S=%d payload=%d bytes", prefix, pkt.PayloadType, pkt.SequenceNumber, pkt.Marker, vp8Pkt.S, len(pkt.Payload))
+		if verbose && recvPkts < 6 {
+			head := pkt.Payload
+			if len(head) > 16 {
+				head = head[:16]
+			}
+			logFn("%s: rtp pt=%d seq=%d ts=%d marker=%v S=%d X=%d N=%d PID=%d payload=%d bytes head=%x", prefix, pkt.PayloadType, pkt.SequenceNumber, pkt.Timestamp, pkt.Marker, vp8Pkt.S, vpX(vp8Pkt), vp8Pkt.N, vp8Pkt.PID, len(pkt.Payload), head)
 		}
 		recvPkts++
 		if vp8Pkt.S == 1 {

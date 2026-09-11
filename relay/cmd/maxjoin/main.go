@@ -106,6 +106,7 @@ type runOpts struct {
 	icePolicy, mediaMode      string
 	calleeUID                 int64
 	transcriptPath, who       string
+	vp8FPS, vp8Batch          int
 }
 
 func main() {
@@ -123,6 +124,8 @@ func main() {
 	secs := flag.Int("secs", 90, "run: seconds to stay up")
 	icePolicy := flag.String("ice-policy", "relay", "run: ICE transport policy (relay|all)")
 	mediaMode := flag.String("media-mode", "direct", "run: media topology (direct|sfu)")
+	vp8FPS := flag.Int("vp8-fps", 0, "run/sfu: VP8 tunnel nominal fps (0 = tunnel default)")
+	vp8Batch := flag.Int("vp8-batch", 0, "run/sfu: VP8 tunnel samples per frame interval (0 = tunnel default)")
 	transcriptPath := flag.String("transcript", "", "run: write the JSONL diagnostic transcript to this file")
 	who := flag.String("who", "", "run: participant label for the transcript (default pion-<role>)")
 	flag.Parse()
@@ -146,6 +149,7 @@ func main() {
 		role: *role, joinLink: *joinLink, conv: *conv, create: *create,
 		calleePhone: *calleePhone, tunnelSecret: *tunnelSecret, secs: *secs,
 		icePolicy: *icePolicy, mediaMode: *mediaMode, calleeUID: *calleeUID,
+		vp8FPS: *vp8FPS, vp8Batch: *vp8Batch,
 		transcriptPath: *transcriptPath, who: *who,
 	}
 
@@ -223,6 +227,8 @@ func authParams(tf tokenFile, o runOpts) string {
 		CalleePhone:        o.calleePhone,
 		CalleeUID:          o.calleeUID,
 		MediaMode:          o.mediaMode,
+		VP8FPS:             o.vp8FPS,
+		VP8Batch:           o.vp8Batch,
 	}
 	pj, _ := json.Marshal(params)
 	return string(pj)
@@ -233,7 +239,13 @@ func newJoiner(logFn func(string, ...any), mediaMode string) *joiner.MaxHeadless
 	// to another codec, so the codec-checking reader would discard everything.
 	readTrackFn := pion.ReadTrack
 	if mediaMode == "sfu" {
-		readTrackFn = pion.ReadTrackForceVP8
+		readTrackFn = func(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string) {
+			if track.Kind() == webrtc.RTPCodecTypeVideo {
+				pion.ReadTrackForceVP8(track, handler, logFn, prefix)
+				return
+			}
+			pion.ReadTrack(track, handler, logFn, prefix)
+		}
 	}
 	return joiner.NewMaxHeadlessJoiner(
 		logFn, joiner.ResolveFunc(resolve), statusEmitter{}, pcConfigurer{},

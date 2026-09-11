@@ -1121,7 +1121,7 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 			h.logFn("max-joiner: AddTrack (pre-SRD) failed: %v", addErr)
 		} else {
 			h.sfuTrackBound = true
-			go tunnel.DrainSenderRTCP(sender)
+			go tunnel.DrainSenderRTCPLogging(sender, h.logFn, "max-joiner: video-sender")
 			h.logFn("max-joiner: AddTrack VP8 sampleTrack (pre-SRD), sender=%v", sender != nil)
 		}
 		// Bind the silent audio track too, so the SFU's audio-send m-line (mid:2)

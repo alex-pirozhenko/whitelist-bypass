@@ -12,9 +12,13 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// vp8Keepalive is a keyframe-tagged VP8 header: frame tag, start code
+// 9d 01 2a, then width/height. The dimensions used to be 16x16; the OK-Calls
+// SFU forwards on-demand layers by requested size (consumers ask for
+// 320x240), so declare 320x240 (little-endian 14-bit + 2 scale bits).
 var vp8Keepalive = []byte{
-	0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00,
-	0x10, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
+	0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x01,
+	0xf0, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
 	0x99, 0x84, 0x88, 0xfc,
 }
 
@@ -25,11 +29,11 @@ var vp8Interframe = []byte{
 }
 
 const (
-	vp8KeepaliveLen   = 20
-	vp8InterframeLen  = 17
-	epochFieldLen     = 4
-	keepaliveHdrLen   = vp8KeepaliveLen + epochFieldLen
-	interframeHdrLen  = vp8InterframeLen + epochFieldLen
+	vp8KeepaliveLen  = 20
+	vp8InterframeLen = 17
+	epochFieldLen    = 4
+	keepaliveHdrLen  = vp8KeepaliveLen + epochFieldLen
+	interframeHdrLen = vp8InterframeLen + epochFieldLen
 )
 
 var ErrEmptySecret = errors.New("tunnel: obfuscator requires a non-empty secret")

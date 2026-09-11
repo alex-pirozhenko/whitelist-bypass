@@ -24,6 +24,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -107,6 +108,8 @@ type runOpts struct {
 	calleeUID                 int64
 	transcriptPath, who       string
 	vp8FPS, vp8Batch          int
+	bench                     bool
+	benchSize, benchIntervalMS int
 }
 
 func main() {
@@ -128,6 +131,9 @@ func main() {
 	vp8Batch := flag.Int("vp8-batch", 0, "run/sfu: VP8 tunnel samples per frame interval (0 = tunnel default)")
 	transcriptPath := flag.String("transcript", "", "run: write the JSONL diagnostic transcript to this file")
 	who := flag.String("who", "", "run: participant label for the transcript (default pion-<role>)")
+	bench := flag.Bool("bench", false, "run: throughput benchmark mode")
+	benchSize := flag.Int("bench-size", 800, "run/bench: payload bytes per frame (default 800)")
+	benchIntervalMS := flag.Int("bench-interval-ms", 50, "run/bench: interval between sends in ms (default 50)")
 	flag.Parse()
 
 	if *tokenPath == "" {
@@ -151,6 +157,7 @@ func main() {
 		icePolicy: *icePolicy, mediaMode: *mediaMode, calleeUID: *calleeUID,
 		vp8FPS: *vp8FPS, vp8Batch: *vp8Batch,
 		transcriptPath: *transcriptPath, who: *who,
+		bench: *bench, benchSize: *benchSize, benchIntervalMS: *benchIntervalMS,
 	}
 
 	switch *mode {
@@ -307,18 +314,64 @@ func doRun(tf tokenFile, o runOpts) {
 	}
 
 	var recvCount atomic.Int64
+	var recvBytes atomic.Int64
+	var sendBytes atomic.Int64
+	var firstRecv atomic.Int64
+	var lastRecv atomic.Int64
+
 	j.OnConnected = func(dt tunnel.DataTunnel) {
 		logFn("*** TUNNEL CONNECTED — starting data pump ***")
 		dt.SetOnData(func(b []byte) {
-			recvCount.Add(1)
-			logFn("<<< RECV %d bytes: %q", len(b), string(b))
+			now := time.Now().UnixNano()
+			firstRecv.CompareAndSwap(0, now)
+			lastRecv.Store(now)
+			cnt := recvCount.Add(1)
+			tot := recvBytes.Add(int64(len(b)))
+			if !o.bench {
+				logFn("<<< RECV %d bytes: %q", len(b), string(b))
+			} else if cnt%20 == 0 {
+				el := time.Duration(now - firstRecv.Load()).Seconds()
+				if el > 0 {
+					rateKBps := (float64(tot) / 1024.0) / el
+					logFn("<<< RECV #%d: total %d bytes (%.2f KB/s, %.2f kbps)", cnt, tot, rateKBps, rateKBps*8)
+				}
+			}
 		})
 		go func() {
-			for i := 0; i < 100; i++ {
-				msg := fmt.Sprintf("%s-msg-%d", role, i)
-				dt.SendData([]byte(msg))
-				logFn(">>> SEND %d bytes: %q", len(msg), msg)
-				time.Sleep(2 * time.Second)
+			if o.bench {
+				chunkSize := o.benchSize
+				if chunkSize <= 0 {
+					chunkSize = 800
+				}
+				interval := time.Duration(o.benchIntervalMS) * time.Millisecond
+				if interval <= 0 {
+					interval = 50 * time.Millisecond
+				}
+				buf := make([]byte, chunkSize)
+				for i := range buf {
+					buf[i] = byte(i & 0xff)
+				}
+				logFn(">>> STARTING BENCHMARK chunk=%d bytes interval=%v", chunkSize, interval)
+				seq := 0
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						binary.BigEndian.PutUint32(buf[0:4], uint32(seq))
+						seq++
+						dt.SendData(buf)
+						sendBytes.Add(int64(chunkSize))
+					}
+				}
+			} else {
+				for i := 0; i < 100; i++ {
+					msg := fmt.Sprintf("%s-msg-%d", role, i)
+					dt.SendData([]byte(msg))
+					sendBytes.Add(int64(len(msg)))
+					logFn(">>> SEND %d bytes: %q", len(msg), msg)
+					time.Sleep(2 * time.Second)
+				}
 			}
 		}()
 	}
@@ -327,8 +380,17 @@ func doRun(tf tokenFile, o runOpts) {
 
 	time.Sleep(time.Duration(o.secs) * time.Second)
 	j.Close()
-	log.Printf("[%s] DONE — received %d messages", role, recvCount.Load())
-	if recvCount.Load() > 0 {
+	rc := recvCount.Load()
+	rb := recvBytes.Load()
+	sb := sendBytes.Load()
+	log.Printf("[%s] DONE — sent %d bytes, received %d msgs (%d bytes)", role, sb, rc, rb)
+	if rc > 0 {
 		log.Printf("[%s] *** TRANSPORT WORKS — bytes flowed over the MAX call ***", role)
+		if o.bench && firstRecv.Load() > 0 && lastRecv.Load() > firstRecv.Load() {
+			dur := time.Duration(lastRecv.Load() - firstRecv.Load()).Seconds()
+			rateKBps := (float64(rb) / 1024.0) / dur
+			log.Printf("[%s] *** THROUGHPUT BENCHMARK: %.2f KB/s (%.2f kbps) over %.2f seconds ***",
+				role, rateKBps, rateKBps*8, dur)
+		}
 	}
 }

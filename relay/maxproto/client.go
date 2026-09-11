@@ -26,6 +26,22 @@ var AndroidUA = map[string]any{
 	"timezone":       "Europe/Moscow",
 }
 
+// WebUA identifies the connection as the WEB platform. Required for the QR
+// login-track creation (op288), which the server refuses on an ANDROID session.
+var WebUA = map[string]any{
+	"deviceType":      "WEB",
+	"pushDeviceType":  "WEBPUSH",
+	"locale":          "ru",
+	"deviceLocale":    "en",
+	"osVersion":       "macOS",
+	"deviceName":      "Chrome",
+	"headerUserAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+	"isPwa":           false,
+	"appVersion":      "26.9.4",
+	"screen":          "1080x1920 2.0x",
+	"timezone":        "Europe/Moscow",
+}
+
 type ResolveFunc func(host string) (ip string, err error)
 
 type reply struct {
@@ -36,6 +52,7 @@ type reply struct {
 type Client struct {
 	token    string
 	deviceID string
+	ua       map[string]any // SessionInit userAgent; AndroidUA by default, WebUA for QR web legs
 
 	conn    net.Conn
 	seq     uint16
@@ -51,8 +68,19 @@ func New(token, deviceID string) *Client {
 	return &Client{
 		token:    token,
 		deviceID: deviceID,
+		ua:       AndroidUA,
 		pending:  make(map[uint16]chan reply),
 	}
+}
+
+// NewWeb builds a client that identifies as the WEB platform in SessionInit.
+// The QR login-track creation (op288) is refused ("qr_login.disabled") on an
+// ANDROID-identified connection — that opcode is the web/PWA client's, so the
+// web leg of DeriveWebSession must session-init as WEB.
+func NewWeb(token, deviceID string) *Client {
+	c := New(token, deviceID)
+	c.ua = WebUA
+	return c
 }
 
 // DeviceID returns the device ID the client was constructed with, or the
@@ -278,8 +306,12 @@ func (c *Client) Cmd(ctx context.Context, opcode uint16, payload any) (any, erro
 }
 
 func (c *Client) SessionInit(ctx context.Context) (map[string]any, error) {
+	ua := c.ua
+	if ua == nil {
+		ua = AndroidUA
+	}
 	payload := map[string]any{
-		"userAgent": AndroidUA,
+		"userAgent": ua,
 		"deviceId":  c.deviceID,
 	}
 	resp, err := c.Cmd(ctx, 6, payload)

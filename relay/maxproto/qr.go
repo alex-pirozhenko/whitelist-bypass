@@ -78,7 +78,9 @@ func DeriveWebSession(ctx context.Context, master *Client, resolve ResolveFunc) 
 		return "", "", fmt.Errorf("generate web device id: %w", err)
 	}
 
-	web := New("", webDeviceID)
+	// The web leg MUST identify as WEB: op288 (QR create-track) is refused
+	// ("qr_login.disabled") on an ANDROID-identified session.
+	web := NewWeb("", webDeviceID)
 	if err := web.Connect(ctx, resolve); err != nil {
 		return "", "", fmt.Errorf("web connect: %w", err)
 	}

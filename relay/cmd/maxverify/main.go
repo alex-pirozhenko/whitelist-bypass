@@ -40,6 +40,7 @@ func main() {
 	poolPath := flag.String("pool", "", "path to a JSON array of {phone,device_id,token,password?}")
 	doQR := flag.Bool("qr", false, "derive a web session from the first live master")
 	doSetPw := flag.Bool("set-password", false, "set a 2FA password on the first live password-less master")
+	addPhone := flag.String("add-phone", "", "op41: resolve+add this phone as a contact of the first live master")
 	flag.Parse()
 	if *poolPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: maxverify -pool tokens.json [-qr] [-set-password]")
@@ -138,6 +139,32 @@ func main() {
 		}()
 		vcancel()
 		fmt.Printf("  derived session usable WEB-style: ok=%v err=%v\n", werr == nil, werr)
+	}
+
+	if *addPhone != "" {
+		fmt.Printf("\n[add-phone] %s adds contact %s (op41) ...\n", firstLive.Phone, *addPhone)
+		mc := maxproto.New(firstLive.Token, firstLive.DeviceID)
+		actx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		defer cancel()
+		if err := mc.Connect(actx, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "  connect: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := mc.SessionInit(actx); err != nil {
+			fmt.Fprintf(os.Stderr, "  session-init: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := mc.Login(actx); err != nil {
+			fmt.Fprintf(os.Stderr, "  login: %v\n", err)
+			os.Exit(1)
+		}
+		uid, isNew, err := mc.ContactAddByPhone(actx, *addPhone, "", "")
+		mc.Close()
+		if err != nil {
+			fmt.Printf("  op41 err: %v\n", err)
+			return
+		}
+		fmt.Printf("  op41 OK: contact uid=%d new=%v\n", uid, isNew)
 	}
 
 	if *doSetPw {

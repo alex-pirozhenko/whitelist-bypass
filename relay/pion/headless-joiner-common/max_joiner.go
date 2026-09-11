@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,12 +43,19 @@ const (
 	maxDefaultOSVersion       = "34"
 	maxDefaultTunnelMode      = "dc"
 
-	// WEB-platform ws2 defaults. The reference bundle's SDK defaults are
-	// platform:"WEB", device:"browser", clientType:"PORTAL" (MAX_WS2_REFERENCE.md
-	// "Open items"); web.max.ru may override them, and op166's CallInfo
-	// clientType wins when present. appVersion follows maxproto.WebUA.
-	maxDefaultWebDevice     = "browser"
-	maxDefaultWebClientType = "PORTAL"
+	// WEB-platform ws2 defaults, captured verbatim from the real web.max.ru
+	// client (2026-09-11, /tmp/golden/D3.jsonl ws open):
+	//   platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME
+	// clientType is op166 CallInfo's when present (the capture's conversation
+	// reported clientType ONE_ME), else ONE_ME. No locale/osVersion on web.
+	maxDefaultWebDevice       = "browser"
+	maxDefaultWebAppVersion   = "1.1"
+	maxDefaultWebCapabilities = "2A03F"
+
+	// SFU on-demand video: the size we ask the SFU to send a peer's CAMERA at
+	// (UPDATE_DISPLAY_LAYOUT over producerCommand). The browser asked 320x240.
+	maxDefaultSFUVideoWidth  = 320
+	maxDefaultSFUVideoHeight = 240
 
 	maxPlatformAndroid = "android"
 	maxPlatformWeb     = "web"
@@ -137,6 +145,12 @@ type MaxHeadlessAuthParams struct {
 	VP8FPS   int `json:"vp8Fps"`
 	VP8Batch int `json:"vp8Batch"`
 
+	// SFUVideoWidth/SFUVideoHeight size the on-demand CAMERA video we request
+	// from the SFU for every other participant (SFU mode only). Zero uses the
+	// browser's 320x240.
+	SFUVideoWidth  int `json:"sfuVideoWidth"`
+	SFUVideoHeight int `json:"sfuVideoHeight"`
+
 	// ws2 client params (all have defaults; only override if set).
 	AppVersion      string `json:"appVersion"`
 	ProtocolVersion string `json:"protocolVersion"`
@@ -159,9 +173,7 @@ func (p *MaxHeadlessAuthParams) applyDefaults() {
 	if p.AppVersion == "" {
 		p.AppVersion = maxDefaultAppVersion
 		if web {
-			if v, ok := maxproto.WebUA["appVersion"].(string); ok && v != "" {
-				p.AppVersion = v
-			}
+			p.AppVersion = maxDefaultWebAppVersion
 		}
 	}
 	if p.ProtocolVersion == "" {
@@ -169,10 +181,13 @@ func (p *MaxHeadlessAuthParams) applyDefaults() {
 	}
 	if p.Capabilities == "" {
 		p.Capabilities = maxDefaultCapabilities
+		if web {
+			p.Capabilities = maxDefaultWebCapabilities
+		}
 	}
 	// ClientType: android defaults to ONE_ME here; web leaves it empty so
 	// buildWSURL can prefer the clientType op166's CallInfo reports, falling
-	// back to the web SDK default (PORTAL).
+	// back to ONE_ME (what the captured web client sent).
 	if p.ClientType == "" && !web {
 		p.ClientType = maxDefaultClientType
 	}
@@ -199,6 +214,10 @@ func (p *MaxHeadlessAuthParams) applyDefaults() {
 	}
 	if p.MediaMode == "" {
 		p.MediaMode = "direct"
+	}
+	if p.SFUVideoWidth <= 0 || p.SFUVideoHeight <= 0 {
+		p.SFUVideoWidth = maxDefaultSFUVideoWidth
+		p.SFUVideoHeight = maxDefaultSFUVideoHeight
 	}
 }
 
@@ -260,6 +279,21 @@ type MaxHeadlessJoiner struct {
 	vp8tunnel         *tunnel.VP8DataTunnel
 	producerSessionID string
 	configAck         configAckTracker
+
+	// SFU data-channel control plane (max_sfu_dc.go, MAX_SFU_DATACHANNEL.md).
+	// sfuDCs holds the four channels by label; sfuPeers is every other
+	// participant id seen on ws2 (call-scoped, survives PC rebuilds);
+	// sfuRequested is the subset already asked for over the CURRENT
+	// producerCommand channel; sfuRegistry/sfuSlots/sfuSlotAssign are the
+	// current media session's compact-id registry, the offer's pat-N consumer
+	// slots and which stream each slot currently carries.
+	sfuMu         sync.Mutex
+	sfuDCs        map[string]*webrtc.DataChannel
+	sfuPeers      map[string]bool
+	sfuRequested  map[string]bool
+	sfuRegistry   *sfuStreamRegistry
+	sfuSlots      map[string]*sfuSlot
+	sfuSlotAssign map[string]SFUStreamDesc
 
 	reconnectAttempt atomic.Int32
 	stopCh           chan struct{}
@@ -441,6 +475,14 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	h.ci = nil
 	h.selfUID = ""
 	h.selfAltUID = ""
+	h.sfuMu.Lock()
+	h.sfuDCs = nil
+	h.sfuPeers = nil
+	h.sfuRequested = nil
+	h.sfuRegistry = nil
+	h.sfuSlots = nil
+	h.sfuSlotAssign = nil
+	h.sfuMu.Unlock()
 }
 
 func (h *MaxHeadlessJoiner) Close() {
@@ -580,10 +622,11 @@ func (h *MaxHeadlessJoiner) joinCall() error {
 // _full_ws_url). Without these the server accepts the handshake but then
 // replies {"type":"error","error":"invalid-request"}.
 //
-// Platform "web" mirrors the web client's _buildUrl (MAX_WS2_REFERENCE.md §2b):
-// platform=WEB, device=browser, clientType from CallInfo (else the SDK default
-// PORTAL), and no locale/osVersion — the web client never appends those two.
-// Android keeps the values the ANDROID app sends.
+// Platform "web" reproduces the captured web client URL exactly, in its
+// order (MAX_WS2_REFERENCE.md §2b _buildUrl; capture 2026-09-11):
+// platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=<CallInfo|ONE_ME>
+// — no locale/osVersion, the web client never appends those two. Android
+// keeps the values the ANDROID app sends.
 func (h *MaxHeadlessJoiner) buildWSURL() string {
 	p := h.params
 	base := h.ci.Endpoint
@@ -595,14 +638,23 @@ func (h *MaxHeadlessJoiner) buildWSURL() string {
 	}
 	if clientType == "" {
 		clientType = maxDefaultClientType
-		if web {
-			clientType = maxDefaultWebClientType
+	}
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	if web {
+		q := []string{
+			"platform=WEB",
+			"appVersion=" + url.QueryEscape(p.AppVersion),
+			"version=" + url.QueryEscape(p.ProtocolVersion),
+			"device=" + url.QueryEscape(p.Device),
+			"capabilities=" + url.QueryEscape(p.Capabilities),
+			"clientType=" + url.QueryEscape(clientType),
 		}
+		return base + sep + strings.Join(q, "&")
 	}
 	platform := "ANDROID"
-	if web {
-		platform = "WEB"
-	}
 
 	values := url.Values{}
 	values.Set("version", p.ProtocolVersion)
@@ -611,15 +663,8 @@ func (h *MaxHeadlessJoiner) buildWSURL() string {
 	values.Set("clientType", clientType)
 	values.Set("appVersion", p.AppVersion)
 	values.Set("device", p.Device)
-	if !web {
-		values.Set("locale", p.Locale)
-		values.Set("osVersion", p.OSVersion)
-	}
-
-	sep := "?"
-	if strings.Contains(base, "?") {
-		sep = "&"
-	}
+	values.Set("locale", p.Locale)
+	values.Set("osVersion", p.OSVersion)
 	return base + sep + values.Encode()
 }
 
@@ -742,6 +787,15 @@ func (h *MaxHeadlessJoiner) handleConnection(m map[string]interface{}) {
 	if conv, ok := m["conversation"].(map[string]interface{}); ok {
 		topology, _ = conv["topology"].(string)
 		h.logFn("max-joiner: <- connection topology=%v state=%v", conv["topology"], conv["state"])
+		// Everyone already in the call (minus self) is a video source we will
+		// ask the SFU for once producerCommand opens.
+		if parts, ok := conv["participants"].([]interface{}); ok {
+			for _, p := range parts {
+				if pm, ok := p.(map[string]interface{}); ok {
+					h.noteSFUPeer(jsonIDString(pm["id"]))
+				}
+			}
+		}
 	}
 
 	if cp, ok := m["conversationParams"].(map[string]interface{}); ok {
@@ -1098,6 +1152,14 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 		return
 	}
 	h.trPC("setRemoteDescription", sdpArgs(desc), nil, nil)
+
+	// Remember the offer's consumer slots (pat-N -> mid/ssrcs) so a later
+	// participant-sources-update and OnTrack can be correlated in the logs.
+	slots := parseSFUSlotMap(desc.SDP)
+	h.sfuMu.Lock()
+	h.sfuSlots = slots
+	h.sfuMu.Unlock()
+	h.logFn("max-joiner: SFU offer consumer slots: %s", describeSFUSlots(slots))
 
 	for _, tr := range h.pc.GetTransceivers() {
 		h.logFn("max-joiner: transceiver mid=%s kind=%s dir=%s sender=%v",
@@ -1549,21 +1611,33 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 
 	// SCTP data channels the SFU offers on mid:1 (UDP/DTLS/SCTP). The web
 	// client's ServerTransport opens four (producerNotification, producerCommand,
-	// producerScreenShare, consumerScreenShare); creating them here initializes
+	// producerScreenShare, consumerScreenShare) with {ordered:true}
+	// (slice.pretty.js:6648-6665, 6685-6750); creating them here initializes
 	// pion's SCTP association so mid:1 is answered as a real datachannel section
 	// rather than a dead one — another layout the SFU media core rejects.
+	// producerCommand/producerNotification are the on-demand video control
+	// plane (max_sfu_dc.go): a new PeerConnection means a new media session,
+	// so the registry/slot state and the "already requested" set start over.
+	h.sfuMu.Lock()
+	h.sfuDCs = map[string]*webrtc.DataChannel{}
+	h.sfuRequested = map[string]bool{}
+	h.sfuRegistry = newSFUStreamRegistry()
+	h.sfuSlots = nil
+	h.sfuSlotAssign = map[string]SFUStreamDesc{}
+	h.sfuMu.Unlock()
+	ordered := true
 	for _, name := range []string{"producerNotification", "producerCommand", "producerScreenShare", "consumerScreenShare"} {
-		dc, derr := pc.CreateDataChannel(name, nil)
-		h.trPC("createDataChannel", map[string]any{"label": name, "options": nil}, nil, derr)
+		dc, derr := pc.CreateDataChannel(name, &webrtc.DataChannelInit{Ordered: &ordered})
+		h.trPC("createDataChannel", map[string]any{"label": name, "options": map[string]any{"ordered": true}}, nil, derr)
 		if derr != nil {
 			h.logFn("max-joiner: failed to create %s datachannel: %v", name, derr)
 			continue
 		}
-		h.attachDCStateHandlers(dc)
+		h.attachSFUDataChannel(dc)
 	}
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		h.logFn("max-joiner: remote track: codec=%s ssrc=%d", track.Codec().MimeType, track.SSRC())
+		h.logFn("max-joiner: remote track: %s", h.describeSFUTrack(track))
 		go h.ReadTrackFn(track, func(frame []byte) {
 			if h.vp8tunnel != nil {
 				h.vp8tunnel.HandleFrame(frame)
@@ -1612,6 +1686,221 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	}
 	h.logFn("max-joiner: SFU PC ready with %d ICE servers (turn-user=%q turn-urls=%v), waiting for producer offer",
 		len(iceServers), turnUser, h.ci.Turn.URLs)
+}
+
+// --- SFU data-channel control plane (see max_sfu_dc.go, MAX_SFU_DATACHANNEL.md) ---
+
+const (
+	sfuDCProducerNotification = "producerNotification"
+	sfuDCProducerCommand      = "producerCommand"
+)
+
+// attachSFUDataChannel wires one of the four SFU data channels: transcript
+// state lines for all of them, plus the control-plane handlers on
+// producerCommand (send queued video requests on open, decode responses) and
+// producerNotification (decode registry/slot/activity notifications).
+func (h *MaxHeadlessJoiner) attachSFUDataChannel(dc *webrtc.DataChannel) {
+	label := dc.Label()
+	h.sfuMu.Lock()
+	if h.sfuDCs == nil {
+		h.sfuDCs = map[string]*webrtc.DataChannel{}
+	}
+	h.sfuDCs[label] = dc
+	h.sfuMu.Unlock()
+	dc.OnOpen(func() {
+		h.trState("dc", "open", label)
+		id := uint16(0)
+		if dc.ID() != nil {
+			id = *dc.ID()
+		}
+		h.logFn("max-joiner: dc %s open (id=%d)", label, id)
+		if label == sfuDCProducerCommand {
+			h.flushSFUVideoRequests()
+		}
+	})
+	dc.OnClose(func() { h.trState("dc", "close", label) })
+	dc.OnError(func(err error) { h.logFn("max-joiner: dc %s error: %v", label, err) })
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		h.trDC(label, "rx", msg.Data)
+		switch label {
+		case sfuDCProducerNotification:
+			h.onSFUNotification(msg.Data)
+		case sfuDCProducerCommand:
+			h.onSFUCommandResponse(msg.Data)
+		default:
+			h.logFn("max-joiner: dc %s <- %d bytes (raw=%x)", label, len(msg.Data), msg.Data)
+		}
+	})
+}
+
+// noteSFUPeer records another participant of the call (from the connection
+// participants list, participant-joined or registered-peer) and, if the
+// producerCommand channel is already open, asks the SFU for its CAMERA video
+// right away; otherwise the request goes out when the channel opens.
+func (h *MaxHeadlessJoiner) noteSFUPeer(pid string) {
+	if h.params == nil || h.params.MediaMode != "sfu" {
+		return
+	}
+	if pid == "" || pid == h.selfUID || pid == h.selfAltUID {
+		return
+	}
+	h.sfuMu.Lock()
+	if h.sfuPeers == nil {
+		h.sfuPeers = map[string]bool{}
+	}
+	fresh := !h.sfuPeers[pid]
+	h.sfuPeers[pid] = true
+	h.sfuMu.Unlock()
+	if fresh {
+		h.logFn("max-joiner: SFU peer participantId=%s (will request CAMERA %dx%d)", pid, h.params.SFUVideoWidth, h.params.SFUVideoHeight)
+	}
+	h.flushSFUVideoRequests()
+}
+
+// flushSFUVideoRequests sends one UPDATE_DISPLAY_LAYOUT per known peer that
+// has not been requested over the current producerCommand channel yet.
+func (h *MaxHeadlessJoiner) flushSFUVideoRequests() {
+	h.sfuMu.Lock()
+	dc := h.sfuDCs[sfuDCProducerCommand]
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		h.sfuMu.Unlock()
+		return
+	}
+	var pending []string
+	for pid := range h.sfuPeers {
+		if !h.sfuRequested[pid] {
+			pending = append(pending, pid)
+		}
+	}
+	sort.Strings(pending)
+	for _, pid := range pending {
+		h.sfuRequested[pid] = true
+	}
+	h.sfuMu.Unlock()
+	for _, pid := range pending {
+		if err := h.sendSFUVideoRequest(dc, pid); err != nil {
+			h.sfuMu.Lock()
+			delete(h.sfuRequested, pid)
+			h.sfuMu.Unlock()
+		}
+	}
+}
+
+// nextSeq hands out the next command sequence number. The web client uses ONE
+// counter for ws2 JSON commands and producerCommand binary commands
+// (slice.pretty.js:9467 `c = this.sequence++`); the captured display-layout
+// request was seq 4 after allocate-consumer=1, change-media-settings=2,
+// accept-producer=3.
+func (h *MaxHeadlessJoiner) nextSeq() int {
+	h.wsMu.Lock()
+	defer h.wsMu.Unlock()
+	h.seq++
+	return h.seq
+}
+
+// sendSFUVideoRequest asks the SFU to start streaming pid's CAMERA at the
+// configured size into one of our pat-N consumer slots (the SFU answers which
+// slot on producerNotification type 7). Uses the registry compact id when the
+// SFU has already announced one for the stream, like `writeStreamDesc`.
+func (h *MaxHeadlessJoiner) sendSFUVideoRequest(dc *webrtc.DataChannel, pid string) error {
+	desc := SFUStreamDesc{ParticipantID: sfuCompositeUserID(pid), MediaType: SFUMediaCamera}
+	req := SFULayoutRequest{
+		Stream: desc,
+		Width:  h.params.SFUVideoWidth,
+		Height: h.params.SFUVideoHeight,
+		Fit:    "cv",
+	}
+	h.sfuMu.Lock()
+	reg := h.sfuRegistry
+	h.sfuMu.Unlock()
+	if reg != nil {
+		if id, ok := reg.compactID(desc.String()); ok {
+			req.CompactID = &id
+		}
+	}
+	seq := h.nextSeq()
+	payload := encodeUpdateDisplayLayout(seq, []SFULayoutRequest{req})
+	h.logFn("max-joiner: -> producerCommand update-display-layout seq=%d %s %dx%d fit=cv compact=%v (%d bytes: %x)",
+		seq, desc, req.Width, req.Height, req.CompactID != nil, len(payload), payload)
+	h.trDC(sfuDCProducerCommand, "tx", payload)
+	if err := dc.Send(payload); err != nil {
+		h.logFn("max-joiner: producerCommand send failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+// onSFUCommandResponse decodes and logs a producerCommand reply.
+func (h *MaxHeadlessJoiner) onSFUCommandResponse(b []byte) {
+	h.sfuMu.Lock()
+	reg := h.sfuRegistry
+	h.sfuMu.Unlock()
+	resp, err := decodeSFUCommandResponse(b, reg)
+	if err != nil {
+		h.logFn("max-joiner: <- producerCommand undecodable (%v) raw=%x", err, b)
+		return
+	}
+	h.logFn("max-joiner: <- producerCommand response %s", resp)
+}
+
+// onSFUNotification decodes a producerNotification frame, feeds the registry
+// and, for participant-sources-update, records which consumer slot (pat-N,
+// with its mid and SSRCs from the offer) now carries which peer stream.
+func (h *MaxHeadlessJoiner) onSFUNotification(b []byte) {
+	h.sfuMu.Lock()
+	reg := h.sfuRegistry
+	h.sfuMu.Unlock()
+	n, err := decodeSFUNotification(b, reg)
+	if err != nil {
+		h.logFn("max-joiner: <- producerNotification undecodable (%v) raw=%x", err, b)
+		return
+	}
+	h.logFn("max-joiner: <- producerNotification %s", n)
+	if n.Type != sfuNotifSourcesUpdate {
+		return
+	}
+	h.sfuMu.Lock()
+	defer h.sfuMu.Unlock()
+	if h.sfuSlotAssign == nil {
+		h.sfuSlotAssign = map[string]SFUStreamDesc{}
+	}
+	for _, s := range n.Sources {
+		mid, ssrcs := "?", []uint32(nil)
+		if slot := h.sfuSlots[s.StreamID]; slot != nil {
+			mid, ssrcs = slot.Mid, slot.SSRCs
+		}
+		switch {
+		case s.Stream != nil:
+			h.sfuSlotAssign[s.StreamID] = *s.Stream
+			h.logFn("max-joiner: SFU consumer slot %s (mid=%s ssrcs=%v) <- %s (answering seq=%d)", s.StreamID, mid, ssrcs, s.Stream, s.SequenceNumber)
+		case s.CompactID != nil:
+			h.logFn("max-joiner: SFU consumer slot %s (mid=%s ssrcs=%v) <- unknown compact id %d (registry has no entry yet)", s.StreamID, mid, ssrcs, *s.CompactID)
+		default:
+			delete(h.sfuSlotAssign, s.StreamID)
+			h.logFn("max-joiner: SFU consumer slot %s (mid=%s ssrcs=%v) released", s.StreamID, mid, ssrcs)
+		}
+	}
+}
+
+// describeSFUTrack renders an OnTrack track with the consumer slot it belongs
+// to (by SSRC from the offer, else by msid stream id) and, if the SFU already
+// told us, which peer stream that slot carries.
+func (h *MaxHeadlessJoiner) describeSFUTrack(track *webrtc.TrackRemote) string {
+	h.sfuMu.Lock()
+	defer h.sfuMu.Unlock()
+	slotID := track.StreamID()
+	mid := "?"
+	if slot := sfuSlotForSSRC(h.sfuSlots, uint32(track.SSRC())); slot != nil {
+		slotID, mid = slot.StreamID, slot.Mid
+	} else if slot := h.sfuSlots[slotID]; slot != nil {
+		mid = slot.Mid
+	}
+	carries := "(unassigned yet)"
+	if d, ok := h.sfuSlotAssign[slotID]; ok {
+		carries = d.String()
+	}
+	return fmt.Sprintf("kind=%s codec=%s ssrc=%d streamId=%s trackId=%s slot=%s mid=%s carries=%s",
+		track.Kind(), track.Codec().MimeType, track.SSRC(), track.StreamID(), track.ID(), slotID, mid, carries)
 }
 
 func (h *MaxHeadlessJoiner) initPC() {
@@ -2028,9 +2317,12 @@ func (h *MaxHeadlessJoiner) handleMessage(raw []byte) {
 		}
 		h.logFn("max-joiner: <- %s participantId=%v", notif, pid)
 		// DIRECT only: a peer joining triggers our p2p offer. SFU has no peer
-		// offer (the SFU offers via producer-updated).
+		// offer (the SFU offers via producer-updated); there a new peer is a
+		// video source to request over producerCommand.
 		if h.params.MediaMode != "sfu" {
 			h.maybeSendOffer()
+		} else {
+			h.noteSFUPeer(jsonIDString(pid))
 		}
 	case "connection":
 		h.logFn("max-joiner: <- connection (raw=%s)", string(raw))

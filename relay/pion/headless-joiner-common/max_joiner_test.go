@@ -224,8 +224,16 @@ func TestApplyDefaultsPlatform(t *testing.T) {
 	if w.ClientType != "" {
 		t.Errorf("web ClientType = %q, want empty (CallInfo must win)", w.ClientType)
 	}
-	if want, _ := maxproto.WebUA["appVersion"].(string); w.AppVersion != want || want == "" {
-		t.Errorf("web AppVersion = %q, want WebUA appVersion %q", w.AppVersion, want)
+	// Captured web client: appVersion=1.1, capabilities=2A03F (not the Android
+	// 26.30.1 / 1877f, and not maxproto.WebUA's HTTP-API appVersion).
+	if w.AppVersion != "1.1" {
+		t.Errorf("web AppVersion = %q, want 1.1", w.AppVersion)
+	}
+	if w.Capabilities != "2A03F" {
+		t.Errorf("web Capabilities = %q, want 2A03F", w.Capabilities)
+	}
+	if w.SFUVideoWidth != 320 || w.SFUVideoHeight != 240 {
+		t.Errorf("SFU video size = %dx%d, want 320x240", w.SFUVideoWidth, w.SFUVideoHeight)
 	}
 	// Explicit overrides survive on web too.
 	w2 := &MaxHeadlessAuthParams{Platform: "web", Device: "custom", ClientType: "X"}
@@ -235,9 +243,10 @@ func TestApplyDefaultsPlatform(t *testing.T) {
 	}
 }
 
-// TestBuildWSURLWeb mirrors the web client's _buildUrl (MAX_WS2_REFERENCE.md
-// §2b): platform=WEB, device=browser, clientType from CallInfo (else PORTAL),
-// and no locale/osVersion params.
+// TestBuildWSURLWeb reproduces the captured web client URL tail exactly
+// (2026-09-11, /tmp/golden/D3.jsonl ws open):
+// platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME
+// clientType comes from CallInfo when present; no locale/osVersion params.
 func TestBuildWSURLWeb(t *testing.T) {
 	h := &MaxHeadlessJoiner{}
 	params := &MaxHeadlessAuthParams{Platform: "web"}
@@ -246,21 +255,19 @@ func TestBuildWSURLWeb(t *testing.T) {
 	h.ci = &maxproto.CallInfo{Endpoint: "wss://example.max/ws2?tgt=join", ClientType: "FROM_CALLINFO"}
 
 	got := h.buildWSURL()
-	for _, want := range []string{"platform=WEB", "device=browser", "clientType=FROM_CALLINFO", "version=5", "capabilities=1877f", "appVersion=" + params.AppVersion} {
-		if !strings.Contains(got, want) {
-			t.Errorf("buildWSURL() = %q, missing %q", got, want)
-		}
-	}
-	for _, reject := range []string{"locale=", "osVersion=", "platform=ANDROID", "ONE_ME"} {
-		if strings.Contains(got, reject) {
-			t.Errorf("buildWSURL() = %q, must not contain %q on web", got, reject)
-		}
+	if want := "wss://example.max/ws2?tgt=join&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=FROM_CALLINFO"; got != want {
+		t.Errorf("buildWSURL() = %q\n                want %q", got, want)
 	}
 
-	// No CallInfo clientType -> web SDK default PORTAL.
+	// No CallInfo clientType -> ONE_ME, exactly as captured.
 	h.ci = &maxproto.CallInfo{Endpoint: "wss://example.max/ws2"}
-	if got := h.buildWSURL(); !strings.Contains(got, "clientType=PORTAL") {
-		t.Errorf("buildWSURL() = %q, want clientType=PORTAL fallback", got)
+	if want := "wss://example.max/ws2?platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME"; h.buildWSURL() != want {
+		t.Errorf("buildWSURL() = %q, want %q", h.buildWSURL(), want)
+	}
+	for _, reject := range []string{"locale=", "osVersion=", "platform=ANDROID", "PORTAL"} {
+		if strings.Contains(h.buildWSURL(), reject) {
+			t.Errorf("buildWSURL() = %q, must not contain %q on web", h.buildWSURL(), reject)
+		}
 	}
 }
 

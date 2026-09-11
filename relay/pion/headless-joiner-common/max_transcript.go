@@ -1,6 +1,7 @@
 package joiner
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -220,6 +221,16 @@ func (h *MaxHeadlessJoiner) attachTranscriptStateHandlers(pc *webrtc.PeerConnect
 	})
 	pc.OnSignalingStateChange(func(s webrtc.SignalingState) {
 		h.trState("signaling", s.String(), "")
+	})
+}
+
+// trDC records a binary data-channel frame in the same shape the browser
+// oracle emits ({kind:"dc", label, dir, binary:true, len, b64}) so the SFU
+// control-plane traffic can be diffed against a browser transcript.
+func (h *MaxHeadlessJoiner) trDC(label, dir string, payload []byte) {
+	h.tr(map[string]any{
+		"kind": "dc", "label": label, "dir": dir, "binary": true,
+		"len": len(payload), "b64": base64.StdEncoding.EncodeToString(payload),
 	})
 }
 

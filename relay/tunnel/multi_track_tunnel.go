@@ -202,3 +202,37 @@ func (m *MultiTrackTunnel) HandleFrame(frame []byte) {
 		first.HandleFrame(frame)
 	}
 }
+
+// SetProfile fans a Profile out to every sub-tunnel. Each *VP8DataTunnel
+// applies it via its own SetProfile (see vp8tunnel.go).
+func (m *MultiTrackTunnel) SetProfile(p Profile) {
+	m.mu.Lock()
+	m.fps = p.FPS
+	m.batch = p.Batch
+	tunnels := m.tunnels
+	m.mu.Unlock()
+	for _, tun := range tunnels {
+		tun.SetProfile(p)
+	}
+}
+
+// Counters sums the per-track counters across every sub-tunnel. There is no
+// single meaningful "current" Keepalives/SentFrames for a multi-track
+// tunnel other than the total actually placed on the wire, which is what a
+// caller measuring aggregate throughput/loss wants.
+func (m *MultiTrackTunnel) Counters() Counters {
+	m.mu.Lock()
+	tunnels := make([]*VP8DataTunnel, len(m.tunnels))
+	copy(tunnels, m.tunnels)
+	m.mu.Unlock()
+	var c Counters
+	for _, tun := range tunnels {
+		tc := tun.Counters()
+		c.SentFrames += tc.SentFrames
+		c.SentBytes += tc.SentBytes
+		c.Keepalives += tc.Keepalives
+		c.RecvFrames += tc.RecvFrames
+		c.RecvBytes += tc.RecvBytes
+	}
+	return c
+}

@@ -86,6 +86,9 @@ type RelayBridge struct {
 
 	onConfigAckMu sync.Mutex
 	onConfigAck   func()
+
+	policyMaster bool
+	rateCtl      *RateController
 }
 
 func (rb *RelayBridge) SetOnPeerConfig(fn func(fps, batch, trackCount int)) {
@@ -100,23 +103,26 @@ func (rb *RelayBridge) SetOnConfigAck(fn func()) {
 	rb.onConfigAckMu.Unlock()
 }
 
-func NewRelayBridgeWithAuth(tunnel DataTunnel, mode string, readBuf int, logFn func(string, ...any), socksUser, socksPass string) *RelayBridge {
-	rb := NewRelayBridge(tunnel, mode, readBuf, logFn)
+func NewRelayBridgeWithAuth(tunnel DataTunnel, mode string, readBuf int, logFn func(string, ...any), socksUser, socksPass string, policyMaster bool) *RelayBridge {
+	rb := NewRelayBridge(tunnel, mode, readBuf, logFn, policyMaster)
 	rb.socksUser = socksUser
 	rb.socksPass = socksPass
 	return rb
 }
 
-func NewRelayBridge(tunnel DataTunnel, mode string, readBuf int, logFn func(string, ...any)) *RelayBridge {
+func NewRelayBridge(tunnel DataTunnel, mode string, readBuf int, logFn func(string, ...any), policyMaster bool) *RelayBridge {
 	rb := &RelayBridge{
-		tunnel:  tunnel,
-		logFn:   logFn,
-		mode:    mode,
-		readBuf: readBuf,
-		ready:   make(chan struct{}),
+		tunnel:       tunnel,
+		logFn:        logFn,
+		mode:         mode,
+		readBuf:      readBuf,
+		ready:        make(chan struct{}),
+		policyMaster: policyMaster,
 	}
 	tunnel.SetOnData(rb.handleTunnelData)
 	tunnel.SetOnClose(rb.handleTunnelClose)
+	rb.rateCtl = NewRateController(tunnel, DefaultRateControllerConfig(), policyMaster, logFn)
+	rb.rateCtl.Start()
 	return rb
 }
 
@@ -131,7 +137,15 @@ func (rb *RelayBridge) SetUpstreamSocks(addr, user, pass string) {
 func (rb *RelayBridge) SwapTunnel(newTunnel DataTunnel) {
 	rb.tunnelMu.Lock()
 	rb.tunnel = newTunnel
+	oldCtl := rb.rateCtl
+	newCtl := NewRateController(newTunnel, DefaultRateControllerConfig(), rb.policyMaster, rb.logFn)
+	rb.rateCtl = newCtl
 	rb.tunnelMu.Unlock()
+	if oldCtl != nil {
+		newCtl.SetPolicy(oldCtl.policyForTransfer())
+		oldCtl.Stop()
+	}
+	newCtl.Start()
 	newTunnel.SetOnData(rb.handleTunnelData)
 	newTunnel.SetOnClose(rb.handleTunnelClose)
 	rb.closeAll()
@@ -141,6 +155,12 @@ func (rb *RelayBridge) currentTunnel() DataTunnel {
 	rb.tunnelMu.RLock()
 	defer rb.tunnelMu.RUnlock()
 	return rb.tunnel
+}
+
+func (rb *RelayBridge) currentRateCtl() *RateController {
+	rb.tunnelMu.RLock()
+	defer rb.tunnelMu.RUnlock()
+	return rb.rateCtl
 }
 
 func (rb *RelayBridge) handleTunnelClose() {
@@ -197,6 +217,12 @@ func (rb *RelayBridge) Close() {
 	if !rb.closed.CompareAndSwap(false, true) {
 		return
 	}
+	rb.tunnelMu.RLock()
+	ctl := rb.rateCtl
+	rb.tunnelMu.RUnlock()
+	if ctl != nil {
+		ctl.Stop()
+	}
 	rb.listenerMu.Lock()
 	ln := rb.listener
 	rb.listener = nil
@@ -220,45 +246,70 @@ func (rb *RelayBridge) MarkReady() {
 
 func (rb *RelayBridge) send(connID uint32, msgType byte, payload []byte) {
 	frame := EncodeFrame(connID, msgType, payload)
+	if connID != ControlConnID {
+		if ctl := rb.currentRateCtl(); ctl != nil {
+			ctl.NoteSent()
+		}
+	}
 	rb.currentTunnel().SendData(frame)
 }
 
 func (rb *RelayBridge) handleTunnelData(data []byte) {
 	DecodeFrames(data, func(connID uint32, msgType byte, payload []byte) {
-		if connID == ControlConnID && msgType == MsgConfig {
-			fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs, flags, ok := DecodeVP8Config(payload)
-			if !ok {
-				return
-			}
-			// maxFrameBytes/idleKeepaliveMs/flags are consumed by the rate
-			// controller wired up in a later step of this feature; for now the
-			// creator side keeps applying only fps/batch, exactly as before.
-			_ = maxFrameBytes
-			_ = idleKeepaliveMs
-			_ = flags
-			if rb.mode == "creator" {
-				rb.logFn("relay: peer requested vp8 pacing fps=%d batch=%d trackCount=%d", fps, batch, trackCount)
-				rb.currentTunnel().Reconfigure(fps, batch)
-				rb.send(ControlConnID, MsgConfigAck, nil)
-				rb.onPeerConfigMu.Lock()
-				cb := rb.onPeerConfig
-				rb.onPeerConfigMu.Unlock()
-				if cb != nil {
-					cb(fps, batch, trackCount)
+		if connID == ControlConnID {
+			ctl := rb.currentRateCtl()
+			switch msgType {
+			case MsgConfig:
+				fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs, flags, ok := DecodeVP8Config(payload)
+				if !ok {
+					return
 				}
+				_ = flags
+				if !rb.policyMaster {
+					rb.logFn("relay: peer requested vp8 pacing fps=%d batch=%d trackCount=%d maxFrameBytes=%d idleKeepaliveMs=%d",
+						fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs)
+					if ctl != nil {
+						ctl.onPeerConfig(Profile{FPS: fps, Batch: batch, MaxFrameBytes: maxFrameBytes, IdleKeepalive: time.Duration(idleKeepaliveMs) * time.Millisecond})
+					} else {
+						rb.currentTunnel().Reconfigure(fps, batch)
+						rb.send(ControlConnID, MsgConfigAck, nil)
+					}
+					rb.onPeerConfigMu.Lock()
+					cb := rb.onPeerConfig
+					rb.onPeerConfigMu.Unlock()
+					if cb != nil {
+						cb(fps, batch, trackCount)
+					}
+				}
+				return
+			case MsgConfigAck:
+				if rb.policyMaster {
+					rb.onConfigAckMu.Lock()
+					cb := rb.onConfigAck
+					rb.onConfigAckMu.Unlock()
+					if cb != nil {
+						cb()
+					}
+				}
+				if ctl != nil {
+					ctl.onPeerAck()
+				}
+				return
+			case MsgStats:
+				if ctl != nil {
+					ctl.handlePeerStats(payload)
+				}
+				return
+			case MsgPing:
+				if ctl != nil {
+					ctl.handlePeerPing(payload)
+				}
+				return
 			}
 			return
 		}
-		if connID == ControlConnID && msgType == MsgConfigAck {
-			if rb.mode == "joiner" {
-				rb.onConfigAckMu.Lock()
-				cb := rb.onConfigAck
-				rb.onConfigAckMu.Unlock()
-				if cb != nil {
-					cb()
-				}
-			}
-			return
+		if ctl := rb.currentRateCtl(); ctl != nil {
+			ctl.NoteRecv()
 		}
 		switch rb.mode {
 		case "joiner":
@@ -267,6 +318,24 @@ func (rb *RelayBridge) handleTunnelData(data []byte) {
 			rb.handleCreatorMessage(connID, msgType, payload)
 		}
 	})
+}
+
+// State reports the RateController's current tier, or TierActive if none
+// is attached (should not happen via the exported constructors, but keep
+// this defensive for a RelayBridge somehow built another way).
+func (rb *RelayBridge) State() Tier {
+	if ctl := rb.currentRateCtl(); ctl != nil {
+		return ctl.State()
+	}
+	return TierActive
+}
+
+// SetPolicy forwards to the attached RateController. See Policy's and
+// NewRateController's doc comments for the master/non-master distinction.
+func (rb *RelayBridge) SetPolicy(p Policy) {
+	if ctl := rb.currentRateCtl(); ctl != nil {
+		ctl.SetPolicy(p)
+	}
 }
 
 func (rb *RelayBridge) handleJoinerMessage(connID uint32, msgType byte, payload []byte) {

@@ -113,6 +113,15 @@ type MaxHeadlessAuthParams struct {
 	TunnelMode     string `json:"tunnelMode"`
 	TunnelSecret   string `json:"tunnelSecret"`
 
+	// RequireTunnelSecret, when true, makes buildObfuscator fail instead of
+	// falling back to tunnel.DeriveSecretFromJoinLink when no usable
+	// TunnelSecret is configured. The join link is known to the call
+	// platform (it issued it) and the platform's SFU terminates SRTP, so a
+	// token-derived tunnel key lets the PLATFORM decrypt the tunnel contents
+	// — acceptable for cmd/maxjoin's ad-hoc/dev use (no device-provisioned secret
+	// available there) but not for a production caller that has one.
+	RequireTunnelSecret bool `json:"requireTunnelSecret"`
+
 	// Platform is the session platform the Token belongs to: "android" (the
 	// default; a master token) or "web" (a session derived from a master via
 	// maxproto.DeriveWebSession). Operator rule: Android master tokens are never
@@ -151,6 +160,49 @@ type MaxHeadlessAuthParams struct {
 	// browser's 320x240.
 	SFUVideoWidth  int `json:"sfuVideoWidth"`
 	SFUVideoHeight int `json:"sfuVideoHeight"`
+
+	// VP8MaxFrameBytes caps how large a coalesced VP8 tunnel frame may grow
+	// (see the frame-coalescing work in a later step of this feature). Zero
+	// means "coalescing disabled", i.e. today's one-frame-per-tick behavior.
+	VP8MaxFrameBytes int `json:"vp8MaxFrameBytes"`
+
+	// VP8IdleKeepaliveMs overrides how often an idle VP8 tunnel emits a
+	// keepalive frame (see the idle rate-control work in a later step of this
+	// feature). Zero uses the tunnel's own default idle keepalive period.
+	VP8IdleKeepaliveMs int `json:"vp8IdleKeepaliveMs"`
+
+	// RateControl selects the sender-side congestion-control strategy for the
+	// VP8 tunnel (see the AIMD work in a later step of this feature):
+	// "" or "fixed" (default): no adaptive behavior, matches today.
+	// "aimd": adaptive increase/multiplicative decrease of VP8MaxFrameBytes.
+	RateControl string `json:"rateControl"`
+
+	// SFUIdleVideoWidth/SFUIdleVideoHeight (SFU mode only) size the CAMERA
+	// video requested from the SFU for OTHER participants while this joiner's
+	// tunnel is idle (screen off, no tunnel traffic) — smaller than
+	// SFUVideoWidth/SFUVideoHeight to cut incoming bandwidth when the device
+	// doesn't need to render anyone's video. Zero on either disables idle
+	// resizing (SFUVideoWidth/SFUVideoHeight are used regardless of tunnel
+	// idleness — today's behavior).
+	SFUIdleVideoWidth  int `json:"sfuIdleVideoWidth"`
+	SFUIdleVideoHeight int `json:"sfuIdleVideoHeight"`
+
+	// ICEKeepaliveSec, when > 0, is reserved for a later step's ICE-keepalive
+	// tuning. Zero uses whatever default the transport already uses today
+	// (unchanged by this field for now).
+	ICEKeepaliveSec int `json:"iceKeepaliveSec"`
+
+	// ForceVP8Read makes the SFU-mode (MediaMode=="sfu") remote-track reader
+	// use the codec-check-bypassing variant (pion.ReadTrackForceVP8-equivalent)
+	// instead of the strict, codec-checked one, regardless of what the far end
+	// labels the forwarded track's codec. The OK-Calls SFU forwards our VP8 RTP
+	// under a payload type whose consumer m-line maps to a different codec
+	// label (observed: pion reports the forwarded track as VP9), so the
+	// strict/codec-checked reader silently discards every frame in that
+	// topology. Today only cmd/maxjoin knows to build the bypassing reader
+	// itself for MediaMode=="sfu"; this field lets ANY caller opt in without
+	// duplicating that branch. See ForceReadTrackFn below for how this is wired.
+	ForceVP8Read bool `json:"forceVp8Read"`
 
 	// ws2 client params (all have defaults; only override if set).
 	AppVersion      string `json:"appVersion"`
@@ -242,6 +294,10 @@ type MaxHeadlessJoiner struct {
 	PCConfig          PeerConnectionConfigurer
 	AddTracks         AddTunnelTracksFunc
 	ReadTrackFn       ReadTrackFunc
+	// ForceReadTrackFn, if set, is used instead of ReadTrackFn for SFU-mode
+	// (MediaMode=="sfu") remote-track reads when params.ForceVP8Read is true.
+	// See MaxHeadlessAuthParams.ForceVP8Read.
+	ForceReadTrackFn ReadTrackFunc
 	// Transcript, when non-nil, receives the JSONL diagnostic transcript
 	// (ws frames, pc calls, state changes, stats, logs). See max_transcript.go.
 	Transcript Transcript
@@ -300,6 +356,8 @@ type MaxHeadlessJoiner struct {
 	reconnectAttempt atomic.Int32
 	stopCh           chan struct{}
 	stopOnce         sync.Once
+
+	rtcpFeedback *tunnel.RTCPFeedback
 }
 
 // maxTopologyServer is the SFU/producer-consumer topology (vs "DIRECT" p2p).
@@ -307,16 +365,21 @@ const maxTopologyServer = "SERVER"
 
 func NewMaxHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, status StatusEmitter, pcConfig PeerConnectionConfigurer, addTracks AddTunnelTracksFunc, readTrackFn ReadTrackFunc) *MaxHeadlessJoiner {
 	h := &MaxHeadlessJoiner{
-		ResolveFn:   resolveFn,
-		Status:      status,
-		PCConfig:    pcConfig,
-		AddTracks:   addTracks,
-		ReadTrackFn: readTrackFn,
-		stopCh:      make(chan struct{}),
+		ResolveFn:    resolveFn,
+		Status:       status,
+		PCConfig:     pcConfig,
+		AddTracks:    addTracks,
+		ReadTrackFn:  readTrackFn,
+		stopCh:       make(chan struct{}),
+		rtcpFeedback: &tunnel.RTCPFeedback{},
 	}
 	// Every log line is mirrored into the Transcript (if one is attached later).
 	h.logFn = h.logAndTranscript(logFn)
 	return h
+}
+
+func (h *MaxHeadlessJoiner) RTCPFeedback() *tunnel.RTCPFeedback {
+	return h.rtcpFeedback
 }
 
 // MarkConfigAcked confirms the peer received our VP8 tunnel config (SFU mode).
@@ -523,15 +586,9 @@ func (h *MaxHeadlessJoiner) closeTransport() {
 // TunnelSecret (base64) or, failing that, derives it from the final JoinLink.
 // Called from joinCall after JoinLink is known (so CreateRoom works).
 func (h *MaxHeadlessJoiner) buildObfuscator() error {
-	var secret []byte
-	if h.params.TunnelSecret != "" {
-		decoded, err := base64.StdEncoding.DecodeString(h.params.TunnelSecret)
-		if err != nil {
-			return fmt.Errorf("bad tunnelSecret: %w", err)
-		}
-		secret = decoded
-	} else {
-		secret = tunnel.DeriveSecretFromJoinLink(h.params.JoinLink)
+	secret, err := callpathTunnelSecret(h.params.TunnelSecret, h.params.JoinLink, h.params.RequireTunnelSecret)
+	if err != nil {
+		return err
 	}
 	obf, err := tunnel.NewTunnelObfuscator(secret)
 	if err != nil {
@@ -1131,7 +1188,7 @@ func (h *MaxHeadlessJoiner) handleProducerUpdated(m map[string]interface{}) {
 				if h.vp8tunnel != nil {
 					h.vp8tunnel.RequestKeyframe()
 				}
-			})
+			}, h.rtcpFeedback)
 			h.logFn("max-joiner: AddTrack VP8 rtpTrack (pre-SRD), sender=%v", sender != nil)
 		}
 		// Bind the silent audio track too, so the SFU's audio-send m-line (mid:2)
@@ -1648,7 +1705,11 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		h.logFn("max-joiner: remote track: %s", h.describeSFUTrack(track))
-		go h.ReadTrackFn(track, func(frame []byte) {
+		readFn := h.ReadTrackFn
+		if h.params != nil && h.params.ForceVP8Read && h.ForceReadTrackFn != nil {
+			readFn = h.ForceReadTrackFn
+		}
+		go readFn(track, func(frame []byte) {
 			if h.vp8tunnel != nil {
 				h.vp8tunnel.HandleFrame(frame)
 			}
@@ -1814,11 +1875,15 @@ func (h *MaxHeadlessJoiner) nextSeq() int {
 // slot on producerNotification type 7). Uses the registry compact id when the
 // SFU has already announced one for the stream, like `writeStreamDesc`.
 func (h *MaxHeadlessJoiner) sendSFUVideoRequest(dc *webrtc.DataChannel, pid string) error {
+	return h.sendSFUVideoRequestSized(dc, pid, h.params.SFUVideoWidth, h.params.SFUVideoHeight)
+}
+
+func (h *MaxHeadlessJoiner) sendSFUVideoRequestSized(dc *webrtc.DataChannel, pid string, width, height int) error {
 	desc := SFUStreamDesc{ParticipantID: sfuCompositeUserID(pid), MediaType: SFUMediaCamera}
 	req := SFULayoutRequest{
 		Stream: desc,
-		Width:  h.params.SFUVideoWidth,
-		Height: h.params.SFUVideoHeight,
+		Width:  width,
+		Height: height,
 		Fit:    "cv",
 	}
 	h.sfuMu.Lock()
@@ -1839,6 +1904,50 @@ func (h *MaxHeadlessJoiner) sendSFUVideoRequest(dc *webrtc.DataChannel, pid stri
 		return err
 	}
 	return nil
+}
+
+// HintBandwidth implements tunnel.BandwidthHinter. It is the one channel
+// this joiner has to ask the far end (the SFU) for a different
+// allocation: the update-display-layout producerCommand that requests
+// each known peer's CAMERA stream at a given size (sendSFUVideoRequest).
+// On a non-Active tier it re-requests every known peer at the configured
+// idle size (SFUIdleVideoWidth/Height — screen off/idle means we don't
+// need full-res video of others); on TierActive it goes back to the
+// configured normal size (SFUVideoWidth/Height). Only meaningful in SFU
+// mode.
+//
+// Whether the SFU actually re-answers a SECOND update-display-layout
+// request for a peer it already granted the FIRST one for is UNVERIFIED
+// — this has only been exercised against the ack semantics of the very
+// first request per peer (see MAX_SFU_DATACHANNEL.md / the existing
+// sfuRequested one-shot guard this method deliberately bypasses). Treat
+// the re-request as best-effort until measured against a live call.
+func (h *MaxHeadlessJoiner) HintBandwidth(ctx context.Context, tier tunnel.Tier) error {
+	if h.params == nil || h.params.MediaMode != "sfu" {
+		return nil
+	}
+	width, height := h.params.SFUVideoWidth, h.params.SFUVideoHeight
+	if tier != tunnel.TierActive && h.params.SFUIdleVideoWidth > 0 && h.params.SFUIdleVideoHeight > 0 {
+		width, height = h.params.SFUIdleVideoWidth, h.params.SFUIdleVideoHeight
+	}
+	h.sfuMu.Lock()
+	dc := h.sfuDCs[sfuDCProducerCommand]
+	peers := make([]string, 0, len(h.sfuPeers))
+	for pid := range h.sfuPeers {
+		peers = append(peers, pid)
+	}
+	h.sfuMu.Unlock()
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return nil
+	}
+	sort.Strings(peers)
+	var firstErr error
+	for _, pid := range peers {
+		if err := h.sendSFUVideoRequestSized(dc, pid, width, height); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // onSFUCommandResponse decodes and logs a producerCommand reply.
@@ -2617,5 +2726,10 @@ func (w *sfuTunnelWrapper) onData(data []byte) {
 	if cb != nil {
 		cb(data)
 	}
+}
+
+// HintBandwidth forwards to the owning joiner — see MaxHeadlessJoiner.HintBandwidth.
+func (w *sfuTunnelWrapper) HintBandwidth(ctx context.Context, tier tunnel.Tier) error {
+	return w.h.HintBandwidth(ctx, tier)
 }
 

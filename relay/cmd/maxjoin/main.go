@@ -31,6 +31,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -112,6 +113,7 @@ type runOpts struct {
 	bench                     bool
 	benchSender               bool
 	benchSize, benchIntervalMS int
+	benchCSVPath              string
 }
 
 func main() {
@@ -139,6 +141,7 @@ func main() {
 	benchSender := flag.Bool("bench-sender", true, "run/bench: enable benchmark sender loop (set false for recv-only)")
 	benchSize := flag.Int("bench-size", 800, "run/bench: payload bytes per frame (default 800)")
 	benchIntervalMS := flag.Int("bench-interval-ms", 50, "run/bench: interval between sends in ms (default 50)")
+	benchCSV := flag.String("bench-csv", "", "run/bench: write one CSV line per second to this path (t,sentFrames,sentBytes,keepalives,recvFrames,recvBytes,gaps,lostPkts,rttMs,maxFrameBytes,state)")
 	flag.Parse()
 
 	if *tokenPath == "" {
@@ -164,6 +167,7 @@ func main() {
 		sfuWidth: *sfuWidth, sfuHeight: *sfuHeight,
 		transcriptPath: *transcriptPath, who: *who,
 		bench: *bench, benchSender: *benchSender, benchSize: *benchSize, benchIntervalMS: *benchIntervalMS,
+		benchCSVPath: *benchCSV,
 	}
 
 	switch *mode {
@@ -244,29 +248,20 @@ func authParams(tf tokenFile, o runOpts) string {
 		VP8Batch:           o.vp8Batch,
 		SFUVideoWidth:      o.sfuWidth,
 		SFUVideoHeight:     o.sfuHeight,
+		ForceVP8Read:       o.mediaMode == "sfu",
 	}
 	pj, _ := json.Marshal(params)
 	return string(pj)
 }
 
 func newJoiner(logFn func(string, ...any), mediaMode string) *joiner.MaxHeadlessJoiner {
-	// The SFU forwards our VP8 under a payload type its consumer m-line maps
-	// to another codec, so the codec-checking reader would discard everything.
-	readTrackFn := pion.ReadTrack
-	if mediaMode == "sfu" {
-		readTrackFn = func(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string) {
-			if track.Kind() == webrtc.RTPCodecTypeVideo {
-				pion.ReadTrackForceVP8(track, handler, logFn, prefix)
-				return
-			}
-			pion.ReadTrack(track, handler, logFn, prefix)
-		}
-	}
-	return joiner.NewMaxHeadlessJoiner(
+	j := joiner.NewMaxHeadlessJoiner(
 		logFn, joiner.ResolveFunc(resolve), statusEmitter{}, pcConfigurer{},
 		pion.AddTunnelTracks,
-		readTrackFn,
+		pion.ReadTrack,
 	)
+	j.ForceReadTrackFn = pion.ReadTrackForceVP8
+	return j
 }
 
 // doCallInfo performs the control-plane join only and prints the CallInfo a
@@ -321,6 +316,25 @@ func doRun(tf tokenFile, o runOpts) {
 		log.Printf("[%s] transcript -> %s (who=%s)", role, o.transcriptPath, who)
 	}
 
+	var csvFile *os.File
+	if o.bench && o.benchCSVPath != "" {
+		var err error
+		csvFile, err = os.OpenFile(o.benchCSVPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			log.Fatalf("open bench csv: %v", err)
+		}
+		defer csvFile.Close()
+		if _, err := csvFile.WriteString("t,sentFrames,sentBytes,keepalives,recvFrames,recvBytes,gaps,lostPkts,rttMs,maxFrameBytes,state\n"); err != nil {
+			log.Fatalf("write bench csv header: %v", err)
+		}
+	}
+
+	var benchMu sync.Mutex
+	var lastSeq uint32
+	var haveLastSeq bool
+	var gaps uint64
+	var lostPkts uint64
+
 	var recvCount atomic.Int64
 	var recvBytes atomic.Int64
 	var sendBytes atomic.Int64
@@ -335,6 +349,21 @@ func doRun(tf tokenFile, o runOpts) {
 			lastRecv.Store(now)
 			cnt := recvCount.Add(1)
 			tot := recvBytes.Add(int64(len(b)))
+
+			if o.bench && len(b) >= 4 {
+				seq := binary.BigEndian.Uint32(b[0:4])
+				benchMu.Lock()
+				if haveLastSeq {
+					if seq != lastSeq+1 {
+						gaps++
+						lostPkts += uint64(seq - lastSeq)
+					}
+				}
+				lastSeq = seq
+				haveLastSeq = true
+				benchMu.Unlock()
+			}
+
 			if !o.bench {
 				logFn("<<< RECV %d bytes: %q", len(b), string(b))
 			} else if cnt%20 == 0 || tot >= 500*1024 {
@@ -346,6 +375,45 @@ func doRun(tf tokenFile, o runOpts) {
 				}
 			}
 		})
+
+		if csvFile != nil {
+			go func() {
+				tSec := 0
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						var sentFrames, sentBytes, keepalives, recvFrames, recvBytes uint64
+						if cs, ok := dt.(interface{ Counters() tunnel.Counters }); ok {
+							c := cs.Counters()
+							sentFrames = c.SentFrames
+							sentBytes = c.SentBytes
+							keepalives = c.Keepalives
+							recvFrames = c.RecvFrames
+							recvBytes = c.RecvBytes
+						}
+
+						benchMu.Lock()
+						g := gaps
+						lp := lostPkts
+						benchMu.Unlock()
+
+						// TODO(step4/5): a later step wires these to the real rate controller
+						rttMs := 0
+						maxFrameBytes := 0
+						state := "n/a"
+
+						row := fmt.Sprintf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s\n",
+							tSec, sentFrames, sentBytes, keepalives, recvFrames, recvBytes, g, lp, rttMs, maxFrameBytes, state)
+						if _, err := csvFile.WriteString(row); err != nil {
+							logFn("write csv row error: %v", err)
+						}
+						tSec++
+					}
+				}
+			}()
+		}
 		go func() {
 			if o.bench && o.benchSender {
 				chunkSize := o.benchSize

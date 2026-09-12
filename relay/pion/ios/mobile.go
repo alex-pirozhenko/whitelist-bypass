@@ -71,7 +71,7 @@ func makeOnConnected(socksPort int, socksUser, socksPass string, logFn func(stri
 		case *tunnel.DCTunnel, *tunnel.MultiTrackKCPTunnel:
 			readBuf = common.DCBufSize
 		}
-		bridge := tunnel.NewRelayBridgeWithAuth(tun, "joiner", readBuf, logFn, socksUser, socksPass)
+		bridge := tunnel.NewRelayBridgeWithAuth(tun, "joiner", readBuf, logFn, socksUser, socksPass, true)
 		if onConfigAck != nil {
 			bridge.SetOnConfigAck(onConfigAck)
 		}

@@ -168,6 +168,40 @@ func ParseSDPType(t string) webrtc.SDPType {
 	return webrtc.SDPTypeAnswer
 }
 
+// RecvStats is a cumulative snapshot of what readVP8Track has observed on
+// one track: how many RTP packets it processed, how many times the sequence
+// number was non-consecutive (a "gap"), and the summed size of those jumps
+// (e.g. seeing 105 after 100 is a jump of 5, i.e. 4 packets never arrived or
+// arrived out of the window we track — LostPackets is that sum across all
+// gaps seen so far, not a count of distinct gap EVENTS; Gaps is the count of
+// gap events).
+type RecvStats struct {
+	RecvPackets uint64
+	Gaps        uint64
+	LostPackets uint64
+}
+
+// ReadTrackWithStats is ReadTrack plus a stats callback invoked after every
+// RTP packet is processed (whether or not it completed a frame), with a
+// cumulative RecvStats snapshot. onStats may be nil.
+func ReadTrackWithStats(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string, onStats func(RecvStats)) {
+	if track.Codec().MimeType != webrtc.MimeTypeVP8 {
+		buf := make([]byte, common.UDPBufSize)
+		for {
+			if _, _, err := track.Read(buf); err != nil {
+				return
+			}
+		}
+	}
+	readVP8Track(track, handler, logFn, prefix, false, onStats)
+}
+
+// ReadTrackForceVP8WithStats is ReadTrackForceVP8 plus the same stats callback.
+func ReadTrackForceVP8WithStats(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string, onStats func(RecvStats)) {
+	logFn("%s: reading track ssrc=%d pt=%d codec=%s as VP8 (forced)", prefix, track.SSRC(), track.PayloadType(), track.Codec().MimeType)
+	readVP8Track(track, handler, logFn, prefix, true, onStats)
+}
+
 func ReadTrack(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string) {
 	if track.Codec().MimeType != webrtc.MimeTypeVP8 {
 		buf := make([]byte, common.UDPBufSize)
@@ -177,7 +211,7 @@ func ReadTrack(track *webrtc.TrackRemote, handler func([]byte), logFn func(strin
 			}
 		}
 	}
-	readVP8Track(track, handler, logFn, prefix, false)
+	readVP8Track(track, handler, logFn, prefix, false, nil)
 }
 
 // ReadTrackForceVP8 is ReadTrack without the codec check. The OK-Calls SFU
@@ -188,7 +222,7 @@ func ReadTrack(track *webrtc.TrackRemote, handler func([]byte), logFn func(strin
 // frames unconditionally so a live run shows whether anything decodes.
 func ReadTrackForceVP8(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string) {
 	logFn("%s: reading track ssrc=%d pt=%d codec=%s as VP8 (forced)", prefix, track.SSRC(), track.PayloadType(), track.Codec().MimeType)
-	readVP8Track(track, handler, logFn, prefix, true)
+	readVP8Track(track, handler, logFn, prefix, true, nil)
 }
 
 // vpX reports the VP8 payload descriptor's extension bit as an int for logging.
@@ -199,15 +233,95 @@ func vpX(p codecs.VP8Packet) int {
 	return 0
 }
 
-func readVP8Track(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string, verbose bool) {
-	var vp8Pkt codecs.VP8Packet
-	var frameBuf []byte
-	var lastSeq uint16
-	var haveLastSeq bool
-	frameValid := false
-	recvCount := 0
-	recvPkts := 0
-	badCount := 0
+// vp8FrameReassembler holds the per-track mutable state readVP8Track uses to
+// turn a stream of RTP packets back into VP8 frames, plus the loss counters
+// from Section 2 above. Split out of readVP8Track so it can be unit-tested
+// with synthetic *rtp.Packet values instead of a live *webrtc.TrackRemote.
+type vp8FrameReassembler struct {
+	vp8Pkt       codecs.VP8Packet
+	frameBuf     []byte
+	lastSeq      uint16
+	haveLastSeq  bool
+	frameValid   bool
+	recvCount    int
+	recvPkts     int
+	badCount     int
+	stats        RecvStats
+}
+
+type feedResult struct {
+	Frame        []byte
+	IsDuplicate  bool
+	UnmarshalErr error
+	LogFirstPkts bool
+	VP8S         uint8
+	VP8PID       uint8
+	VP8N         uint8
+	VP8X         int
+	LogFrame     bool
+}
+
+// feed processes one already-unmarshalled *rtp.Packet. It returns the
+// completed frame (nil if none completed) and whether the packet was a
+// valid VP8 packet.
+func (r *vp8FrameReassembler) feed(pkt *rtp.Packet, verbose bool) (res feedResult) {
+	r.stats.RecvPackets++
+
+	if r.haveLastSeq {
+		if pkt.SequenceNumber == r.lastSeq {
+			res.IsDuplicate = true
+			return res
+		}
+		if pkt.SequenceNumber != r.lastSeq+1 {
+			r.stats.Gaps++
+			r.stats.LostPackets += uint64(uint16(pkt.SequenceNumber - r.lastSeq))
+			r.frameValid = false
+			r.frameBuf = r.frameBuf[:0]
+		}
+	}
+	r.lastSeq = pkt.SequenceNumber
+	r.haveLastSeq = true
+
+	vp8Payload, err := r.vp8Pkt.Unmarshal(pkt.Payload)
+	if err != nil {
+		res.UnmarshalErr = err
+		r.badCount++
+		r.frameValid = false
+		r.frameBuf = r.frameBuf[:0]
+		return res
+	}
+
+	res.LogFirstPkts = verbose && r.recvPkts < 6
+	r.recvPkts++
+	res.VP8S = r.vp8Pkt.S
+	res.VP8PID = r.vp8Pkt.PID
+	res.VP8N = r.vp8Pkt.N
+	res.VP8X = vpX(r.vp8Pkt)
+
+	if r.vp8Pkt.S == 1 {
+		r.frameBuf = r.frameBuf[:0]
+		r.frameValid = true
+	}
+	if !r.frameValid {
+		return res
+	}
+	r.frameBuf = append(r.frameBuf, vp8Payload...)
+	if !pkt.Marker {
+		return res
+	}
+	r.recvCount++
+	res.LogFrame = (common.Debug || verbose) && (r.recvCount <= 3 || r.recvCount%200 == 0)
+
+	res.Frame = make([]byte, len(r.frameBuf))
+	copy(res.Frame, r.frameBuf)
+
+	r.frameBuf = r.frameBuf[:0]
+	r.frameValid = false
+	return res
+}
+
+func readVP8Track(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string, verbose bool, onStats func(RecvStats)) {
+	r := &vp8FrameReassembler{}
 	buf := make([]byte, common.RTPBufSize)
 	for {
 		n, _, err := track.Read(buf)
@@ -221,59 +335,38 @@ func readVP8Track(track *webrtc.TrackRemote, handler func([]byte), logFn func(st
 		if len(pkt.Payload) == 0 {
 			continue
 		}
-		if haveLastSeq {
-			if pkt.SequenceNumber == lastSeq {
-				continue
-			}
-			if pkt.SequenceNumber != lastSeq+1 {
-				frameValid = false
-				frameBuf = frameBuf[:0]
-			}
-		}
-		lastSeq = pkt.SequenceNumber
-		haveLastSeq = true
 
-		vp8Payload, err := vp8Pkt.Unmarshal(pkt.Payload)
-		if err != nil {
-			if verbose {
-				badCount++
-				if badCount <= 3 {
-					logFn("%s: rtp pt=%d seq=%d marker=%v payload=%d bytes: not a VP8 packet: %v", prefix, pkt.PayloadType, pkt.SequenceNumber, pkt.Marker, len(pkt.Payload), err)
-				}
-			}
-			frameValid = false
-			frameBuf = frameBuf[:0]
+		res := r.feed(pkt, verbose)
+		if res.IsDuplicate {
 			continue
 		}
-		if verbose && recvPkts < 6 {
+
+		if onStats != nil {
+			onStats(r.stats)
+		}
+
+		if res.UnmarshalErr != nil {
+			if verbose && r.badCount <= 3 {
+				logFn("%s: rtp pt=%d seq=%d marker=%v payload=%d bytes: not a VP8 packet: %v", prefix, pkt.PayloadType, pkt.SequenceNumber, pkt.Marker, len(pkt.Payload), res.UnmarshalErr)
+			}
+			continue
+		}
+
+		if res.LogFirstPkts {
 			head := pkt.Payload
 			if len(head) > 16 {
 				head = head[:16]
 			}
-			logFn("%s: rtp pt=%d seq=%d ts=%d marker=%v S=%d X=%d N=%d PID=%d payload=%d bytes head=%x", prefix, pkt.PayloadType, pkt.SequenceNumber, pkt.Timestamp, pkt.Marker, vp8Pkt.S, vpX(vp8Pkt), vp8Pkt.N, vp8Pkt.PID, len(pkt.Payload), head)
+			logFn("%s: rtp pt=%d seq=%d ts=%d marker=%v S=%d X=%d N=%d PID=%d payload=%d bytes head=%x", prefix, pkt.PayloadType, pkt.SequenceNumber, pkt.Timestamp, pkt.Marker, res.VP8S, res.VP8X, res.VP8N, res.VP8PID, len(pkt.Payload), head)
 		}
-		recvPkts++
-		if vp8Pkt.S == 1 {
-			frameBuf = frameBuf[:0]
-			frameValid = true
+
+		if res.Frame != nil {
+			if res.LogFrame {
+				logFn("%s: recv vp8 frame #%d %d bytes", prefix, r.recvCount, len(res.Frame))
+			}
+			if handler != nil {
+				handler(res.Frame)
+			}
 		}
-		if !frameValid {
-			continue
-		}
-		frameBuf = append(frameBuf, vp8Payload...)
-		if !pkt.Marker {
-			continue
-		}
-		recvCount++
-		if (common.Debug || verbose) && (recvCount <= 3 || recvCount%200 == 0) {
-			logFn("%s: recv vp8 frame #%d %d bytes", prefix, recvCount, len(frameBuf))
-		}
-		if handler != nil {
-			frame := make([]byte, len(frameBuf))
-			copy(frame, frameBuf)
-			handler(frame)
-		}
-		frameBuf = frameBuf[:0]
-		frameValid = false
 	}
 }

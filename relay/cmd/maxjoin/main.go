@@ -101,19 +101,20 @@ func newControlClient(tf tokenFile) *maxproto.Client {
 
 // runOpts carries the -mode run / callinfo settings.
 type runOpts struct {
-	role, joinLink, conv      string
-	create                    bool
-	calleePhone, tunnelSecret string
-	secs                      int
-	icePolicy, mediaMode      string
-	calleeUID                 int64
-	transcriptPath, who       string
-	vp8FPS, vp8Batch          int
-	sfuWidth, sfuHeight       int
-	bench                     bool
-	benchSender               bool
+	role, joinLink, conv       string
+	create                     bool
+	calleePhone, tunnelSecret  string
+	secs                       int
+	icePolicy, mediaMode       string
+	calleeUID                  int64
+	transcriptPath, who        string
+	vp8FPS, vp8Batch           int
+	sfuWidth, sfuHeight        int
+	bench                      bool
+	benchSender                bool
 	benchSize, benchIntervalMS int
-	benchCSVPath              string
+	benchRateCtl               bool
+	benchCSVPath               string
 }
 
 func main() {
@@ -141,6 +142,7 @@ func main() {
 	benchSender := flag.Bool("bench-sender", true, "run/bench: enable benchmark sender loop (set false for recv-only)")
 	benchSize := flag.Int("bench-size", 800, "run/bench: payload bytes per frame (default 800)")
 	benchIntervalMS := flag.Int("bench-interval-ms", 50, "run/bench: interval between sends in ms (default 50)")
+	benchRateCtl := flag.Bool("bench-ratectl", true, "run/bench: drive the tunnel through the rate controller, so idle tiers and the AIMD frame size are exercised and reported (set false to measure the raw tunnel)")
 	benchCSV := flag.String("bench-csv", "", "run/bench: write one CSV line per second to this path (t,sentFrames,sentBytes,keepalives,recvFrames,recvBytes,gaps,lostPkts,rttMs,maxFrameBytes,state)")
 	flag.Parse()
 
@@ -167,6 +169,7 @@ func main() {
 		sfuWidth: *sfuWidth, sfuHeight: *sfuHeight,
 		transcriptPath: *transcriptPath, who: *who,
 		bench: *bench, benchSender: *benchSender, benchSize: *benchSize, benchIntervalMS: *benchIntervalMS,
+		benchRateCtl: *benchRateCtl,
 		benchCSVPath: *benchCSV,
 	}
 
@@ -341,14 +344,39 @@ func doRun(tf tokenFile, o runOpts) {
 	var firstRecv atomic.Int64
 	var lastRecv atomic.Int64
 
+	var rateCtl *tunnel.RateController
 	j.OnConnected = func(dt tunnel.DataTunnel) {
 		logFn("*** TUNNEL CONNECTED — starting data pump ***")
+
+		// Benchmark traffic normally goes straight at the raw tunnel, which
+		// means the rate controller -- the thing that decides the idle packet
+		// rate and the coalesced frame size -- is simply absent from every
+		// measurement taken here. That made the one claim worth proving, that
+		// matching the send rate to what is actually forwarded costs nothing
+		// in delivered bandwidth while saving most of the radio time,
+		// unmeasurable by the very harness meant to prove it.
+		//
+		// The controller takes a DataTunnel directly, so it can be driven
+		// without the SOCKS multiplexer that normally owns it. What it does
+		// NOT get this way is the peer's statistics, which arrive as control
+		// messages the multiplexer handles: AIMD therefore reacts only to
+		// local signals here, and the rtt column stays zero. Tiers, keepalive
+		// spacing and the chosen frame size -- everything the idle question
+		// turns on -- are real.
+		if o.bench && o.benchRateCtl {
+			rateCtl = tunnel.NewRateController(dt, tunnel.DefaultRateControllerConfig(), true, logFn)
+			rateCtl.Start()
+			logFn("bench: rate controller attached (tiers and AIMD active)")
+		}
 		dt.SetOnData(func(b []byte) {
 			now := time.Now().UnixNano()
 			firstRecv.CompareAndSwap(0, now)
 			lastRecv.Store(now)
 			cnt := recvCount.Add(1)
 			tot := recvBytes.Add(int64(len(b)))
+			if rateCtl != nil {
+				rateCtl.NoteRecv()
+			}
 
 			if o.bench && len(b) >= 4 {
 				seq := binary.BigEndian.Uint32(b[0:4])
@@ -399,10 +427,16 @@ func doRun(tf tokenFile, o runOpts) {
 						lp := lostPkts
 						benchMu.Unlock()
 
-						// TODO(step4/5): a later step wires these to the real rate controller
+						// rtt stays zero without the multiplexer that carries the
+						// peer's ping replies; see the note where the controller
+						// is attached.
 						rttMs := 0
 						maxFrameBytes := 0
-						state := "n/a"
+						state := "raw"
+						if rateCtl != nil {
+							maxFrameBytes = rateCtl.MaxFrameBytes()
+							state = rateCtl.State().String()
+						}
 
 						row := fmt.Sprintf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s\n",
 							tSec, sentFrames, sentBytes, keepalives, recvFrames, recvBytes, g, lp, rttMs, maxFrameBytes, state)
@@ -440,13 +474,27 @@ func doRun(tf tokenFile, o runOpts) {
 						binary.BigEndian.PutUint32(buf[0:4], uint32(seq))
 						seq++
 						dt.SendData(buf)
+						if rateCtl != nil {
+							rateCtl.NoteSent()
+						}
 						sendBytes.Add(int64(chunkSize))
 					}
 				}
+			} else if o.bench {
+				// Receive-only really must mean silent. This used to fall through
+				// to the chat loop below, which sends every two seconds -- just
+				// inside the three-second active-to-drain threshold, so the tunnel
+				// never went idle and an idle measurement could not be taken at
+				// all. The tier sat at active for a full minute of "idle" before
+				// this was noticed.
+				logFn("bench: receive-only, sending nothing")
 			} else {
 				for i := 0; i < 100; i++ {
 					msg := fmt.Sprintf("%s-msg-%d", role, i)
 					dt.SendData([]byte(msg))
+					if rateCtl != nil {
+						rateCtl.NoteSent()
+					}
 					sendBytes.Add(int64(len(msg)))
 					logFn(">>> SEND %d bytes: %q", len(msg), msg)
 					time.Sleep(2 * time.Second)

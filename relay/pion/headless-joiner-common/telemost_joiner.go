@@ -13,12 +13,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v4"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 	tmapi "github.com/alex-pirozhenko/whitelist-bypass/relay/telemost"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 )
 
 const (
@@ -109,12 +109,12 @@ func NewTelemostHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc
 
 func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	var params struct {
-		JoinLink    string `json:"joinLink"`
-		DisplayName string `json:"displayName"`
-		VP8FPS      int    `json:"vp8Fps"`
-		VP8Batch    int    `json:"vp8Batch"`
-		Reliable    bool   `json:"reliable"`
-		DualTrack   bool   `json:"dualTrack"`
+		JoinLink     string `json:"joinLink"`
+		DisplayName  string `json:"displayName"`
+		VP8FPS       int    `json:"vp8Fps"`
+		VP8Batch     int    `json:"vp8Batch"`
+		Reliable     bool   `json:"reliable"`
+		DualTrack    bool   `json:"dualTrack"`
 		TunnelSecret string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
 	}
 	if err := json.Unmarshal([]byte(jsonParams), &params); err != nil {

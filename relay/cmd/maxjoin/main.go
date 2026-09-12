@@ -143,7 +143,7 @@ func main() {
 	benchSize := flag.Int("bench-size", 800, "run/bench: payload bytes per frame (default 800)")
 	benchIntervalMS := flag.Int("bench-interval-ms", 50, "run/bench: interval between sends in ms (default 50)")
 	benchRateCtl := flag.Bool("bench-ratectl", true, "run/bench: drive the tunnel through the rate controller, so idle tiers and the AIMD frame size are exercised and reported (set false to measure the raw tunnel)")
-	benchCSV := flag.String("bench-csv", "", "run/bench: write one CSV line per second to this path (t,sentFrames,sentBytes,keepalives,recvFrames,recvBytes,gaps,lostPkts,rttMs,maxFrameBytes,state)")
+	benchCSV := flag.String("bench-csv", "", "run/bench: write one CSV line per second to this path (t,sentFrames,sentBytes,keepalives,recvFrames,recvBytes,gaps,lostPkts,rttMs,lossPct,maxFrameBytes,state)")
 	flag.Parse()
 
 	if *tokenPath == "" {
@@ -327,7 +327,7 @@ func doRun(tf tokenFile, o runOpts) {
 			log.Fatalf("open bench csv: %v", err)
 		}
 		defer csvFile.Close()
-		if _, err := csvFile.WriteString("t,sentFrames,sentBytes,keepalives,recvFrames,recvBytes,gaps,lostPkts,rttMs,maxFrameBytes,state\n"); err != nil {
+		if _, err := csvFile.WriteString("t,sentFrames,sentBytes,keepalives,recvFrames,recvBytes,gaps,lostPkts,rttMs,lossPct,maxFrameBytes,state\n"); err != nil {
 			log.Fatalf("write bench csv header: %v", err)
 		}
 	}
@@ -344,39 +344,22 @@ func doRun(tf tokenFile, o runOpts) {
 	var firstRecv atomic.Int64
 	var lastRecv atomic.Int64
 
-	var rateCtl *tunnel.RateController
+	// rb is non-nil exactly when -bench -bench-ratectl routes traffic
+	// through a real RelayBridge instead of straight at the DataTunnel (see
+	// below). Every ratectl reading in this function (MaxFrameBytes/State/
+	// LastStats) goes through rb, never through a bare *tunnel.RateController
+	// -- that bare-RateController shortcut used to be exactly the bug this
+	// fixes (see the comment at its construction below).
+	var rb *tunnel.RelayBridge
 	j.OnConnected = func(dt tunnel.DataTunnel) {
 		logFn("*** TUNNEL CONNECTED — starting data pump ***")
 
-		// Benchmark traffic normally goes straight at the raw tunnel, which
-		// means the rate controller -- the thing that decides the idle packet
-		// rate and the coalesced frame size -- is simply absent from every
-		// measurement taken here. That made the one claim worth proving, that
-		// matching the send rate to what is actually forwarded costs nothing
-		// in delivered bandwidth while saving most of the radio time,
-		// unmeasurable by the very harness meant to prove it.
-		//
-		// The controller takes a DataTunnel directly, so it can be driven
-		// without the SOCKS multiplexer that normally owns it. What it does
-		// NOT get this way is the peer's statistics, which arrive as control
-		// messages the multiplexer handles: AIMD therefore reacts only to
-		// local signals here, and the rtt column stays zero. Tiers, keepalive
-		// spacing and the chosen frame size -- everything the idle question
-		// turns on -- are real.
-		if o.bench && o.benchRateCtl {
-			rateCtl = tunnel.NewRateController(dt, tunnel.DefaultRateControllerConfig(), true, logFn)
-			rateCtl.Start()
-			logFn("bench: rate controller attached (tiers and AIMD active)")
-		}
-		dt.SetOnData(func(b []byte) {
+		recvHandler := func(b []byte) {
 			now := time.Now().UnixNano()
 			firstRecv.CompareAndSwap(0, now)
 			lastRecv.Store(now)
 			cnt := recvCount.Add(1)
 			tot := recvBytes.Add(int64(len(b)))
-			if rateCtl != nil {
-				rateCtl.NoteRecv()
-			}
 
 			if o.bench && len(b) >= 4 {
 				seq := binary.BigEndian.Uint32(b[0:4])
@@ -402,7 +385,47 @@ func doRun(tf tokenFile, o runOpts) {
 					logFn("<<< RECV #%d: total %d bytes (%.2f KB/s, %.2f Mbps)", cnt, tot, rateKBps, rateMbps)
 				}
 			}
-		})
+		}
+
+		// Benchmark traffic used to go straight at the raw tunnel with a bare
+		// *tunnel.RateController constructed on the side (NewRateController(dt,
+		// ...)). That controller's own statsPingLoop DOES send real
+		// MsgPing/MsgStats frames onto dt -- but nothing on either end ever
+		// decodes them: dt.SetOnData was bound directly to bench payload
+		// parsing (checking b[0:4] as a raw sequence number), the exact
+		// dispatch RelayBridge.handleTunnelData normally provides. So the
+		// controller's own ping/stats frames arrived at the peer and were
+		// silently misread as bench payloads (or vice versa), AIMD never saw
+		// a peer's real loss/RTT, and the rtt column stayed zero forever.
+		// Routing bench traffic through an actual RelayBridge (via the
+		// reserved benchConnID path -- see SendBenchData/SetOnBenchData) is
+		// the fix: it's the same control-message dispatch a live SOCKS
+		// connection gets, just carrying synthetic payload instead of proxied
+		// bytes, so MsgStats/MsgPing genuinely round-trip and AIMD reacts to
+		// the peer's real measurements.
+		if o.bench && o.benchRateCtl {
+			rb = tunnel.NewRelayBridge(dt, "bench", 32*1024, logFn, true)
+			rb.SetOnBenchData(recvHandler)
+			logFn("bench: rate controller attached via RelayBridge (tiers, AIMD and real peer stats active)")
+		} else {
+			dt.SetOnData(recvHandler)
+		}
+
+		if rb != nil {
+			// Independent of -bench-csv: without this, a run with no CSV
+			// path gets zero visibility into what the controller is doing
+			// until the final summary line, which is exactly the number
+			// that does not matter for an idle/congestion question.
+			go func() {
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				for range ticker.C {
+					st := rb.LastStats()
+					logFn("bench: ratectl state=%s maxFrameBytes=%d lastLossPct=%.2f lastRTT=%s",
+						rb.State(), rb.MaxFrameBytes(), st.LossPercent, st.RTT)
+				}
+			}()
+		}
 
 		if csvFile != nil {
 			go func() {
@@ -427,19 +450,20 @@ func doRun(tf tokenFile, o runOpts) {
 						lp := lostPkts
 						benchMu.Unlock()
 
-						// rtt stays zero without the multiplexer that carries the
-						// peer's ping replies; see the note where the controller
-						// is attached.
 						rttMs := 0
+						lossPct := 0.0
 						maxFrameBytes := 0
 						state := "raw"
-						if rateCtl != nil {
-							maxFrameBytes = rateCtl.MaxFrameBytes()
-							state = rateCtl.State().String()
+						if rb != nil {
+							maxFrameBytes = rb.MaxFrameBytes()
+							state = rb.State().String()
+							st := rb.LastStats()
+							rttMs = int(st.RTT / time.Millisecond)
+							lossPct = st.LossPercent
 						}
 
-						row := fmt.Sprintf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s\n",
-							tSec, sentFrames, sentBytes, keepalives, recvFrames, recvBytes, g, lp, rttMs, maxFrameBytes, state)
+						row := fmt.Sprintf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%s\n",
+							tSec, sentFrames, sentBytes, keepalives, recvFrames, recvBytes, g, lp, rttMs, lossPct, maxFrameBytes, state)
 						if _, err := csvFile.WriteString(row); err != nil {
 							logFn("write csv row error: %v", err)
 						}
@@ -473,9 +497,10 @@ func doRun(tf tokenFile, o runOpts) {
 					case <-ticker.C:
 						binary.BigEndian.PutUint32(buf[0:4], uint32(seq))
 						seq++
-						dt.SendData(buf)
-						if rateCtl != nil {
-							rateCtl.NoteSent()
+						if rb != nil {
+							rb.SendBenchData(buf)
+						} else {
+							dt.SendData(buf)
 						}
 						sendBytes.Add(int64(chunkSize))
 					}
@@ -492,9 +517,6 @@ func doRun(tf tokenFile, o runOpts) {
 				for i := 0; i < 100; i++ {
 					msg := fmt.Sprintf("%s-msg-%d", role, i)
 					dt.SendData([]byte(msg))
-					if rateCtl != nil {
-						rateCtl.NoteSent()
-					}
 					sendBytes.Add(int64(len(msg)))
 					logFn(">>> SEND %d bytes: %q", len(msg), msg)
 					time.Sleep(2 * time.Second)
@@ -508,15 +530,15 @@ func doRun(tf tokenFile, o runOpts) {
 	time.Sleep(time.Duration(o.secs) * time.Second)
 	j.Close()
 	rc := recvCount.Load()
-	rb := recvBytes.Load()
+	rBytes := recvBytes.Load()
 	sb := sendBytes.Load()
-	log.Printf("[%s] DONE — sent %d bytes, received %d msgs (%d bytes)", role, sb, rc, rb)
+	log.Printf("[%s] DONE — sent %d bytes, received %d msgs (%d bytes)", role, sb, rc, rBytes)
 	if rc > 0 {
 		log.Printf("[%s] *** TRANSPORT WORKS — bytes flowed over the MAX call ***", role)
 		if o.bench && firstRecv.Load() > 0 && lastRecv.Load() > firstRecv.Load() {
 			dur := time.Duration(lastRecv.Load() - firstRecv.Load()).Seconds()
-			rateKBps := (float64(rb) / 1024.0) / dur
-			rateMbps := (float64(rb) * 8.0) / (dur * 1000.0 * 1000.0)
+			rateKBps := (float64(rBytes) / 1024.0) / dur
+			rateMbps := (float64(rBytes) * 8.0) / (dur * 1000.0 * 1000.0)
 			log.Printf("[%s] *** THROUGHPUT BENCHMARK: %.2f KB/s (%.2f Mbps) over %.2f seconds ***",
 				role, rateKBps, rateMbps, dur)
 		}

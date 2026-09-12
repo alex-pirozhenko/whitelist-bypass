@@ -36,6 +36,46 @@ type RateControllerConfig struct {
 	AIMDFloor   int // clamp floor, spec value 1200
 	AIMDStart   int // value MaxFrameBytes resets to every time TierActive is (re)entered, spec value 4800
 	AIMDCeiling int // clamp ceiling, spec value 64000 (configurable; this is just the default)
+
+	// StatsPingInterval, AIMDHold and AIMDIncreaseInterval are the AIMD loop's
+	// real-time knobs. Production wants ping/stats every second, a 2s hold
+	// after a decrease, and a 1s gate between increases (DefaultRateControllerConfig
+	// sets exactly that). Zero in any of these means "use that production
+	// default" so a RateControllerConfig built by hand (as every existing
+	// test does) keeps behaving exactly as before; a test that wants an
+	// end-to-end run without burning real wall-clock seconds sets these to
+	// small durations instead, the same way it already shrinks
+	// ActiveToDrain/DrainToIdle/CheckInterval.
+	StatsPingInterval    time.Duration
+	AIMDHold             time.Duration
+	AIMDIncreaseInterval time.Duration
+}
+
+const (
+	defaultStatsPingInterval    = time.Second
+	defaultAIMDHold             = 2 * time.Second
+	defaultAIMDIncreaseInterval = time.Second
+)
+
+func (c RateControllerConfig) statsPingInterval() time.Duration {
+	if c.StatsPingInterval > 0 {
+		return c.StatsPingInterval
+	}
+	return defaultStatsPingInterval
+}
+
+func (c RateControllerConfig) aimdHold() time.Duration {
+	if c.AIMDHold > 0 {
+		return c.AIMDHold
+	}
+	return defaultAIMDHold
+}
+
+func (c RateControllerConfig) aimdIncreaseInterval() time.Duration {
+	if c.AIMDIncreaseInterval > 0 {
+		return c.AIMDIncreaseInterval
+	}
+	return defaultAIMDIncreaseInterval
 }
 
 func DefaultRateControllerConfig() RateControllerConfig {
@@ -151,6 +191,7 @@ type RateController struct {
 	aimd                 aimdState
 	lastPeerPingNanos    int64
 	lastKeyframeReqCount uint64
+	lastStats            AIMDStats // most recent AIMDStats handlePeerStats computed, for introspection (LastStats)
 
 	ackMu sync.Mutex
 	acked chan struct{} // non-nil while a pushProfile()'d config is unacknowledged; see pushProfile/onPeerAck
@@ -179,8 +220,22 @@ func NewRateController(tun DataTunnel, cfg RateControllerConfig, policyMaster bo
 	return rc
 }
 
-func (rc *RateController) SetFeedbackSource(f *RTCPFeedback) { rc.feedback = f }
-func (rc *RateController) SetLossSource(src LossSource)      { rc.lossSource = src }
+// SetFeedbackSource and SetLossSource are safe to call at any time,
+// including concurrently with a running RateController (Start already
+// launched its goroutines): both feedback and lossSource are read from
+// applyAIMD/handlePeerStats/sendStats on those goroutines, so writes here
+// go through rc.mu like every other field a background goroutine reads.
+func (rc *RateController) SetFeedbackSource(f *RTCPFeedback) {
+	rc.mu.Lock()
+	rc.feedback = f
+	rc.mu.Unlock()
+}
+
+func (rc *RateController) SetLossSource(src LossSource) {
+	rc.mu.Lock()
+	rc.lossSource = src
+	rc.mu.Unlock()
+}
 
 // MaxFrameBytes reports the coalescing cap the controller is currently asking
 // the tunnel for -- the number AIMD moves. Exposed for harnesses that need to
@@ -197,6 +252,16 @@ func (rc *RateController) State() Tier {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 	return rc.tier
+}
+
+// LastStats reports the most recent AIMDStats handlePeerStats computed from a
+// real peer MsgStats/MsgPing exchange (zero value if none has arrived yet).
+// Exposed for harnesses/benchmarks that want to log the loss%/RTT the
+// controller is actually reacting to, alongside MaxFrameBytes.
+func (rc *RateController) LastStats() AIMDStats {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.lastStats
 }
 
 // SetPolicy applies a new Policy. Only meaningful on the policy-master side.
@@ -376,14 +441,14 @@ func (rc *RateController) applyAIMD(stats AIMDStats) {
 	if decrease {
 		next := int(float64(rc.aimd.maxFrameBytes) * 0.6)
 		rc.aimd.maxFrameBytes = clampInt(next, rc.cfg.AIMDFloor, ceiling)
-		rc.aimd.holdUntil = now.Add(2 * time.Second)
+		rc.aimd.holdUntil = now.Add(rc.cfg.aimdHold())
 		rc.applyMaxFrameBytesLocked()
 		return
 	}
 
 	rttOK := minRTT == 0 || stats.RTT == 0 || stats.RTT < (minRTT*3)/2
 	increase := stats.LossPercent < 1.0 && rttOK
-	if increase && now.Sub(rc.aimd.lastIncreaseAt) >= time.Second {
+	if increase && now.Sub(rc.aimd.lastIncreaseAt) >= rc.cfg.aimdIncreaseInterval() {
 		next := clampInt(rc.aimd.maxFrameBytes+aimdPacketBytes, rc.cfg.AIMDFloor, ceiling)
 		rc.aimd.maxFrameBytes = next
 		rc.aimd.lastIncreaseAt = now
@@ -450,7 +515,7 @@ func (rc *RateController) onPeerConfig(p Profile) {
 }
 
 func (rc *RateController) statsPingLoop() {
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(rc.cfg.statsPingInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -482,13 +547,15 @@ func (rc *RateController) handlePeerPing(payload []byte) {
 }
 
 func (rc *RateController) sendStats() {
-	var recvPackets, gaps, lostPackets uint64
-	if rc.lossSource != nil {
-		recvPackets, gaps, lostPackets = rc.lossSource.RecvLossStats()
-	}
 	rc.mu.Lock()
+	lossSource := rc.lossSource
 	echo := rc.lastPeerPingNanos
 	rc.mu.Unlock()
+
+	var recvPackets, gaps, lostPackets uint64
+	if lossSource != nil {
+		recvPackets, gaps, lostPackets = lossSource.RecvLossStats()
+	}
 	buf := make([]byte, 32)
 	binary.BigEndian.PutUint64(buf[0:8], recvPackets)
 	binary.BigEndian.PutUint64(buf[8:16], gaps)
@@ -518,9 +585,12 @@ func (rc *RateController) handlePeerStats(payload []byte) {
 			rtt = 0
 		}
 	}
+	rc.mu.Lock()
+	feedback := rc.feedback
+	rc.mu.Unlock()
 	var kfReqs int
-	if rc.feedback != nil {
-		cur := rc.feedback.KeyframeRequests()
+	if feedback != nil {
+		cur := feedback.KeyframeRequests()
 		rc.mu.Lock()
 		prev := rc.lastKeyframeReqCount
 		rc.lastKeyframeReqCount = cur
@@ -529,7 +599,11 @@ func (rc *RateController) handlePeerStats(payload []byte) {
 			kfReqs = int(cur - prev)
 		}
 	}
-	rc.applyAIMD(AIMDStats{LossPercent: lossPct, RTT: rtt, KeyframeReqs: kfReqs})
+	stats := AIMDStats{LossPercent: lossPct, RTT: rtt, KeyframeReqs: kfReqs}
+	rc.mu.Lock()
+	rc.lastStats = stats
+	rc.mu.Unlock()
+	rc.applyAIMD(stats)
 	_ = gaps
 }
 

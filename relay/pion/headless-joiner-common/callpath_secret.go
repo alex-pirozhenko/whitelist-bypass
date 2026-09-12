@@ -2,6 +2,7 @@ package joiner
 
 import (
 	"encoding/base64"
+	"fmt"
 
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 )
@@ -18,13 +19,23 @@ import (
 // enrollment and never sent over the media platform. When it is absent we fall
 // back to upstream behaviour so unmodified callers keep working.
 //
+// If the required parameter is true, callpathTunnelSecret will fail instead of
+// falling back to the token-derived secret when no TunnelSecret is provided.
+//
 // Both ends MUST agree: if one side uses the device secret and the other the
 // join token, the tunnel silently carries undecryptable frames.
-func callpathTunnelSecret(tunnelSecretB64, joinRef string) []byte {
+// A bad or short explicit secret (invalid base64 or fewer than 16 bytes) is
+// always rejected with an error instead of silently falling back.
+func callpathTunnelSecret(tunnelSecretB64, joinRef string, required bool) ([]byte, error) {
 	if tunnelSecretB64 != "" {
-		if b, err := base64.StdEncoding.DecodeString(tunnelSecretB64); err == nil && len(b) >= 16 {
-			return b
+		b, err := base64.StdEncoding.DecodeString(tunnelSecretB64)
+		if err != nil || len(b) < 16 {
+			return nil, fmt.Errorf("callpath: tunnelSecret is invalid or shorter than 16 bytes")
 		}
+		return b, nil
 	}
-	return tunnel.DeriveSecretFromJoinLink(joinRef)
+	if required {
+		return nil, fmt.Errorf("callpath: tunnelSecret is required (RequireTunnelSecret=true) but none was provided")
+	}
+	return tunnel.DeriveSecretFromJoinLink(joinRef), nil
 }

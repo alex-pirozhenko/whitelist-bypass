@@ -142,15 +142,20 @@ type VP8DataTunnel struct {
 	stopOnce sync.Once
 	running  atomic.Bool
 
-	cfgMu           sync.Mutex
-	fps             int
-	batch           int
-	keepaliveMin    time.Duration
-	keepaliveMax    time.Duration
-	keepalivePadMax int
+	cfgMu                sync.Mutex
+	fps                  int
+	batch                int
+	keepaliveMin         time.Duration
+	keepaliveMax         time.Duration
+	keepalivePadMax      int
+	profileIdleKeepalive time.Duration // 0 = use the jittered keepaliveMin/Max range (today's default)
+	maxFrameBytes        int           // cfgMu-protected; 0 = coalescing disabled (today's behavior)
+	tier                 Tier          // cfgMu-protected; informational only, see Profile.Tier
 
 	sentFrames      atomic.Uint64
+	sentBytes       atomic.Uint64
 	recvFrames      atomic.Uint64
+	recvBytes       atomic.Uint64
 	keepaliveFrames atomic.Uint64
 
 	OnData        func([]byte)
@@ -158,6 +163,30 @@ type VP8DataTunnel struct {
 	OnPeerRestart func()
 
 	WriteFrame func([]byte) error
+
+	// overflow holds one send-queue item that was popped while assembling a
+	// coalesced frame but didn't fit under MaxFrameBytes. It is drained before
+	// pulling anything newer from sendQueue so per-connection byte-stream order
+	// is preserved across ticks. Owned exclusively by the writerLoop goroutine.
+	overflow []byte
+}
+
+type Counters struct {
+	SentFrames uint64
+	SentBytes  uint64
+	Keepalives uint64
+	RecvFrames uint64
+	RecvBytes  uint64
+}
+
+func (t *VP8DataTunnel) Counters() Counters {
+	return Counters{
+		SentFrames: t.sentFrames.Load(),
+		SentBytes:  t.sentBytes.Load(),
+		Keepalives: t.keepaliveFrames.Load(),
+		RecvFrames: t.recvFrames.Load(),
+		RecvBytes:  t.recvBytes.Load(),
+	}
 }
 
 func (t *VP8DataTunnel) SetOnData(fn func([]byte))  { t.OnData = fn }
@@ -205,38 +234,88 @@ func NewVP8DataTunnelWithQueue(track *webrtc.TrackLocalStaticSample, obf *Tunnel
 func (t *VP8DataTunnel) nextKeepalive(sampleInterval time.Duration) (ticks, padLen int) {
 	t.cfgMu.Lock()
 	minPeriod, maxPeriod, padMax := t.keepaliveMin, t.keepaliveMax, t.keepalivePadMax
+	override := t.profileIdleKeepalive
 	t.cfgMu.Unlock()
-	ticks = int(common.DurationInRange(minPeriod, maxPeriod) / sampleInterval)
+	period := common.DurationInRange(minPeriod, maxPeriod)
+	if override > 0 {
+		period = override
+	}
+	ticks = int(period / sampleInterval)
 	if ticks < 1 {
 		ticks = 1
 	}
 	return ticks, common.IntInRange(0, padMax)
 }
 
+// SetProfile applies a Profile to this tunnel's writer: target fps/batch,
+// the coalescing cap, and the idle-keepalive override. It supersedes
+// Reconfigure (kept below as a thin shim over this for existing callers).
+// A zero Profile.FPS/Batch means "leave that field unchanged" — same rule
+// Reconfigure already has.
+func (t *VP8DataTunnel) SetProfile(p Profile) {
+	t.cfgMu.Lock()
+	changed := false
+	if p.FPS > 0 && t.fps != p.FPS {
+		t.fps = p.FPS
+		changed = true
+	}
+	if p.Batch > 0 && t.batch != p.Batch {
+		t.batch = p.Batch
+		changed = true
+	}
+	if t.maxFrameBytes != p.MaxFrameBytes {
+		t.maxFrameBytes = p.MaxFrameBytes
+		changed = true
+	}
+	if t.profileIdleKeepalive != p.IdleKeepalive {
+		t.profileIdleKeepalive = p.IdleKeepalive
+		changed = true
+	}
+	t.tier = p.Tier
+	newFPS, newBatch, newMaxFB := t.fps, t.batch, t.maxFrameBytes
+	t.cfgMu.Unlock()
+	if !changed {
+		return
+	}
+	t.logFn("vp8tunnel: SetProfile fps=%d batch=%d maxFrameBytes=%d idleKeepalive=%s tier=%s",
+		newFPS, newBatch, newMaxFB, p.IdleKeepalive, p.Tier)
+	select {
+	case t.cfgChan <- struct{}{}:
+	default:
+	}
+}
+
+// Reconfigure is the pre-Profile API, kept so existing callers (which only
+// know about fps/batch) keep compiling and behaving exactly as before: it
+// reads the current MaxFrameBytes/IdleKeepalive/Tier and re-submits them
+// unchanged alongside the new fps/batch, so calling Reconfigure never resets
+// coalescing or idle-keepalive tuning a caller set via SetProfile.
 func (t *VP8DataTunnel) Reconfigure(fps, batch int) {
 	if fps <= 0 && batch <= 0 {
 		return
 	}
 	t.cfgMu.Lock()
-	changed := false
-	if fps > 0 && t.fps != fps {
-		t.fps = fps
-		changed = true
+	p := Profile{
+		FPS:           fps,
+		Batch:         batch,
+		MaxFrameBytes: t.maxFrameBytes,
+		IdleKeepalive: t.profileIdleKeepalive,
+		Tier:          t.tier,
 	}
-	if batch > 0 && t.batch != batch {
-		t.batch = batch
-		changed = true
+	if fps <= 0 {
+		p.FPS = t.fps
 	}
-	newFPS, newBatch := t.fps, t.batch
+	if batch <= 0 {
+		p.Batch = t.batch
+	}
 	t.cfgMu.Unlock()
-	if !changed {
-		return
-	}
-	t.logFn("vp8tunnel: reconfigure fps=%d batch=%d", newFPS, newBatch)
-	select {
-	case t.cfgChan <- struct{}{}:
-	default:
-	}
+	t.SetProfile(p)
+}
+
+func (t *VP8DataTunnel) currentMaxFrameBytes() int {
+	t.cfgMu.Lock()
+	defer t.cfgMu.Unlock()
+	return t.maxFrameBytes
 }
 
 func (t *VP8DataTunnel) FPS() int {
@@ -342,6 +421,8 @@ func (t *VP8DataTunnel) writerLoop() {
 
 		ticker := time.NewTicker(sampleInterval)
 		reconfigure := false
+		keepaliveEvery, keepalivePad := t.nextKeepalive(sampleInterval)
+		idle := 0
 
 		emit := func(sample []byte, isKeyframe bool, isKeepalive bool) {
 			if sample == nil {
@@ -377,6 +458,7 @@ func (t *VP8DataTunnel) writerLoop() {
 				}
 			}
 			n := t.sentFrames.Add(1)
+			t.sentBytes.Add(uint64(len(sample)))
 			if isKeepalive {
 				t.keepaliveFrames.Add(1)
 			}
@@ -392,9 +474,9 @@ func (t *VP8DataTunnel) writerLoop() {
 			emit(s, isKf, false)
 		}
 
-		sendKeepalive := func() {
+		sendKeepalive := func(padLen int) {
 			isKf := true
-			s := t.obf.EncodeKeepalive(16)
+			s := t.obf.EncodeKeepalive(padLen)
 			emit(s, isKf, true)
 		}
 
@@ -406,12 +488,52 @@ func (t *VP8DataTunnel) writerLoop() {
 			case <-t.cfgChan:
 				reconfigure = true
 			case <-ticker.C:
-				select {
-				case data := <-t.sendQueue:
-					sendFrame(data)
-				default:
-					sendKeepalive()
+				drainOne := func() ([]byte, bool) {
+					if len(t.overflow) > 0 {
+						v := t.overflow
+						t.overflow = nil
+						return v, true
+					}
+					select {
+					case v := <-t.sendQueue:
+						return v, true
+					default:
+						return nil, false
+					}
 				}
+
+				first, ok := drainOne()
+				if !ok {
+					idle++
+					if idle < keepaliveEvery {
+						continue
+					}
+					idle = 0
+					sendKeepalive(keepalivePad)
+					keepaliveEvery, keepalivePad = t.nextKeepalive(sampleInterval)
+					continue
+				}
+				idle = 0
+
+				maxFB := t.currentMaxFrameBytes()
+				combined := first
+				if maxFB > 0 {
+					for len(combined) < maxFB {
+						next, ok := drainOne()
+						if !ok {
+							break
+						}
+						if len(combined)+len(next) > maxFB {
+							t.overflow = next
+							break
+						}
+						buf := make([]byte, 0, len(combined)+len(next))
+						buf = append(buf, combined...)
+						buf = append(buf, next...)
+						combined = buf
+					}
+				}
+				sendFrame(combined)
 			}
 		}
 		ticker.Stop()
@@ -436,6 +558,7 @@ func (t *VP8DataTunnel) HandleFrame(frame []byte) {
 		return
 	}
 	n := t.recvFrames.Add(1)
+	t.recvBytes.Add(uint64(len(res.Payload)))
 	if common.Debug && (n <= 5 || n%500 == 0) {
 		t.logFn("vp8tunnel: recv frame #%d size=%d", n, len(res.Payload))
 	}

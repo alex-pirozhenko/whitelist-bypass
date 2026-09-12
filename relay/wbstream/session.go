@@ -293,7 +293,7 @@ func (s *Session) startTunnel() {
 }
 
 func (s *Session) configPingPong(tun tunnel.DataTunnel, trackCount int) {
-	frame := tunnel.EncodeVP8Config(s.cfg.VP8FPS, s.cfg.VP8Batch, trackCount)
+	frame := tunnel.EncodeVP8Config(s.cfg.VP8FPS, s.cfg.VP8Batch, trackCount, 0, 0, 0)
 	tun.SendData(frame)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -305,7 +305,7 @@ func (s *Session) configPingPong(tun tunnel.DataTunnel, trackCount int) {
 			return
 		case <-ticker.C:
 			s.cfg.LogFn("[lk] resending vp8 config (no ack yet)")
-			tun.SendData(tunnel.EncodeVP8Config(s.cfg.VP8FPS, s.cfg.VP8Batch, trackCount))
+			tun.SendData(tunnel.EncodeVP8Config(s.cfg.VP8FPS, s.cfg.VP8Batch, trackCount, 0, 0, 0))
 		}
 	}
 }

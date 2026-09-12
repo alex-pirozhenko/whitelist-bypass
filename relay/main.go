@@ -56,7 +56,7 @@ func main() {
 	}
 
 	startJoinerBridge := func(tun tunnel.DataTunnel, readBuf int) {
-		rb := tunnel.NewRelayBridgeWithAuth(tun, "joiner", readBuf, log.Printf, *socksUser, *socksPass)
+		rb := tunnel.NewRelayBridgeWithAuth(tun, "joiner", readBuf, log.Printf, *socksUser, *socksPass, true)
 		rb.MarkReady()
 		go rb.ListenSOCKS(fmt.Sprintf("%s:%d", *socksHost, *socksPort))
 	}
@@ -66,7 +66,7 @@ func main() {
 	}
 
 	creatorCallback := func(tun tunnel.DataTunnel) {
-		rb := tunnel.NewRelayBridge(tun, "creator", common.VP8BufSize, log.Printf)
+		rb := tunnel.NewRelayBridge(tun, "creator", common.VP8BufSize, log.Printf, false)
 		rb.SetUpstreamSocks(*upstreamSocks, *upstreamUser, *upstreamPass)
 	}
 
@@ -84,7 +84,7 @@ func main() {
 			bridgeMu.Lock()
 			defer bridgeMu.Unlock()
 			if bridge == nil {
-				bridge = tunnel.NewRelayBridgeWithAuth(tun, "joiner", readBuf, log.Printf, *socksUser, *socksPass)
+				bridge = tunnel.NewRelayBridgeWithAuth(tun, "joiner", readBuf, log.Printf, *socksUser, *socksPass, true)
 				if onConfigAck != nil {
 					bridge.SetOnConfigAck(onConfigAck)
 				}

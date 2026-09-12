@@ -41,6 +41,11 @@ type DCTunnel struct {
 	sendBytes atomic.Uint64
 	recvMsgs  atomic.Uint64
 	sendMsgs  atomic.Uint64
+
+	profileMu       sync.Mutex
+	idleKeepalive   time.Duration // 0 = disabled, matches Reconfigure's existing no-op default
+	keepaliveOnce   sync.Once
+	lastSendAtNanos atomic.Int64
 }
 
 func NewDCTunnel(dc *webrtc.DataChannel, obf *TunnelObfuscator, readBuf int, logFn func(string, ...any)) *DCTunnel {
@@ -229,6 +234,7 @@ func (t *DCTunnel) SendData(data []byte) {
 	if len(data) == 0 {
 		return
 	}
+	t.lastSendAtNanos.Store(time.Now().UnixNano())
 	wire := data
 	if t.obf != nil {
 		wire = t.obf.EncryptPayload(data)
@@ -247,6 +253,67 @@ func (t *DCTunnel) SetOnData(fn func([]byte))  { t.onData = fn }
 func (t *DCTunnel) OnData() func([]byte)       { return t.onData }
 func (t *DCTunnel) SetOnClose(fn func())       { t.onClose = fn }
 func (t *DCTunnel) Reconfigure(fps, batch int) {}
+
+const dcKeepaliveCheckInterval = 100 * time.Millisecond
+
+// profileMu guards idleKeepalive; lastSendAt is updated on every SendData
+// and read/updated by the keepalive loop, hence atomic (cheaper than a
+// second mutex for a single int64).
+
+// SetProfile implements the idle-keepalive half of tunnel.Profile — DCTunnel
+// has no frame-rate/coalescing concept (data channels are message-oriented
+// and reliable already), so FPS/Batch/MaxFrameBytes are ignored here. On the
+// first non-zero IdleKeepalive this starts a background loop (once — it is
+// never stopped, matching this type's existing statsLoop, which also runs
+// for the tunnel's whole lifetime with no explicit shutdown).
+func (t *DCTunnel) SetProfile(p Profile) {
+	t.profileMu.Lock()
+	t.idleKeepalive = p.IdleKeepalive
+	t.profileMu.Unlock()
+	if p.IdleKeepalive > 0 {
+		t.keepaliveOnce.Do(func() { go t.keepaliveLoop() })
+	}
+}
+
+func (t *DCTunnel) keepaliveLoop() {
+	ticker := time.NewTicker(dcKeepaliveCheckInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		t.profileMu.Lock()
+		idle := t.idleKeepalive
+		t.profileMu.Unlock()
+		if idle <= 0 {
+			continue
+		}
+		last := t.lastSendAtNanos.Load()
+		if last != 0 && time.Since(time.Unix(0, last)) < idle {
+			continue
+		}
+		t.sendKeepaliveMarker()
+	}
+}
+
+// sendKeepaliveMarker sends a zero-length application payload. Encrypted
+// (if obf is set) it becomes a nonce+auth-tag-only ciphertext on the wire —
+// indistinguishable in size from a tiny real message, unlike VP8's dedicated
+// keepalive frame shape. The receiver's deliverMessage already no-ops on an
+// empty decrypted payload (`if len(data) == 0 { return }`), so this never
+// reaches onData on the far end.
+func (t *DCTunnel) sendKeepaliveMarker() {
+	wire := []byte{}
+	if t.obf != nil {
+		wire = t.obf.EncryptPayload(wire)
+		if wire == nil {
+			return
+		}
+	}
+	if t.chunked {
+		t.sendChunked(wire)
+	} else {
+		t.sendRaw(wire)
+	}
+	t.lastSendAtNanos.Store(time.Now().UnixNano())
+}
 
 func (t *DCTunnel) statsLoop() {
 	if !common.Debug {

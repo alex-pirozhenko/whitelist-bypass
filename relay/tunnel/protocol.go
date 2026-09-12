@@ -12,6 +12,8 @@ const (
 	MsgUDPReply   byte = 0x07
 	MsgConfig     byte = 0x08
 	MsgConfigAck  byte = 0x09
+	MsgStats      byte = 0x0A
+	MsgPing       byte = 0x0B
 )
 
 const ControlConnID uint32 = 0
@@ -23,7 +25,14 @@ type DataTunnel interface {
 	Reconfigure(fps, batch int)
 }
 
-func EncodeVP8Config(fps, batch, trackCount int) []byte {
+// EncodeVP8Config builds a MsgConfig payload. maxFrameBytes and
+// idleKeepaliveMs are optional trailing fields (a later step's rate
+// controller uses them); pass 0 for both if you only need
+// fps/batch/trackCount, exactly like every call site in this codebase does
+// today. flags is reserved for future per-message bits (also unused by any
+// caller yet) — always encoded as a single trailing byte so a decoder that
+// doesn't know about it yet can still safely ignore the payload tail.
+func EncodeVP8Config(fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs int, flags uint8) []byte {
 	if fps < 1 {
 		fps = 1
 	}
@@ -33,25 +42,33 @@ func EncodeVP8Config(fps, batch, trackCount int) []byte {
 	if trackCount < 1 {
 		trackCount = 1
 	}
-	if fps > 0xFFFF {
-		fps = 0xFFFF
+	clamp16 := func(v int) uint16 {
+		if v < 0 {
+			return 0
+		}
+		if v > 0xFFFF {
+			return 0xFFFF
+		}
+		return uint16(v)
 	}
-	if batch > 0xFFFF {
-		batch = 0xFFFF
-	}
-	if trackCount > 0xFFFF {
-		trackCount = 0xFFFF
-	}
-	var payload [6]byte
-	binary.BigEndian.PutUint16(payload[0:2], uint16(fps))
-	binary.BigEndian.PutUint16(payload[2:4], uint16(batch))
-	binary.BigEndian.PutUint16(payload[4:6], uint16(trackCount))
+	var payload [11]byte
+	binary.BigEndian.PutUint16(payload[0:2], clamp16(fps))
+	binary.BigEndian.PutUint16(payload[2:4], clamp16(batch))
+	binary.BigEndian.PutUint16(payload[4:6], clamp16(trackCount))
+	binary.BigEndian.PutUint16(payload[6:8], clamp16(maxFrameBytes))
+	binary.BigEndian.PutUint16(payload[8:10], clamp16(idleKeepaliveMs))
+	payload[10] = flags
 	return EncodeFrame(ControlConnID, MsgConfig, payload[:])
 }
 
-func DecodeVP8Config(payload []byte) (fps, batch, trackCount int, ok bool) {
+// DecodeVP8Config is the inverse. A short payload (from an OLDER peer that
+// doesn't know about the trailing fields, or a caller that never set them)
+// is tolerated exactly like today: fields past what's present default to 0
+// (trackCount defaults to 1, matching existing behavior — everything added
+// in this step defaults to 0, meaning "not set / use tunnel default").
+func DecodeVP8Config(payload []byte) (fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs int, flags uint8, ok bool) {
 	if len(payload) < 4 {
-		return 0, 0, 0, false
+		return 0, 0, 0, 0, 0, 0, false
 	}
 	fps = int(binary.BigEndian.Uint16(payload[0:2]))
 	batch = int(binary.BigEndian.Uint16(payload[2:4]))
@@ -59,7 +76,16 @@ func DecodeVP8Config(payload []byte) (fps, batch, trackCount int, ok bool) {
 	if len(payload) >= 6 {
 		trackCount = int(binary.BigEndian.Uint16(payload[4:6]))
 	}
-	return fps, batch, trackCount, true
+	if len(payload) >= 8 {
+		maxFrameBytes = int(binary.BigEndian.Uint16(payload[6:8]))
+	}
+	if len(payload) >= 10 {
+		idleKeepaliveMs = int(binary.BigEndian.Uint16(payload[8:10]))
+	}
+	if len(payload) >= 11 {
+		flags = payload[10]
+	}
+	return fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs, flags, true
 }
 
 func EncodeFrame(connID uint32, msgType byte, payload []byte) []byte {

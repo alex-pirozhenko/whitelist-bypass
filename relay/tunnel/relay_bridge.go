@@ -87,9 +87,20 @@ type RelayBridge struct {
 	onConfigAckMu sync.Mutex
 	onConfigAck   func()
 
+	onBenchDataMu sync.Mutex
+	onBenchData   func([]byte)
+
 	policyMaster bool
 	rateCtl      *RateController
+	rateCfg      RateControllerConfig
 }
+
+// benchConnID is a reserved connection id for raw benchmark traffic pushed
+// via SendBenchData/SetOnBenchData (see cmd/maxjoin's -bench-ratectl path).
+// It is far outside the range nextID (a small monotonically increasing
+// counter starting at 1) will ever reach, so it never collides with a real
+// SOCKS/UDP connection id.
+const benchConnID uint32 = 0xFFFFFFFE
 
 func (rb *RelayBridge) SetOnPeerConfig(fn func(fps, batch, trackCount int)) {
 	rb.onPeerConfigMu.Lock()
@@ -111,6 +122,18 @@ func NewRelayBridgeWithAuth(tunnel DataTunnel, mode string, readBuf int, logFn f
 }
 
 func NewRelayBridge(tunnel DataTunnel, mode string, readBuf int, logFn func(string, ...any), policyMaster bool) *RelayBridge {
+	return NewRelayBridgeWithConfig(tunnel, mode, readBuf, logFn, policyMaster, DefaultRateControllerConfig())
+}
+
+// NewRelayBridgeWithConfig is NewRelayBridge with an explicit
+// RateControllerConfig instead of always defaulting to
+// DefaultRateControllerConfig(). Production code has no reason to reach for
+// this (NewRelayBridge is exactly right); it exists so tests -- and only
+// tests -- can shrink the AIMD/stats-ping real-time knobs (StatsPingInterval,
+// AIMDHold, AIMDIncreaseInterval, CheckInterval, ...) far enough that an
+// end-to-end RelayBridge<->RelayBridge run doesn't need to sleep for whole
+// seconds per AIMD window.
+func NewRelayBridgeWithConfig(tunnel DataTunnel, mode string, readBuf int, logFn func(string, ...any), policyMaster bool, cfg RateControllerConfig) *RelayBridge {
 	rb := &RelayBridge{
 		tunnel:       tunnel,
 		logFn:        logFn,
@@ -118,10 +141,11 @@ func NewRelayBridge(tunnel DataTunnel, mode string, readBuf int, logFn func(stri
 		readBuf:      readBuf,
 		ready:        make(chan struct{}),
 		policyMaster: policyMaster,
+		rateCfg:      cfg,
 	}
 	tunnel.SetOnData(rb.handleTunnelData)
 	tunnel.SetOnClose(rb.handleTunnelClose)
-	rb.rateCtl = NewRateController(tunnel, DefaultRateControllerConfig(), policyMaster, logFn)
+	rb.rateCtl = NewRateController(tunnel, cfg, policyMaster, logFn)
 	rb.rateCtl.Start()
 	return rb
 }
@@ -138,7 +162,7 @@ func (rb *RelayBridge) SwapTunnel(newTunnel DataTunnel) {
 	rb.tunnelMu.Lock()
 	rb.tunnel = newTunnel
 	oldCtl := rb.rateCtl
-	newCtl := NewRateController(newTunnel, DefaultRateControllerConfig(), rb.policyMaster, rb.logFn)
+	newCtl := NewRateController(newTunnel, rb.rateCfg, rb.policyMaster, rb.logFn)
 	rb.rateCtl = newCtl
 	rb.tunnelMu.Unlock()
 	if oldCtl != nil {
@@ -311,6 +335,15 @@ func (rb *RelayBridge) handleTunnelData(data []byte) {
 		if ctl := rb.currentRateCtl(); ctl != nil {
 			ctl.NoteRecv()
 		}
+		if connID == benchConnID {
+			rb.onBenchDataMu.Lock()
+			cb := rb.onBenchData
+			rb.onBenchDataMu.Unlock()
+			if cb != nil {
+				cb(payload)
+			}
+			return
+		}
 		switch rb.mode {
 		case "joiner":
 			rb.handleJoinerMessage(connID, msgType, payload)
@@ -336,6 +369,64 @@ func (rb *RelayBridge) SetPolicy(p Policy) {
 	if ctl := rb.currentRateCtl(); ctl != nil {
 		ctl.SetPolicy(p)
 	}
+}
+
+// SetLossSource forwards to the attached RateController (see LossSource's
+// doc comment: unset by default, meaning loss is unmeasured, not "zero").
+func (rb *RelayBridge) SetLossSource(src LossSource) {
+	if ctl := rb.currentRateCtl(); ctl != nil {
+		ctl.SetLossSource(src)
+	}
+}
+
+// SetFeedbackSource forwards to the attached RateController.
+func (rb *RelayBridge) SetFeedbackSource(f *RTCPFeedback) {
+	if ctl := rb.currentRateCtl(); ctl != nil {
+		ctl.SetFeedbackSource(f)
+	}
+}
+
+// MaxFrameBytes reports the attached RateController's current AIMD choice
+// (0 if none attached, which should not happen via the exported
+// constructors).
+func (rb *RelayBridge) MaxFrameBytes() int {
+	if ctl := rb.currentRateCtl(); ctl != nil {
+		return ctl.MaxFrameBytes()
+	}
+	return 0
+}
+
+// LastStats reports the attached RateController's most recent
+// peer-measured AIMDStats (loss%/RTT/keyframe-requests) -- see
+// RateController.LastStats. Zero value if none has arrived, or no
+// RateController is attached.
+func (rb *RelayBridge) LastStats() AIMDStats {
+	if ctl := rb.currentRateCtl(); ctl != nil {
+		return ctl.LastStats()
+	}
+	return AIMDStats{}
+}
+
+// SetOnBenchData registers the handler for raw benchmark payloads sent via
+// SendBenchData (see benchConnID). Used by cmd/maxjoin's -bench-ratectl path
+// to route bench traffic through the same control-message exchange
+// (MsgStats/MsgPing/MsgConfig) production traffic uses, instead of talking
+// straight to the DataTunnel and bypassing the rate controller's peer
+// feedback entirely.
+func (rb *RelayBridge) SetOnBenchData(fn func([]byte)) {
+	rb.onBenchDataMu.Lock()
+	rb.onBenchData = fn
+	rb.onBenchDataMu.Unlock()
+}
+
+// SendBenchData sends payload as ordinary (non-control) application data
+// over the bridge, exactly like a real SOCKS/UDP payload would: it goes
+// through send(), which calls RateController.NoteSent() and is measured by
+// the tunnel's Counters() like any other frame, and arrives at the peer's
+// SetOnBenchData handler via the peer's normal handleTunnelData dispatch
+// (which calls NoteRecv() first, same as a real MsgData frame).
+func (rb *RelayBridge) SendBenchData(payload []byte) {
+	rb.send(benchConnID, MsgData, payload)
 }
 
 func (rb *RelayBridge) handleJoinerMessage(connID uint32, msgType byte, payload []byte) {

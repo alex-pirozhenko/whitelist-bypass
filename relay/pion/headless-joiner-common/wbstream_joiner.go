@@ -69,7 +69,14 @@ func (j *WBStreamHeadlessJoiner) RunWithParams(jsonParams string) {
 	httpClient := j.makeHTTPClient()
 	j.logFn("wbstream-joiner: room=%s name=%s vp8Fps=%d vp8Batch=%d dualTrack=%v", params.RoomID, params.DisplayName, params.VP8FPS, params.VP8Batch, params.DualTrack)
 
-	obf, err := tunnel.NewTunnelObfuscator(callpathTunnelSecret(params.TunnelSecret, params.RoomID))
+	// no RequireTunnelSecret concept here yet; false preserves today's behavior
+	secret, err := callpathTunnelSecret(params.TunnelSecret, params.RoomID, false)
+	if err != nil {
+		j.logFn("wbstream-joiner: tunnel secret error: %v", err)
+		j.Status.EmitStatusError("tunnel secret: " + err.Error())
+		return
+	}
+	obf, err := tunnel.NewTunnelObfuscator(secret)
 	if err != nil {
 		j.logFn("wbstream-joiner: obfuscator init failed: %v", err)
 		j.Status.EmitStatusError("obfuscator init: " + err.Error())

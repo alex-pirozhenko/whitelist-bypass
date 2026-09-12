@@ -127,7 +127,14 @@ func (h *VKHeadlessJoiner) RunWithParams(jsonParams string) {
 		return
 	}
 	h.authParams = &params
-	obf, err := tunnel.NewTunnelObfuscator(callpathTunnelSecret(params.TunnelSecret, params.JoinLink))
+	// no RequireTunnelSecret concept here yet; false preserves today's behavior
+	secret, err := callpathTunnelSecret(params.TunnelSecret, params.JoinLink, false)
+	if err != nil {
+		h.logFn("vk-joiner: tunnel secret error: %v", err)
+		h.Status.EmitStatusError("tunnel secret: " + err.Error())
+		return
+	}
+	obf, err := tunnel.NewTunnelObfuscator(secret)
 	if err != nil {
 		h.logFn("vk-joiner: obfuscator init failed: %v", err)
 		h.Status.EmitStatusError("obfuscator init: " + err.Error())

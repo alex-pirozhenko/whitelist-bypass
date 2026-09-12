@@ -127,7 +127,14 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	if j.displayName == "" {
 		j.displayName = "Joiner"
 	}
-	obf, err := tunnel.NewTunnelObfuscator(callpathTunnelSecret(params.TunnelSecret, params.JoinLink))
+	// no RequireTunnelSecret concept here yet; false preserves today's behavior
+	secret, err := callpathTunnelSecret(params.TunnelSecret, params.JoinLink, false)
+	if err != nil {
+		j.logFn("telemost-joiner: tunnel secret error: %v", err)
+		j.Status.EmitStatusError("tunnel secret: " + err.Error())
+		return
+	}
+	obf, err := tunnel.NewTunnelObfuscator(secret)
 	if err != nil {
 		j.logFn("telemost-joiner: obfuscator init failed: %v", err)
 		j.Status.EmitStatusError("obfuscator init: " + err.Error())

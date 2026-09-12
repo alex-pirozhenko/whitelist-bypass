@@ -226,10 +226,16 @@ func (rb *RelayBridge) send(connID uint32, msgType byte, payload []byte) {
 func (rb *RelayBridge) handleTunnelData(data []byte) {
 	DecodeFrames(data, func(connID uint32, msgType byte, payload []byte) {
 		if connID == ControlConnID && msgType == MsgConfig {
-			fps, batch, trackCount, ok := DecodeVP8Config(payload)
+			fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs, flags, ok := DecodeVP8Config(payload)
 			if !ok {
 				return
 			}
+			// maxFrameBytes/idleKeepaliveMs/flags are consumed by the rate
+			// controller wired up in a later step of this feature; for now the
+			// creator side keeps applying only fps/batch, exactly as before.
+			_ = maxFrameBytes
+			_ = idleKeepaliveMs
+			_ = flags
 			if rb.mode == "creator" {
 				rb.logFn("relay: peer requested vp8 pacing fps=%d batch=%d trackCount=%d", fps, batch, trackCount)
 				rb.currentTunnel().Reconfigure(fps, batch)

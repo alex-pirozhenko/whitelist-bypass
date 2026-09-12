@@ -5,9 +5,9 @@ import (
 	"io"
 	"sync"
 
+	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 	"github.com/pion/datachannel"
 	"github.com/pion/webrtc/v4"
-	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 )
 
 var errScreenNotReady = errors.New("screen DC not ready")

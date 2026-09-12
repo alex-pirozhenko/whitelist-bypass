@@ -1572,16 +1572,26 @@ type diagLogger struct {
 	logFn func(string, ...interface{})
 }
 
-func (l *diagLogger) Trace(msg string)                          { l.logFn("[turn-diag-%s] TRACE: %s", l.scope, msg) }
-func (l *diagLogger) Tracef(format string, args ...interface{}) { l.logFn("[turn-diag-%s] TRACE: "+format, append([]interface{}{l.scope}, args...)...) }
-func (l *diagLogger) Debug(msg string)                          { l.logFn("[turn-diag-%s] DEBUG: %s", l.scope, msg) }
-func (l *diagLogger) Debugf(format string, args ...interface{}) { l.logFn("[turn-diag-%s] DEBUG: "+format, append([]interface{}{l.scope}, args...)...) }
-func (l *diagLogger) Info(msg string)                           { l.logFn("[turn-diag-%s] INFO: %s", l.scope, msg) }
-func (l *diagLogger) Infof(format string, args ...interface{})  { l.logFn("[turn-diag-%s] INFO: "+format, append([]interface{}{l.scope}, args...)...) }
-func (l *diagLogger) Warn(msg string)                           { l.logFn("[turn-diag-%s] WARN: %s", l.scope, msg) }
-func (l *diagLogger) Warnf(format string, args ...interface{})  { l.logFn("[turn-diag-%s] WARN: "+format, append([]interface{}{l.scope}, args...)...) }
-func (l *diagLogger) Error(msg string)                          { l.logFn("[turn-diag-%s] ERROR: %s", l.scope, msg) }
-func (l *diagLogger) Errorf(format string, args ...interface{}) { l.logFn("[turn-diag-%s] ERROR: "+format, append([]interface{}{l.scope}, args...)...) }
+func (l *diagLogger) Trace(msg string) { l.logFn("[turn-diag-%s] TRACE: %s", l.scope, msg) }
+func (l *diagLogger) Tracef(format string, args ...interface{}) {
+	l.logFn("[turn-diag-%s] TRACE: "+format, append([]interface{}{l.scope}, args...)...)
+}
+func (l *diagLogger) Debug(msg string) { l.logFn("[turn-diag-%s] DEBUG: %s", l.scope, msg) }
+func (l *diagLogger) Debugf(format string, args ...interface{}) {
+	l.logFn("[turn-diag-%s] DEBUG: "+format, append([]interface{}{l.scope}, args...)...)
+}
+func (l *diagLogger) Info(msg string) { l.logFn("[turn-diag-%s] INFO: %s", l.scope, msg) }
+func (l *diagLogger) Infof(format string, args ...interface{}) {
+	l.logFn("[turn-diag-%s] INFO: "+format, append([]interface{}{l.scope}, args...)...)
+}
+func (l *diagLogger) Warn(msg string) { l.logFn("[turn-diag-%s] WARN: %s", l.scope, msg) }
+func (l *diagLogger) Warnf(format string, args ...interface{}) {
+	l.logFn("[turn-diag-%s] WARN: "+format, append([]interface{}{l.scope}, args...)...)
+}
+func (l *diagLogger) Error(msg string) { l.logFn("[turn-diag-%s] ERROR: %s", l.scope, msg) }
+func (l *diagLogger) Errorf(format string, args ...interface{}) {
+	l.logFn("[turn-diag-%s] ERROR: "+format, append([]interface{}{l.scope}, args...)...)
+}
 
 func (h *MaxHeadlessJoiner) iceServers() []webrtc.ICEServer {
 	var iceServers []webrtc.ICEServer
@@ -2729,7 +2739,31 @@ func (w *sfuTunnelWrapper) onData(data []byte) {
 }
 
 // HintBandwidth forwards to the owning joiner — see MaxHeadlessJoiner.HintBandwidth.
+// SetProfile and Counters are forwarded explicitly because this wrapper embeds
+// the DataTunnel INTERFACE, and Go promotes only the methods that interface
+// declares. Everything the rate controller needs -- applying a profile, reading
+// counters -- lives outside it, so without these the controller silently fails
+// its type assertions and does nothing at all.
+//
+// It failed exactly that way: a live SFU run on 2026-09-11 reported zero frames
+// and zero keepalives for a minute and never left the active tier, because the
+// controller could not see through this wrapper. SFU mode is the production
+// path, so the controller was inert precisely where it matters. Anything added
+// to RateControllable or the tunnel's optional interfaces must be forwarded
+// here too.
+func (w *sfuTunnelWrapper) SetProfile(p tunnel.Profile) {
+	if rc, ok := w.DataTunnel.(tunnel.RateControllable); ok {
+		rc.SetProfile(p)
+	}
+}
+
+func (w *sfuTunnelWrapper) Counters() tunnel.Counters {
+	if rc, ok := w.DataTunnel.(tunnel.RateControllable); ok {
+		return rc.Counters()
+	}
+	return tunnel.Counters{}
+}
+
 func (w *sfuTunnelWrapper) HintBandwidth(ctx context.Context, tier tunnel.Tier) error {
 	return w.h.HintBandwidth(ctx, tier)
 }
-

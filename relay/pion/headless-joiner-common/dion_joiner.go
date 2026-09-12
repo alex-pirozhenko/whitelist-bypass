@@ -10,10 +10,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pion/webrtc/v4"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/dion"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
+	"github.com/pion/webrtc/v4"
 )
 
 type DionHeadlessJoiner struct {

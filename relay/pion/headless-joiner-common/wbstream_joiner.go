@@ -10,10 +10,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pion/webrtc/v4"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/wbstream"
+	"github.com/pion/webrtc/v4"
 )
 
 type WBStreamHeadlessJoiner struct {
@@ -42,13 +42,13 @@ func NewWBStreamHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc
 
 func (j *WBStreamHeadlessJoiner) RunWithParams(jsonParams string) {
 	var params struct {
-		RoomID      string `json:"roomId"`
-		DisplayName string `json:"displayName"`
-		TunnelMode  string `json:"tunnelMode"`
-		VP8FPS      int    `json:"vp8Fps"`
-		VP8Batch    int    `json:"vp8Batch"`
-		DualTrack   bool   `json:"dualTrack"`
-		Reliable    *bool  `json:"reliable"`
+		RoomID       string `json:"roomId"`
+		DisplayName  string `json:"displayName"`
+		TunnelMode   string `json:"tunnelMode"`
+		VP8FPS       int    `json:"vp8Fps"`
+		VP8Batch     int    `json:"vp8Batch"`
+		DualTrack    bool   `json:"dualTrack"`
+		Reliable     *bool  `json:"reliable"`
 		TunnelSecret string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
 	}
 	if err := json.Unmarshal([]byte(jsonParams), &params); err != nil {

@@ -358,4 +358,3 @@ func TestSanitizeCandidateAndSDP(t *testing.T) {
 		t.Errorf("sanitizedSDP still contains old ufrag:\n%s", sanitizedSDP)
 	}
 }
-

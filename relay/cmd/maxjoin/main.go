@@ -480,6 +480,14 @@ func doRun(tf tokenFile, o runOpts) {
 						sendBytes.Add(int64(chunkSize))
 					}
 				}
+			} else if o.bench {
+				// Receive-only really must mean silent. This used to fall through
+				// to the chat loop below, which sends every two seconds -- just
+				// inside the three-second active-to-drain threshold, so the tunnel
+				// never went idle and an idle measurement could not be taken at
+				// all. The tier sat at active for a full minute of "idle" before
+				// this was noticed.
+				logFn("bench: receive-only, sending nothing")
 			} else {
 				for i := 0; i < 100; i++ {
 					msg := fmt.Sprintf("%s-msg-%d", role, i)

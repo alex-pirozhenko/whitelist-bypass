@@ -20,8 +20,8 @@ func (f *fakeTunnel) SendData(data []byte) {
 	f.sent = append(f.sent, append([]byte(nil), data...))
 	f.mu.Unlock()
 }
-func (f *fakeTunnel) SetOnData(fn func([]byte)) { f.onData = fn }
-func (f *fakeTunnel) SetOnClose(fn func())      { f.onClose = fn }
+func (f *fakeTunnel) SetOnData(fn func([]byte))  { f.onData = fn }
+func (f *fakeTunnel) SetOnClose(fn func())       { f.onClose = fn }
 func (f *fakeTunnel) Reconfigure(fps, batch int) {}
 func (f *fakeTunnel) SetProfile(p Profile) {
 	f.mu.Lock()

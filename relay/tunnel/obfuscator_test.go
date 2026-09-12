@@ -82,15 +82,15 @@ func TestVP8BitstreamDecodesInFFmpeg(t *testing.T) {
 	// Build IVF container with 1 keyframe and 1 interframe
 	var ivf bytes.Buffer
 	// IVF header (32 bytes)
-	ivf.WriteString("DKIF")                                      // signature
-	ivf.Write([]byte{0x00, 0x00})                                // version 0
-	ivf.Write([]byte{0x20, 0x00})                                // header length 32
-	ivf.WriteString("VP80")                                      // codec FourCC
-	ivf.Write([]byte{0x40, 0x01, 0xf0, 0x00})                    // 320x240
-	ivf.Write([]byte{0x14, 0x00, 0x00, 0x00})                    // rate 20
-	ivf.Write([]byte{0x01, 0x00, 0x00, 0x00})                    // scale 1
-	ivf.Write([]byte{0x02, 0x00, 0x00, 0x00})                    // num frames: 2
-	ivf.Write([]byte{0x00, 0x00, 0x00, 0x00})                    // unused
+	ivf.WriteString("DKIF")                   // signature
+	ivf.Write([]byte{0x00, 0x00})             // version 0
+	ivf.Write([]byte{0x20, 0x00})             // header length 32
+	ivf.WriteString("VP80")                   // codec FourCC
+	ivf.Write([]byte{0x40, 0x01, 0xf0, 0x00}) // 320x240
+	ivf.Write([]byte{0x14, 0x00, 0x00, 0x00}) // rate 20
+	ivf.Write([]byte{0x01, 0x00, 0x00, 0x00}) // scale 1
+	ivf.Write([]byte{0x02, 0x00, 0x00, 0x00}) // num frames: 2
+	ivf.Write([]byte{0x00, 0x00, 0x00, 0x00}) // unused
 
 	// Frame 1: Keyframe
 	kfLen := uint32(len(kf))

@@ -182,6 +182,17 @@ func NewRateController(tun DataTunnel, cfg RateControllerConfig, policyMaster bo
 func (rc *RateController) SetFeedbackSource(f *RTCPFeedback) { rc.feedback = f }
 func (rc *RateController) SetLossSource(src LossSource)      { rc.lossSource = src }
 
+// MaxFrameBytes reports the coalescing cap the controller is currently asking
+// the tunnel for -- the number AIMD moves. Exposed for harnesses that need to
+// record what the controller actually chose rather than what it was configured
+// with; without it a benchmark can only report the default it started from,
+// which is exactly the number that does not matter.
+func (rc *RateController) MaxFrameBytes() int {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.aimd.maxFrameBytes
+}
+
 func (rc *RateController) State() Tier {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()

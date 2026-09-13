@@ -472,8 +472,15 @@ func (rc *RateController) pushProfile(p Profile) {
 	rc.ackMu.Unlock()
 
 	idleMs := int(p.IdleKeepalive / time.Millisecond)
-	payload := EncodeVP8Config(p.FPS, p.Batch, 1, p.MaxFrameBytes, idleMs, 0)
-	send := func() { rc.tun.SendData(EncodeFrame(ControlConnID, MsgConfig, payload)) }
+	// EncodeVP8Config returns a COMPLETE frame, not a payload -- do not wrap
+	// it again. Wrapping made the config message's payload an entire encoded
+	// frame, so the peer's DecodeVP8Config read the inner frame's HEADER as
+	// the config fields and every push, for every profile, decoded to the
+	// same constant: fps=0 batch=16 trackCount=0 maxFrameBytes=0
+	// idleKeepaliveMs=2048. Rate control has therefore never worked over the
+	// wire. See TestPushProfileFrameRoundTrip.
+	frame := EncodeVP8Config(p.FPS, p.Batch, 1, p.MaxFrameBytes, idleMs, 0)
+	send := func() { rc.tun.SendData(frame) }
 	send()
 	go func() {
 		ticker := time.NewTicker(configPushResendPeriod)

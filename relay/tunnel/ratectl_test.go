@@ -344,6 +344,11 @@ func TestPushProfileResendsUntilAcked(t *testing.T) {
 func TestPushProfileFrameRoundTrip(t *testing.T) {
 	tun := &fakeTunnel{}
 	rc := NewRateController(tun, testConfig(), true, nil)
+	// pushProfile spawns a resend goroutine that re-sends every
+	// configPushResendPeriod until acked; without this it outlives the test,
+	// and a resend landing inside the 3s window would also break the
+	// exactly-one-frame assertion below. Stop is safe without Start.
+	defer rc.Stop()
 
 	want := Profile{FPS: 37, Batch: 5, MaxFrameBytes: 4800, IdleKeepalive: 1500 * time.Millisecond}
 	rc.pushProfile(want)
@@ -401,6 +406,7 @@ func TestPushProfileDistinguishesProfiles(t *testing.T) {
 		t.Helper()
 		tun := &fakeTunnel{}
 		rc := NewRateController(tun, testConfig(), true, nil)
+		defer rc.Stop() // see TestPushProfileFrameRoundTrip: don't leak the resender
 		rc.pushProfile(p)
 		tun.mu.Lock()
 		sent := append([][]byte(nil), tun.sent...)

@@ -189,10 +189,41 @@ func (j *TelemostHeadlessJoiner) waitBeforeRetry(attempt int) bool {
 	return waitReconnectBackoff(attempt, j.logFn, "telemost-joiner", j.stopCh, j.isClosed)
 }
 
+// resetSessionState drops everything belonging to one SFU session so the
+// reconnect loop can build a fresh one.
+//
+// It must CLOSE what it drops, not merely nil it. This runs on every
+// StatusTunnelLost cycle, so a PeerConnection released here without Close()
+// is orphaned while still alive: its ICE agent and TURN client keep running,
+// and that TURN client keeps refreshing permissions forever. Once the
+// allocation behind it is gone the server answers 400 and the client retries,
+// producing the endless
+//
+//	turnc ERROR: Fail to refresh permissions: CreatePermission error response (error 400)
+//
+// reported as letmeout#90 -- one orphan per reconnect, accumulating for the
+// life of the process. In production that flood compressed `kubectl logs`
+// history to under two minutes, destroying the diagnostic record of the
+// component it was attached to.
+//
+// The sibling joiners already close theirs here (MaxHeadlessJoiner's calls
+// closePC, VKHeadlessJoiner's calls pc.Close), and this type's own Close()
+// does it too. Only the reconnect path was missing it.
 func (j *TelemostHeadlessJoiner) resetSessionState() {
 	j.wsMu.Lock()
+	ws := j.ws
 	j.ws = nil
 	j.wsMu.Unlock()
+	common.CloseWS(ws)
+	if j.vp8tunnel != nil {
+		j.vp8tunnel.Stop()
+	}
+	if j.subPC != nil {
+		j.subPC.Close()
+	}
+	if j.pubPC != nil {
+		j.pubPC.Close()
+	}
 	j.subPC = nil
 	j.subSeq = 0
 	j.subRemoteSet = false

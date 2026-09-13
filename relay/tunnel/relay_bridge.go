@@ -115,7 +115,22 @@ func (rb *RelayBridge) SetOnConfigAck(fn func()) {
 }
 
 func NewRelayBridgeWithAuth(tunnel DataTunnel, mode string, readBuf int, logFn func(string, ...any), socksUser, socksPass string, policyMaster bool) *RelayBridge {
-	rb := NewRelayBridge(tunnel, mode, readBuf, logFn, policyMaster)
+	return NewRelayBridgeWithAuthAndConfig(tunnel, mode, readBuf, logFn, socksUser, socksPass, policyMaster, DefaultRateControllerConfig())
+}
+
+// NewRelayBridgeWithAuthAndConfig is NewRelayBridgeWithAuth with an explicit
+// RateControllerConfig -- the auth-carrying counterpart of
+// NewRelayBridgeWithConfig, and the only way a SOCKS-authenticating caller
+// can supply its own ActiveProfile.
+//
+// It exists because a caller that needs BOTH credentials and a real
+// ActiveProfile previously had neither door open to it: WithAuth hard-coded
+// DefaultRateControllerConfig, and WithConfig cannot set the unexported
+// socksUser/socksPass. A tunnel negotiated at, say, 24fps/batch-30 would
+// then be clobbered to the 20/1 default on the first tier promotion, with no
+// supported way to prevent it.
+func NewRelayBridgeWithAuthAndConfig(tunnel DataTunnel, mode string, readBuf int, logFn func(string, ...any), socksUser, socksPass string, policyMaster bool, cfg RateControllerConfig) *RelayBridge {
+	rb := NewRelayBridgeWithConfig(tunnel, mode, readBuf, logFn, policyMaster, cfg)
 	rb.socksUser = socksUser
 	rb.socksPass = socksPass
 	return rb
@@ -127,9 +142,14 @@ func NewRelayBridge(tunnel DataTunnel, mode string, readBuf int, logFn func(stri
 
 // NewRelayBridgeWithConfig is NewRelayBridge with an explicit
 // RateControllerConfig instead of always defaulting to
-// DefaultRateControllerConfig(). Production code has no reason to reach for
-// this (NewRelayBridge is exactly right); it exists so tests -- and only
-// tests -- can shrink the AIMD/stats-ping real-time knobs (StatsPingInterval,
+// DefaultRateControllerConfig().
+//
+// Production code has two legitimate reasons to reach for it. The first is
+// ActiveProfile: its own doc says it is "FPS/Batch the caller wants at full
+// rate", and a caller whose tunnel was negotiated at something other than
+// the 20/1 default MUST supply it here or applyProfile will clobber the
+// tunnel to that default on the first TierActive edge. The second is the
+// original one -- tests can shrink the AIMD/stats-ping real-time knobs (StatsPingInterval,
 // AIMDHold, AIMDIncreaseInterval, CheckInterval, ...) far enough that an
 // end-to-end RelayBridge<->RelayBridge run doesn't need to sleep for whole
 // seconds per AIMD window.

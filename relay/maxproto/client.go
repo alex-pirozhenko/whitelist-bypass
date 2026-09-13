@@ -341,6 +341,39 @@ func (c *Client) Login(ctx context.Context) (map[string]any, error) {
 	return m, nil
 }
 
+// LoginWithPassword performs op19 LOGIN and, when the account carries a 2FA
+// password, answers the resulting password challenge with op115
+// (AUTH_LOGIN_CHECK_PASSWORD). When password is empty it behaves exactly like
+// Login, so callers can route every login through it and only the
+// password-bearing masters take the op115 leg.
+//
+// For a 2FA-protected account the server responds to op19 with a
+// passwordChallenge{trackId} in place of a completed login; op115 presents the
+// password against that trackId and yields the final LOGIN token. This is the
+// only path that logs a password-bearing master in without a fresh SMS — see
+// maxproto/password.go (op115) and letmeout #118. The returned map is
+// login-shaped ({"token": ...}) so callers can treat the result identically to
+// a passwordless Login response, including adopting a rotated token.
+func (c *Client) LoginWithPassword(ctx context.Context, password string) (map[string]any, error) {
+	resp, err := c.Login(ctx)
+	if err != nil {
+		return nil, err
+	}
+	trackID, present := parsePasswordChallenge(resp)
+	if !present {
+		// No 2FA password required (the common case) — login already complete.
+		return resp, nil
+	}
+	if password == "" {
+		return nil, errors.New("maxproto: login requires a 2FA password but none was provided")
+	}
+	token, err := c.CheckPassword(ctx, trackID, password)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"token": token}, nil
+}
+
 func (c *Client) Close() error {
 	c.mu.Lock()
 	conn := c.conn

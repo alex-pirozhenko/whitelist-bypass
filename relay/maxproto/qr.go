@@ -140,6 +140,19 @@ func DeriveWebSession(ctx context.Context, master *Client, resolve ResolveFunc) 
 // is alive, rotatedToken carries the (possibly refreshed) token from the Login
 // response so the caller can adopt it.
 func CheckAlive(ctx context.Context, token, deviceID string, resolve ResolveFunc) (alive bool, rotatedToken string, err error) {
+	return CheckAliveWithPassword(ctx, token, deviceID, "", resolve)
+}
+
+// CheckAliveWithPassword is CheckAlive that also presents a 2FA password (op115)
+// when the account requires one: op6 SessionInit -> op19 LOGIN -> op115. password
+// may be empty, in which case it is byte-for-byte identical to CheckAlive (op115
+// is only reached when the server raises a password challenge). The
+// alive/rotatedToken/err contract is exactly CheckAlive's; in particular a
+// wrong-password rejection surfaces as a server error (isTransportErr==false),
+// so it is reported as alive=false,err=nil — a definite "not logged in", never a
+// transport blip. When the login rotates the token (op115 always mints a fresh
+// LOGIN token), rotatedToken carries it so the caller can persist it.
+func CheckAliveWithPassword(ctx context.Context, token, deviceID, password string, resolve ResolveFunc) (alive bool, rotatedToken string, err error) {
 	c := New(token, deviceID)
 	if err := c.Connect(ctx, resolve); err != nil {
 		return false, "", fmt.Errorf("connect: %w", err)
@@ -148,12 +161,13 @@ func CheckAlive(ctx context.Context, token, deviceID string, resolve ResolveFunc
 	if _, err := c.SessionInit(ctx); err != nil {
 		return false, "", fmt.Errorf("session init: %w", err)
 	}
-	loginResp, err := c.Login(ctx)
+	loginResp, err := c.LoginWithPassword(ctx, password)
 	if err != nil {
 		// Distinguish a transport blip (indeterminate) from the server actively
-		// rejecting the token (dead). Connect+SessionInit already succeeded, so a
-		// clean server error here means the token is dead; a dropped connection or
-		// a context error is transport and must not be read as dead.
+		// rejecting the token/password (dead). Connect+SessionInit already
+		// succeeded, so a clean server error here (op19 OR op115) means the token
+		// is dead; a dropped connection or a context error is transport and must
+		// not be read as dead.
 		if isTransportErr(err) {
 			return false, "", err
 		}

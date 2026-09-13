@@ -327,3 +327,106 @@ func TestPushProfileResendsUntilAcked(t *testing.T) {
 		t.Errorf("expected acked channel to be closed after onPeerAck")
 	}
 }
+
+// TestPushProfileFrameRoundTrip is the regression guard for the double-framing
+// bug: pushProfile wrapped EncodeVP8Config's return in a SECOND EncodeFrame,
+// so the config message's payload was an entire encoded frame and the peer's
+// DecodeVP8Config read the INNER frame's header as the config fields.
+//
+// It asserts on what the peer decodes, not on bytes, because the bug was
+// invisible at the byte level -- both the broken and correct forms are
+// well-formed frames that decode without error. What distinguishes them is
+// that the broken one decodes to values nobody asked for.
+//
+// The pushed profile deliberately uses no value that could be confused with a
+// framing artifact (the old bug always yielded fps=0 batch=16 trackCount=0
+// maxFrameBytes=0 idleKeepaliveMs=2048, regardless of the profile).
+func TestPushProfileFrameRoundTrip(t *testing.T) {
+	tun := &fakeTunnel{}
+	rc := NewRateController(tun, testConfig(), true, nil)
+
+	want := Profile{FPS: 37, Batch: 5, MaxFrameBytes: 4800, IdleKeepalive: 1500 * time.Millisecond}
+	rc.pushProfile(want)
+
+	tun.mu.Lock()
+	sent := append([][]byte(nil), tun.sent...)
+	tun.mu.Unlock()
+	if len(sent) != 1 {
+		t.Fatalf("pushProfile sent %d frames, want 1", len(sent))
+	}
+
+	// Decode exactly the way a peer does: frame decoder first, then the
+	// config decoder on that frame's payload.
+	var (
+		got     Profile
+		decoded bool
+	)
+	DecodeFrames(sent[0], func(connID uint32, msgType byte, payload []byte) {
+		if connID != ControlConnID || msgType != MsgConfig {
+			t.Errorf("frame is connID=%d msgType=%d, want ControlConnID/MsgConfig", connID, msgType)
+			return
+		}
+		fps, batch, trackCount, maxFB, idleMs, _, ok := DecodeVP8Config(payload)
+		if !ok {
+			t.Error("DecodeVP8Config reported not-ok")
+			return
+		}
+		if trackCount != 1 {
+			t.Errorf("trackCount = %d, want 1", trackCount)
+		}
+		got = Profile{FPS: fps, Batch: batch, MaxFrameBytes: maxFB, IdleKeepalive: time.Duration(idleMs) * time.Millisecond}
+		decoded = true
+	})
+	if !decoded {
+		t.Fatal("no MsgConfig frame decoded from what pushProfile sent")
+	}
+
+	if got.FPS != want.FPS || got.Batch != want.Batch ||
+		got.MaxFrameBytes != want.MaxFrameBytes || got.IdleKeepalive != want.IdleKeepalive {
+		t.Errorf("peer decoded fps=%d batch=%d maxFrameBytes=%d idleKeepalive=%s,\n"+
+			"                   want fps=%d batch=%d maxFrameBytes=%d idleKeepalive=%s",
+			got.FPS, got.Batch, got.MaxFrameBytes, got.IdleKeepalive,
+			want.FPS, want.Batch, want.MaxFrameBytes, want.IdleKeepalive)
+	}
+}
+
+// TestPushProfileDistinguishesProfiles is the sharper half of the guard. The
+// double-framing bug decoded EVERY profile to the same constant, because every
+// decoded field came from the inner frame's fixed header -- so a push carried
+// no information at all. A test that only checked one profile could still pass
+// against a future bug that clamps or drops values; this one fails unless
+// distinct profiles actually arrive distinct.
+func TestPushProfileDistinguishesProfiles(t *testing.T) {
+	decode := func(t *testing.T, p Profile) (fps, batch int) {
+		t.Helper()
+		tun := &fakeTunnel{}
+		rc := NewRateController(tun, testConfig(), true, nil)
+		rc.pushProfile(p)
+		tun.mu.Lock()
+		sent := append([][]byte(nil), tun.sent...)
+		tun.mu.Unlock()
+		if len(sent) != 1 {
+			t.Fatalf("sent %d frames, want 1", len(sent))
+		}
+		var f, b int
+		DecodeFrames(sent[0], func(_ uint32, _ byte, payload []byte) {
+			f, b, _, _, _, _, _ = DecodeVP8Config(payload)
+		})
+		return f, b
+	}
+
+	activeFPS, activeBatch := decode(t, Profile{FPS: 40, Batch: 8})
+	idleFPS, idleBatch := decode(t, Profile{FPS: 2, Batch: 1})
+
+	if activeFPS == idleFPS && activeBatch == idleBatch {
+		t.Fatalf("two different profiles both decoded to fps=%d batch=%d; "+
+			"a config push is carrying no information (double-framing regression)",
+			activeFPS, activeBatch)
+	}
+	if activeFPS != 40 || activeBatch != 8 {
+		t.Errorf("active profile decoded fps=%d batch=%d, want 40/8", activeFPS, activeBatch)
+	}
+	if idleFPS != 2 || idleBatch != 1 {
+		t.Errorf("idle profile decoded fps=%d batch=%d, want 2/1", idleFPS, idleBatch)
+	}
+}

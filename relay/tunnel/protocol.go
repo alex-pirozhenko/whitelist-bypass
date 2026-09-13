@@ -25,7 +25,14 @@ type DataTunnel interface {
 	Reconfigure(fps, batch int)
 }
 
-// EncodeVP8Config builds a MsgConfig payload. maxFrameBytes and
+// EncodeVP8Config builds a COMPLETE MsgConfig frame -- it calls EncodeFrame
+// itself and returns the result, so hand it straight to SendData and do NOT
+// wrap it again. (It is named for the payload it encodes, not for what it
+// returns; renaming it is a bigger change than this fix wanted to make.)
+// Note the asymmetry with DecodeVP8Config below, which takes a PAYLOAD: the
+// two are not inverses, and a caller that assumes they are produces a
+// double-framed message whose fields decode entirely from the inner frame's
+// header. ratectl.pushProfile did exactly that. maxFrameBytes and
 // idleKeepaliveMs are optional trailing fields (a later step's rate
 // controller uses them); pass 0 for both if you only need
 // fps/batch/trackCount, exactly like every call site in this codebase does
@@ -61,7 +68,10 @@ func EncodeVP8Config(fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs int,
 	return EncodeFrame(ControlConnID, MsgConfig, payload[:])
 }
 
-// DecodeVP8Config is the inverse. A short payload (from an OLDER peer that
+// DecodeVP8Config decodes the PAYLOAD of a MsgConfig frame -- i.e. what a
+// frame decoder hands you, not what EncodeVP8Config returns. Despite the
+// names these two are NOT inverses; see EncodeVP8Config above.
+// A short payload (from an OLDER peer that
 // doesn't know about the trailing fields, or a caller that never set them)
 // is tolerated exactly like today: fields past what's present default to 0
 // (trackCount defaults to 1, matching existing behavior — everything added

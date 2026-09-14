@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pion/webrtc/v4"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
+	"github.com/pion/webrtc/v4"
 )
 
 var stdinReader = bufio.NewReader(os.Stdin)
@@ -40,7 +40,7 @@ func RequestResolve(hostname string) (string, error) {
 
 type StatusEmitter struct{}
 
-func (StatusEmitter) EmitStatus(status string)  { common.EmitStatus(status) }
+func (StatusEmitter) EmitStatus(status string)   { common.EmitStatus(status) }
 func (StatusEmitter) EmitStatusError(msg string) { common.EmitStatusError(msg) }
 
 type PCConfigurer struct{}

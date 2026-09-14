@@ -7,15 +7,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/webrtc/v4"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/common"
 	"github.com/alex-pirozhenko/whitelist-bypass/relay/tunnel"
+	"github.com/pion/webrtc/v4"
 )
 
 type tmPCState struct {
-	pc          *webrtc.PeerConnection
-	remoteSet   bool
-	pending     []webrtc.ICECandidateInit
+	pc        *webrtc.PeerConnection
+	remoteSet bool
+	pending   []webrtc.ICECandidateInit
 }
 
 type TelemostClient struct {

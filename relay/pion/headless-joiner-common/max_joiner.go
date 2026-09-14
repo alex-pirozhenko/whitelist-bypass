@@ -2767,3 +2767,21 @@ func (w *sfuTunnelWrapper) Counters() tunnel.Counters {
 func (w *sfuTunnelWrapper) HintBandwidth(ctx context.Context, tier tunnel.Tier) error {
 	return w.h.HintBandwidth(ctx, tier)
 }
+
+func (w *sfuTunnelWrapper) SendControl(frame []byte) bool {
+	if sc, ok := w.DataTunnel.(interface{ SendControl([]byte) bool }); ok {
+		return sc.SendControl(frame)
+	}
+	if tsd, ok := w.DataTunnel.(interface{ TrySendData([]byte) bool }); ok {
+		return tsd.TrySendData(frame)
+	}
+	w.DataTunnel.SendData(frame)
+	return true
+}
+
+func (w *sfuTunnelWrapper) CtlQueueLen() int {
+	if cq, ok := w.DataTunnel.(interface{ CtlQueueLen() int }); ok {
+		return cq.CtlQueueLen()
+	}
+	return 0
+}

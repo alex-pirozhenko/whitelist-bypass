@@ -22,3 +22,4 @@ type CacheStore interface {
 
 type AddTunnelTracksFunc func(pc *webrtc.PeerConnection, logFn func(string, ...any), prefix string) *webrtc.TrackLocalStaticSample
 type ReadTrackFunc func(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string)
+type ReadTrackStatsFunc func(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string, onStats func(recvPackets, gaps, lostPackets uint64))

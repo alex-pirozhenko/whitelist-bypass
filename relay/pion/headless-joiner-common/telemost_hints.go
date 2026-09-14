@@ -42,6 +42,14 @@ type queueLener interface {
 	QueueLen() int
 }
 
+type sendController interface {
+	SendControl([]byte) bool
+}
+
+type ctlQueueLener interface {
+	CtlQueueLen() int
+}
+
 func (w *telemostTunnelWrapper) SetProfile(p tunnel.Profile) {
 	if rc, ok := w.DataTunnel.(rateControllable); ok {
 		rc.SetProfile(p)
@@ -79,6 +87,24 @@ func (w *telemostTunnelWrapper) Batch() int {
 func (w *telemostTunnelWrapper) QueueLen() int {
 	if q, ok := w.DataTunnel.(queueLener); ok {
 		return q.QueueLen()
+	}
+	return 0
+}
+
+func (w *telemostTunnelWrapper) SendControl(frame []byte) bool {
+	if sc, ok := w.DataTunnel.(sendController); ok {
+		return sc.SendControl(frame)
+	}
+	if tsd, ok := w.DataTunnel.(trySendDataer); ok {
+		return tsd.TrySendData(frame)
+	}
+	w.DataTunnel.SendData(frame)
+	return true
+}
+
+func (w *telemostTunnelWrapper) CtlQueueLen() int {
+	if cq, ok := w.DataTunnel.(ctlQueueLener); ok {
+		return cq.CtlQueueLen()
 	}
 	return 0
 }

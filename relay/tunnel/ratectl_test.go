@@ -776,3 +776,126 @@ func TestAIMDDecreaseOnLossNotHighRTT(t *testing.T) {
 		t.Errorf("expected decrease to %d, got %d", expected, curBytesDecrease)
 	}
 }
+
+func TestLossPercentIsPerWindow(t *testing.T) {
+	fake := &fakeTunnel{}
+	cfg := testConfig()
+	cfg.AIMDStart = 10000
+	rc := NewRateController(fake, cfg, true, nil)
+	rc.Start()
+	defer rc.Stop()
+
+	// Initial setting: make sure we are active and maxFrameBytes starts at 10000
+	rc.mu.Lock()
+	rc.tier = TierActive
+	rc.aimd.maxFrameBytes = 10000
+	rc.activeFPS = cfg.ActiveProfile.FPS
+	rc.mu.Unlock()
+
+	// 1. First peer stats frame: cumulative (1000,0)
+	buf1 := make([]byte, 32)
+	binary.BigEndian.PutUint64(buf1[0:8], 1000) // recv
+	binary.BigEndian.PutUint64(buf1[8:16], 0)   // gaps
+	binary.BigEndian.PutUint64(buf1[16:24], 0)  // lost
+	binary.BigEndian.PutUint64(buf1[24:32], 0)  // echo
+	rc.handlePeerStats(buf1)
+
+	rc.mu.Lock()
+	m1 := rc.aimd.maxFrameBytes
+	stats1 := rc.lastStats
+	rc.mu.Unlock()
+
+	if m1 != 11200 {
+		t.Errorf("expected maxFrameBytes=11200 after first frame, got %d", m1)
+	}
+	if stats1.LossPercent != 0 {
+		t.Errorf("expected 0%% loss for first frame, got %f", stats1.LossPercent)
+	}
+
+	// 2. Second peer stats frame: cumulative (2000, 30) -> window is dRecv=1000, dLost=30
+	// loss = 30 / 1030 * 100 = ~2.91% >= 2.0% (triggers decrease of maxFrameBytes to 60%)
+	buf2 := make([]byte, 32)
+	binary.BigEndian.PutUint64(buf2[0:8], 2000) // recv
+	binary.BigEndian.PutUint64(buf2[8:16], 0)
+	binary.BigEndian.PutUint64(buf2[16:24], 30) // lost
+	binary.BigEndian.PutUint64(buf2[24:32], 0)
+	rc.handlePeerStats(buf2)
+
+	rc.mu.Lock()
+	m2 := rc.aimd.maxFrameBytes
+	stats2 := rc.lastStats
+	rc.mu.Unlock()
+
+	expectedDec := int(11200 * 0.6)
+	if m2 != expectedDec {
+		t.Errorf("expected maxFrameBytes to decrease to %d, got %d", expectedDec, m2)
+	}
+	if stats2.LossPercent < 2.9 || stats2.LossPercent > 3.0 {
+		t.Errorf("expected ~2.9%% loss for second window, got %f", stats2.LossPercent)
+	}
+
+	// 3. Third peer stats frame: cumulative (3000, 30) -> window is dRecv=1000, dLost=0
+	// loss = 0% < 1.0% -> no decrease. In fact, it might increase slightly, but definitely won't decrease.
+	buf3 := make([]byte, 32)
+	binary.BigEndian.PutUint64(buf3[0:8], 3000)
+	binary.BigEndian.PutUint64(buf3[8:16], 0)
+	binary.BigEndian.PutUint64(buf3[16:24], 30)
+	binary.BigEndian.PutUint64(buf3[24:32], 0)
+	rc.handlePeerStats(buf3)
+
+	rc.mu.Lock()
+	m3 := rc.aimd.maxFrameBytes
+	stats3 := rc.lastStats
+	rc.mu.Unlock()
+
+	if m3 < expectedDec {
+		t.Errorf("expected maxFrameBytes to not decrease further (was %d, now %d)", expectedDec, m3)
+	}
+	if stats3.LossPercent != 0 {
+		t.Errorf("expected 0%% loss for third window, got %f", stats3.LossPercent)
+	}
+}
+
+type dummyLossSource struct{}
+
+func (d dummyLossSource) RecvLossStats() (uint64, uint64, uint64) { return 0, 0, 0 }
+
+func TestSwapTunnelKeepsLossAndFeedbackSources(t *testing.T) {
+	fake1 := &fakeTunnel{}
+	cfg := testConfig()
+	rb := NewRelayBridgeWithConfig(fake1, "socks", 0, t.Logf, true, cfg)
+
+	lossSrc := dummyLossSource{}
+	fbSrc := &RTCPFeedback{}
+
+	rb.SetLossSource(lossSrc)
+	rb.SetFeedbackSource(fbSrc)
+
+	// Verify they are on the current rate controller
+	ctl1 := rb.currentRateCtl()
+	if ctl1 == nil {
+		t.Fatalf("expected rate controller")
+	}
+	if ctl1.lossSource != lossSrc {
+		t.Errorf("expected lossSource on ctl1")
+	}
+	if ctl1.feedback != fbSrc {
+		t.Errorf("expected feedback on ctl1")
+	}
+
+	// Swap tunnel
+	fake2 := &fakeTunnel{}
+	rb.SwapTunnel(fake2)
+
+	// Verify they are kept on the new rate controller
+	ctl2 := rb.currentRateCtl()
+	if ctl2 == nil {
+		t.Fatalf("expected new rate controller")
+	}
+	if ctl2.lossSource != lossSrc {
+		t.Errorf("expected lossSource to be preserved on ctl2")
+	}
+	if ctl2.feedback != fbSrc {
+		t.Errorf("expected feedback to be preserved on ctl2")
+	}
+}

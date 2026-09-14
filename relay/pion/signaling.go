@@ -179,6 +179,7 @@ type RecvStats struct {
 	RecvPackets uint64
 	Gaps        uint64
 	LostPackets uint64
+	Reordered   uint64
 }
 
 // ReadTrackWithStats is ReadTrack plus a stats callback invoked after every
@@ -194,6 +195,14 @@ func ReadTrackWithStats(track *webrtc.TrackRemote, handler func([]byte), logFn f
 		}
 	}
 	readVP8Track(track, handler, logFn, prefix, false, onStats)
+}
+
+func ReadTrackCounting(track *webrtc.TrackRemote, handler func([]byte), logFn func(string, ...any), prefix string, onStats func(recvPackets, gaps, lostPackets uint64)) {
+	ReadTrackWithStats(track, handler, logFn, prefix, func(stats RecvStats) {
+		if onStats != nil {
+			onStats(stats.RecvPackets, stats.Gaps, stats.LostPackets)
+		}
+	})
 }
 
 // ReadTrackForceVP8WithStats is ReadTrackForceVP8 plus the same stats callback.
@@ -238,15 +247,15 @@ func vpX(p codecs.VP8Packet) int {
 // from Section 2 above. Split out of readVP8Track so it can be unit-tested
 // with synthetic *rtp.Packet values instead of a live *webrtc.TrackRemote.
 type vp8FrameReassembler struct {
-	vp8Pkt       codecs.VP8Packet
-	frameBuf     []byte
-	lastSeq      uint16
-	haveLastSeq  bool
-	frameValid   bool
-	recvCount    int
-	recvPkts     int
-	badCount     int
-	stats        RecvStats
+	vp8Pkt      codecs.VP8Packet
+	frameBuf    []byte
+	lastSeq     uint16
+	haveLastSeq bool
+	frameValid  bool
+	recvCount   int
+	recvPkts    int
+	badCount    int
+	stats       RecvStats
 }
 
 type feedResult struct {
@@ -267,20 +276,29 @@ type feedResult struct {
 func (r *vp8FrameReassembler) feed(pkt *rtp.Packet, verbose bool) (res feedResult) {
 	r.stats.RecvPackets++
 
+	isLate := false
 	if r.haveLastSeq {
 		if pkt.SequenceNumber == r.lastSeq {
 			res.IsDuplicate = true
 			return res
 		}
 		if pkt.SequenceNumber != r.lastSeq+1 {
-			r.stats.Gaps++
-			r.stats.LostPackets += uint64(uint16(pkt.SequenceNumber - r.lastSeq))
-			r.frameValid = false
-			r.frameBuf = r.frameBuf[:0]
+			delta := uint16(pkt.SequenceNumber - r.lastSeq)
+			if delta < 0x8000 {
+				r.stats.Gaps++
+				r.stats.LostPackets += uint64(delta - 1)
+				r.frameValid = false
+				r.frameBuf = r.frameBuf[:0]
+			} else {
+				r.stats.Reordered++
+				isLate = true
+			}
 		}
 	}
-	r.lastSeq = pkt.SequenceNumber
-	r.haveLastSeq = true
+	if !isLate {
+		r.lastSeq = pkt.SequenceNumber
+		r.haveLastSeq = true
+	}
 
 	vp8Payload, err := r.vp8Pkt.Unmarshal(pkt.Payload)
 	if err != nil {

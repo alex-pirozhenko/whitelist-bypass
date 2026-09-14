@@ -93,6 +93,8 @@ type RelayBridge struct {
 	policyMaster bool
 	rateCtl      *RateController
 	rateCfg      RateControllerConfig
+	lossSource   LossSource
+	feedback     *RTCPFeedback
 }
 
 // benchConnID is a reserved connection id for raw benchmark traffic pushed
@@ -184,7 +186,15 @@ func (rb *RelayBridge) SwapTunnel(newTunnel DataTunnel) {
 	oldCtl := rb.rateCtl
 	newCtl := NewRateController(newTunnel, rb.rateCfg, rb.policyMaster, rb.logFn)
 	rb.rateCtl = newCtl
+	lossSrc := rb.lossSource
+	feedbackSrc := rb.feedback
 	rb.tunnelMu.Unlock()
+	if lossSrc != nil {
+		newCtl.SetLossSource(lossSrc)
+	}
+	if feedbackSrc != nil {
+		newCtl.SetFeedbackSource(feedbackSrc)
+	}
 	if oldCtl != nil {
 		newCtl.SetPolicy(oldCtl.policyForTransfer())
 		oldCtl.Stop()
@@ -403,14 +413,22 @@ func (rb *RelayBridge) SetPolicy(p Policy) {
 // SetLossSource forwards to the attached RateController (see LossSource's
 // doc comment: unset by default, meaning loss is unmeasured, not "zero").
 func (rb *RelayBridge) SetLossSource(src LossSource) {
-	if ctl := rb.currentRateCtl(); ctl != nil {
+	rb.tunnelMu.Lock()
+	rb.lossSource = src
+	ctl := rb.rateCtl
+	rb.tunnelMu.Unlock()
+	if ctl != nil {
 		ctl.SetLossSource(src)
 	}
 }
 
 // SetFeedbackSource forwards to the attached RateController.
 func (rb *RelayBridge) SetFeedbackSource(f *RTCPFeedback) {
-	if ctl := rb.currentRateCtl(); ctl != nil {
+	rb.tunnelMu.Lock()
+	rb.feedback = f
+	ctl := rb.rateCtl
+	rb.tunnelMu.Unlock()
+	if ctl != nil {
 		ctl.SetFeedbackSource(f)
 	}
 }

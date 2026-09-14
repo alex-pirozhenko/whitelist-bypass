@@ -402,3 +402,49 @@ func TestSubscriberAudioOff(t *testing.T) {
 		t.Errorf("expected video section to NOT be inactive")
 	}
 }
+
+func TestTelemostTrackStatsSinkAccumulatesAcrossTracks(t *testing.T) {
+	j := NewTelemostHeadlessJoiner(nil, nil, nil, nil, nil, nil)
+
+	sink1 := j.trackStatsSink()
+	sink2 := j.trackStatsSink()
+
+	// First track reports 100 recv, 1 gaps, 3 lost
+	sink1(100, 1, 3)
+	// First track reports 150 recv, 2 gaps, 5 lost (deltas: 50, 1, 2)
+	sink1(150, 2, 5)
+
+	// Second track reports 10 recv, 0 gaps, 0 lost
+	sink2(10, 0, 0)
+
+	r, g, l := j.RecvLossStats()
+	if r != 160 || g != 2 || l != 5 {
+		t.Errorf("expected RecvLossStats=(160,2,5), got (%d,%d,%d)", r, g, l)
+	}
+}
+
+func TestSelectActiveTunnel(t *testing.T) {
+	secret := []byte("pump-secret-key-12345")
+	obf, _ := tunnel.NewTunnelObfuscator(secret)
+	vp8 := tunnel.NewVP8DataTunnelWithQueue(nil, obf, func(string, ...any) {}, 64)
+
+	// A KCP reliable segment should result in KCP non-nil
+	kcpSegment := []byte{0x00, 0x11, 0x22, 0x33}
+	active1, kcp1 := selectActiveTunnel(vp8, kcpSegment, func(string, ...any) {})
+	if kcp1 == nil {
+		t.Errorf("expected KCP tunnel to be non-nil for KCP segment")
+	}
+	if active1 != kcp1 {
+		t.Errorf("expected active tunnel to be the KCP tunnel")
+	}
+
+	// A raw relay frame should result in KCP nil, active == vp8
+	relayFrame := tunnel.EncodeFrame(1, 1, make([]byte, 8)) // connID=1, msgType=1 (MsgPing)
+	active2, kcp2 := selectActiveTunnel(vp8, relayFrame, func(string, ...any) {})
+	if kcp2 != nil {
+		t.Errorf("expected KCP tunnel to be nil for raw relay frame")
+	}
+	if active2 != vp8 {
+		t.Errorf("expected active tunnel to be the raw VP8 tunnel")
+	}
+}

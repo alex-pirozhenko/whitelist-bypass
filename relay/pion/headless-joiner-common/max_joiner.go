@@ -323,7 +323,7 @@ type MaxHeadlessJoiner struct {
 
 	pc          *webrtc.PeerConnection
 	dc          *webrtc.DataChannel
-	remoteSet   bool
+	remoteSet   atomic.Bool
 	remoteUfrag string
 	pendingICE  []webrtc.ICECandidateInit
 
@@ -524,8 +524,8 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 		h.ctl.Close()
 		h.ctl = nil
 	}
-	h.remoteSet = false
-	h.remoteUfrag = ""
+	h.remoteSet.Store(false)
+	h.setRemoteUfrag("")
 	h.pendingICE = nil
 	h.peerMu.Lock()
 	h.peerAddr = nil
@@ -538,6 +538,7 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 		h.vp8tunnel.Stop()
 	}
 	h.rtpTrack = nil
+	h.sampleAudioTrack = nil
 	h.sfuTrackBound = false
 	h.vp8tunnel = nil
 	h.producerSessionID = ""
@@ -792,13 +793,15 @@ func (h *MaxHeadlessJoiner) connectSignaling() error {
 	// Declare media settings immediately, mirroring vk_joiner (VK Calls == this
 	// OK-Calls stack). The SFU does not begin ICE/media until the client states
 	// its media settings; without this, connectivity checks go unanswered and
-	// ICE fails. In SFU mode the tunnel rides a VP8 VIDEO track, so video MUST be
-	// enabled; the DIRECT/DataChannel mode is data-only (all media disabled).
-	videoEnabled := h.params.MediaMode == "sfu"
-	// In SFU mode we bind a (silent) audio track on mid:2, so we must advertise
-	// audio enabled — otherwise the SFU media core sees an active audio producer
-	// slot with the participant reporting audio disabled and rejects the layout.
-	audioEnabled := h.params.MediaMode == "sfu"
+	// ICE fails. Both SFU and DIRECT present an audio/video media call:
+	// - SFU carries the data tunnel over a VP8 video track (with a silent Opus audio track on mid:2)
+	// - DIRECT carries the data tunnel over a VP8 video track (with a silent Opus audio track on mid:0)
+	// Reference capture: capA_relay.jsonl lines 101-104 / direct-findings.md §5:
+	// Two ws2 commands precede media on each leg, in this order:
+	// update-media-modifiers{denoise,denoiseAnn} then
+	// change-media-settings{mediaSettings:{isAudioEnabled:true,isVideoEnabled:true,…}}
+	videoEnabled := true
+	audioEnabled := true
 	h.send("update-media-modifiers", map[string]interface{}{
 		"mediaModifiers": map[string]interface{}{"denoise": true, "denoiseAnn": true},
 	})
@@ -2089,22 +2092,55 @@ func (h *MaxHeadlessJoiner) initPC() {
 
 	h.logFn("max-joiner: role=%s tunnelMode=%s", h.params.Role, h.params.TunnelMode)
 
-	if h.params.Role == maxRoleOfferer {
-		dc, err := pc.CreateDataChannel("tunnel", nil)
-		h.trPC("createDataChannel", map[string]any{"label": "tunnel", "options": nil}, nil, err)
-		if err != nil {
-			h.logFn("max-joiner: warning: could not create tunnel DC: %v", err)
-		} else {
-			h.onTunnelDC(dc)
-		}
-	} else {
-		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-			h.logFn("max-joiner: remote DataChannel: label=%q id=%v", dc.Label(), dc.ID())
-			if dc.Label() == "tunnel" {
-				h.onTunnelDC(dc)
-			}
-		})
+	// Reference capture: capA_relay.jsonl lines 155-156
+	// Line 155: {"t":143563,"who":"A-offerer","kind":"pc","pc":1,"op":"addTrack","args":{"kind":"audio","id":"cf1f42d5-5358-436f-be53-173cf2769d25","label":"MediaStreamAudioDestinationNode"},"result":null,"err":null}
+	// Line 156: {"t":143565,"who":"A-offerer","kind":"pc","pc":1,"op":"addTrack","args":{"kind":"video","id":"6f159d42-d64a-4311-ad01-8bda4f07a393","label":"..."},"result":null,"err":null}
+	// Add audio then video immediately so CreateOffer/CreateAnswer emit m=audio and m=video with no m=application.
+	audioTrack, aerr := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		"audio", "tunnel-audio",
+	)
+	if aerr != nil {
+		h.logFn("max-joiner: failed to create Opus audio track: %v", aerr)
+		return
 	}
+	h.sampleAudioTrack = audioTrack
+	if _, err := pc.AddTrack(h.sampleAudioTrack); err != nil {
+		h.trPC("addTrack", trackArgs(h.sampleAudioTrack), nil, err)
+		h.logFn("max-joiner: failed to add audio track: %v", err)
+	} else {
+		h.trPC("addTrack", trackArgs(h.sampleAudioTrack), nil, nil)
+	}
+
+	rtpTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
+		"video", "tunnel-video",
+	)
+	if err != nil {
+		h.logFn("max-joiner: failed to create VP8 RTP track: %v", err)
+		return
+	}
+	h.rtpTrack = rtpTrack
+	if _, err := pc.AddTrack(h.rtpTrack); err != nil {
+		h.trPC("addTrack", trackArgs(h.rtpTrack), nil, err)
+		h.logFn("max-joiner: failed to add video track: %v", err)
+	} else {
+		h.trPC("addTrack", trackArgs(h.rtpTrack), nil, nil)
+	}
+
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		h.logFn("max-joiner: remote track: kind=%s codec=%s ssrc=%d streamId=%s trackId=%s",
+			track.Kind(), track.Codec().MimeType, track.SSRC(), track.StreamID(), track.ID())
+		readFn := h.ReadTrackFn
+		if track.Kind() == webrtc.RTPCodecTypeVideo && h.params != nil && h.params.ForceVP8Read && h.ForceReadTrackFn != nil {
+			readFn = h.ForceReadTrackFn
+		}
+		go readFn(track, func(frame []byte) {
+			if h.vp8tunnel != nil {
+				h.vp8tunnel.HandleFrame(frame)
+			}
+		}, h.logFn, "max-joiner")
+	})
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
@@ -2127,28 +2163,29 @@ func (h *MaxHeadlessJoiner) initPC() {
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
 			h.logFn("max-joiner: PC %s, closing transport to trigger reconnect", state.String())
 			h.closeTransport()
+			return
+		}
+		if state == webrtc.PeerConnectionStateConnected && h.vp8tunnel == nil {
+			h.reconnectAttempt.Store(0)
+			h.logFn("max-joiner: === VP8 TUNNEL CONNECTED ===")
+			h.Status.EmitStatus(common.StatusTunnelConnected)
+			h.vp8tunnel = tunnel.NewVP8DataTunnelRTP(h.rtpTrack, h.obf, h.logFn)
+			vp8tun := h.vp8tunnel
+			vp8tun.Start(h.params.VP8FPS, h.params.VP8Batch)
+			if !h.configAck.acknowledged() {
+				acked, cancel := h.configAck.arm()
+				go sendVP8ConfigUntilAcked(acked, cancel, h.stopCh, vp8tun,
+					vp8tun.FPS(), vp8tun.Batch(), 1, h.logFn, "max-joiner")
+				h.logFn("max-joiner: pushed vp8 config fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
+			}
+			wrapped := newSFUTunnelWrapper(vp8tun, h)
+			if h.OnConnected != nil {
+				h.OnConnected(wrapped)
+			}
 		}
 	})
 
 	h.logFn("max-joiner: PC ready, role=%s", h.params.Role)
-}
-
-func (h *MaxHeadlessJoiner) onTunnelDC(dc *webrtc.DataChannel) {
-	h.dc = dc
-	dc.OnOpen(func() {
-		h.trState("dc", "open", dc.Label())
-		h.logFn("max-joiner: tunnel DC open")
-		h.reconnectAttempt.Store(0)
-		h.logFn("max-joiner: === DC TUNNEL CONNECTED ===")
-		h.Status.EmitStatus(common.StatusTunnelConnected)
-		if h.OnConnected != nil {
-			h.OnConnected(tunnel.NewDCTunnel(dc, h.obf, common.RTPBufSize, h.logFn))
-		}
-	})
-	dc.OnClose(func() {
-		h.trState("dc", "close", dc.Label())
-		h.logFn("max-joiner: tunnel DC closed")
-	})
 }
 
 func (h *MaxHeadlessJoiner) onLocalICECandidate(candidate *webrtc.ICECandidate) {
@@ -2597,8 +2634,8 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 		candidateJSON, _ := json.Marshal(candidate)
 		var candidateInit webrtc.ICECandidateInit
 		if err := json.Unmarshal(candidateJSON, &candidateInit); err == nil && candidateInit.Candidate != "" {
-			if h.remoteUfrag != "" {
-				candidateInit.Candidate = sanitizeCandidate(candidateInit.Candidate, h.remoteUfrag)
+			if ufrag := h.RemoteUfrag(); ufrag != "" {
+				candidateInit.Candidate = sanitizeCandidate(candidateInit.Candidate, ufrag)
 			}
 			// A non-empty inner .candidate distinguishes a real candidate from the
 			// end-of-candidates sentinel {candidate:""}, which the real client
@@ -2606,7 +2643,7 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 			if h.OnRemoteCandidate != nil {
 				h.OnRemoteCandidate(0, candidateInit.Candidate)
 			}
-			if h.remoteSet {
+			if h.remoteSet.Load() {
 				h.logFn("max-joiner: <- server ICE candidate: %s", candidateInit.Candidate)
 				h.trPC("addIceCandidate", candidateInit, nil, h.pc.AddICECandidate(candidateInit))
 			} else {
@@ -2628,16 +2665,17 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 	h.logFn("max-joiner: remote SDP: %s [%s]\n--- SDP RAW ---\n%s\n--- END SDP ---", sdpType, sdpUfragSummary(sdpStr), sdpStr)
 
 	sdpStr = sanitizeSDPCandidates(sdpStr)
-	h.remoteUfrag = parseSessionUfrag(sdpStr)
+	h.setRemoteUfrag(parseSessionUfrag(sdpStr))
+	ufrag := h.RemoteUfrag()
 
 	switch sdpType {
 	case "answer":
 		remote := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdpStr}
 		h.trPC("setRemoteDescription", sdpArgs(remote), nil, h.pc.SetRemoteDescription(remote))
-		h.remoteSet = true
+		h.remoteSet.Store(true)
 		for _, candidate := range h.pendingICE {
-			if h.remoteUfrag != "" {
-				candidate.Candidate = sanitizeCandidate(candidate.Candidate, h.remoteUfrag)
+			if ufrag != "" {
+				candidate.Candidate = sanitizeCandidate(candidate.Candidate, ufrag)
 			}
 			h.logFn("max-joiner: <- buffered ICE candidate: %s", candidate.Candidate)
 			h.trPC("addIceCandidate", candidate, nil, h.pc.AddICECandidate(candidate))
@@ -2647,10 +2685,10 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 	case "offer":
 		remote := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdpStr}
 		h.trPC("setRemoteDescription", sdpArgs(remote), nil, h.pc.SetRemoteDescription(remote))
-		h.remoteSet = true
+		h.remoteSet.Store(true)
 		for _, candidate := range h.pendingICE {
-			if h.remoteUfrag != "" {
-				candidate.Candidate = sanitizeCandidate(candidate.Candidate, h.remoteUfrag)
+			if ufrag != "" {
+				candidate.Candidate = sanitizeCandidate(candidate.Candidate, ufrag)
 			}
 			h.logFn("max-joiner: <- buffered ICE candidate: %s", candidate.Candidate)
 			h.trPC("addIceCandidate", candidate, nil, h.pc.AddICECandidate(candidate))
@@ -2687,6 +2725,18 @@ func (h *MaxHeadlessJoiner) onTransmittedData(data map[string]interface{}) {
 		})
 		h.logFn("max-joiner: sent ANSWER [%s]", sdpUfragSummary(answer.SDP))
 	}
+}
+
+func (h *MaxHeadlessJoiner) RemoteUfrag() string {
+	h.peerMu.Lock()
+	defer h.peerMu.Unlock()
+	return h.remoteUfrag
+}
+
+func (h *MaxHeadlessJoiner) setRemoteUfrag(u string) {
+	h.peerMu.Lock()
+	defer h.peerMu.Unlock()
+	h.remoteUfrag = u
 }
 
 // sfuTunnelWrapper wraps a VP8 DataTunnel in SFU mode to intercept control-plane

@@ -251,7 +251,7 @@ func authParams(tf tokenFile, o runOpts) string {
 		VP8Batch:           o.vp8Batch,
 		SFUVideoWidth:      o.sfuWidth,
 		SFUVideoHeight:     o.sfuHeight,
-		ForceVP8Read:       o.mediaMode == "sfu",
+		ForceVP8Read:       o.mediaMode == "sfu" || o.mediaMode == "direct",
 	}
 	pj, _ := json.Marshal(params)
 	return string(pj)

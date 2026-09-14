@@ -133,6 +133,23 @@ func (j *TelemostHeadlessJoiner) HintBandwidth(ctx context.Context, tier tunnel.
 		}
 	}
 
+	// Unsubscribe video logic
+	if j.idleUnsubscribeVideo {
+		if tier != tunnel.TierActive {
+			if !j.getUnsubscribedVideo() {
+				j.setUnsubscribedVideo(true)
+				j.wsSend(tmapi.SetSlotsShutdownMessage(j.nextSlotsKey()))
+				j.logFn("telemost-joiner: hint tier=%s video=unsubscribed", tier)
+			}
+		} else {
+			if j.getUnsubscribedVideo() {
+				j.setUnsubscribedVideo(false)
+				j.wsSend(tmapi.SetSlotsMessage(j.nextSlotsKey()))
+				j.logFn("telemost-joiner: hint tier=%s video=subscribed", tier)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -189,4 +206,16 @@ func (j *TelemostHeadlessJoiner) getRembBps() int {
 	j.rembLoopMu.Lock()
 	defer j.rembLoopMu.Unlock()
 	return j.rembBps
+}
+
+func (j *TelemostHeadlessJoiner) getUnsubscribedVideo() bool {
+	j.slotsMu.Lock()
+	defer j.slotsMu.Unlock()
+	return j.videoUnsubscribed
+}
+
+func (j *TelemostHeadlessJoiner) setUnsubscribedVideo(v bool) {
+	j.slotsMu.Lock()
+	defer j.slotsMu.Unlock()
+	j.videoUnsubscribed = v
 }

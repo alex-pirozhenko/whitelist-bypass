@@ -94,6 +94,9 @@ type TelemostHeadlessJoiner struct {
 	boundMu          sync.Mutex
 
 	disableSubscriberAudio bool
+	idleUnsubscribeVideo   bool
+	subscriberAudioOff     bool
+	videoUnsubscribed      bool
 	idleRembBps            int
 	activeRembBps          int
 	idleSlotWidth          int
@@ -130,6 +133,8 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 		DualTrack              bool   `json:"dualTrack"`
 		TunnelSecret           string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
 		DisableSubscriberAudio bool   `json:"disableSubscriberAudio"`
+		IdleUnsubscribeVideo   bool   `json:"idleUnsubscribeVideo"`
+		SubscriberAudioOff     bool   `json:"subscriberAudioOff"`
 		IdleRembBps            int    `json:"idleRembBps"`
 		ActiveRembBps          int    `json:"activeRembBps"`
 		IdleSlotWidth          int    `json:"idleSlotWidth"`
@@ -164,13 +169,15 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	j.reliable = params.Reliable
 	j.dualTrack = params.DualTrack
 	j.disableSubscriberAudio = params.DisableSubscriberAudio
+	j.idleUnsubscribeVideo = params.IdleUnsubscribeVideo
+	j.subscriberAudioOff = params.SubscriberAudioOff
 	j.idleRembBps = params.IdleRembBps
 	j.activeRembBps = params.ActiveRembBps
 	j.idleSlotWidth = params.IdleSlotWidth
 	j.idleSlotHeight = params.IdleSlotHeight
-	j.logFn("telemost-joiner: link=%s name=%s vp8Fps=%d vp8Batch=%d dualTrack=%v localEpoch=0x%08x remb=%d/%d idleSlot=%dx%d subAudio=%v",
+	j.logFn("telemost-joiner: link=%s name=%s vp8Fps=%d vp8Batch=%d dualTrack=%v localEpoch=0x%08x remb=%d/%d idleSlot=%dx%d subAudio=%v idleUnsubscribeVideo=%v subscriberAudioOff=%v",
 		j.joinLink, j.displayName, params.VP8FPS, params.VP8Batch, j.dualTrack, obf.LocalEpoch(),
-		j.idleRembBps, j.activeRembBps, j.idleSlotWidth, j.idleSlotHeight, j.disableSubscriberAudio)
+		j.idleRembBps, j.activeRembBps, j.idleSlotWidth, j.idleSlotHeight, j.disableSubscriberAudio, j.idleUnsubscribeVideo, j.subscriberAudioOff)
 
 	j.Status.EmitStatus(common.StatusConnecting)
 	if err := j.runOnce(); err != nil {
@@ -259,6 +266,9 @@ func (j *TelemostHeadlessJoiner) resetSessionState() {
 	j.sampleTrack = nil
 	j.vp8tunnel = nil
 	j.initBundleSent = false
+	j.slotsMu.Lock()
+	j.videoUnsubscribed = false
+	j.slotsMu.Unlock()
 	j.boundMu.Lock()
 	j.boundPeers = nil
 	j.unboundPeers = nil
@@ -737,6 +747,18 @@ func (j *TelemostHeadlessJoiner) handleSubOffer(sdp string, pcSeq int) {
 	}
 	j.subRemoteSet = true
 
+	if j.subscriberAudioOff {
+		for _, transceiver := range j.subPC.GetTransceivers() {
+			if transceiver.Kind() == webrtc.RTPCodecTypeAudio {
+				err := setTransceiverDirection(transceiver, webrtc.RTPTransceiverDirectionInactive)
+				if err != nil {
+					_ = transceiver.Stop()
+				}
+				j.logFn("telemost-joiner: subscriber audio rejected (mid=%s)", transceiver.Mid())
+			}
+		}
+	}
+
 	for _, candidate := range j.subPending {
 		j.subPC.AddICECandidate(candidate)
 	}
@@ -947,7 +969,11 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 		}
 		j.boundMu.Unlock()
 		if needRebind {
-			j.logFn("telemost-joiner: slot kill/vanish observed - ignoring (tunnel data path is independent of slot binding)")
+			if j.getUnsubscribedVideo() {
+				j.logFn("telemost-joiner: slot kill/vanish observed (video unsubscribed) - ignoring")
+			} else {
+				j.logFn("telemost-joiner: slot kill/vanish observed - ignoring (tunnel data path is independent of slot binding)")
+			}
 		}
 		j.ack(uid)
 		return
@@ -1125,4 +1151,18 @@ func (j *TelemostHeadlessJoiner) connectAndRun() {
 		j.pubPC.Close()
 	}
 	j.logFn("telemost-joiner: disconnected")
+}
+
+// setTransceiverDirection rejects a subscriber transceiver before the answer
+// is created. pion v4 exposes no SetDirection on RTPTransceiver (only the
+// unexported setDirection), so the one supported way to answer an offered
+// m-line as inactive is to stop the transceiver: the answer then carries
+// port 0 + a=inactive for it and the SFU stops sending on that m-line. The
+// direction argument is kept for the call site's intent; only Inactive is
+// meaningful.
+func setTransceiverDirection(t *webrtc.RTPTransceiver, d webrtc.RTPTransceiverDirection) error {
+	if d != webrtc.RTPTransceiverDirectionInactive {
+		return fmt.Errorf("setTransceiverDirection: only inactive is supported, got %s", d)
+	}
+	return t.Stop()
 }

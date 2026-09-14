@@ -678,55 +678,57 @@ func TestStaleEchoRejected(t *testing.T) {
 	cfg := testConfig()
 	rc := NewRateController(fake, cfg, true, nil)
 
-	// Send ping A
+	// Send ping A, then ping B a little later.
 	rc.sendPing()
 	rc.mu.Lock()
 	pingANanos := rc.lastPingSentNanos
 	rc.mu.Unlock()
-
-	// Sleep 2ms, then send ping B
 	time.Sleep(2 * time.Millisecond)
 	rc.sendPing()
 	rc.mu.Lock()
 	pingBNanos := rc.lastPingSentNanos
 	rc.mu.Unlock()
-
 	if pingBNanos <= pingANanos {
 		t.Fatalf("expected ping B nanos (%d) to be greater than ping A nanos (%d)", pingBNanos, pingANanos)
 	}
 
-	// Now send a stats frame echoing A after B was sent
-	payloadA := make([]byte, 32)
-	binary.BigEndian.PutUint64(payloadA[24:32], uint64(pingANanos))
-	rc.handlePeerStats(payloadA)
-
-	rc.mu.Lock()
-	lastStats := rc.lastStats
-	staleEchoes := rc.staleEchoes
-	rc.mu.Unlock()
-
-	if lastStats.RTT != 0 {
-		t.Errorf("expected RTT to be 0 (unknown) for stale echo, got %v", lastStats.RTT)
-	}
-	if staleEchoes != 1 {
-		t.Errorf("expected staleEchoes to be 1, got %d", staleEchoes)
+	echo := func(nanos int64) (AIMDStats, uint64) {
+		payload := make([]byte, 32)
+		binary.BigEndian.PutUint64(payload[24:32], uint64(nanos))
+		rc.handlePeerStats(payload)
+		rc.mu.Lock()
+		defer rc.mu.Unlock()
+		return rc.lastStats, rc.staleEchoes
 	}
 
-	// Now echo B
-	payloadB := make([]byte, 32)
-	binary.BigEndian.PutUint64(payloadB[24:32], uint64(pingBNanos))
-	rc.handlePeerStats(payloadB)
-
-	rc.mu.Lock()
-	lastStatsB := rc.lastStats
-	staleEchoesB := rc.staleEchoes
-	rc.mu.Unlock()
-
-	if lastStatsB.RTT <= 0 {
-		t.Errorf("expected RTT to be > 0 for valid echo B, got %v", lastStatsB.RTT)
+	// An echo of A arriving after B was sent is still a valid RTT sample for A
+	// (the peer echoes the last ping it saw, which is usually one behind).
+	st, stale := echo(pingANanos)
+	if st.RTT <= 0 || stale != 0 {
+		t.Fatalf("echo of the previous ping should be accepted: rtt=%v stale=%d", st.RTT, stale)
 	}
-	if staleEchoesB != 1 {
-		t.Errorf("expected staleEchoes to remain 1, got %d", staleEchoesB)
+
+	// The same echo again is older than the last accepted one: stale.
+	st, stale = echo(pingANanos)
+	if st.RTT != 0 || stale != 1 {
+		t.Fatalf("repeated echo should be rejected: rtt=%v stale=%d", st.RTT, stale)
+	}
+
+	// An echo that implies an RTT beyond 3x the ping interval is stale even if newer.
+	old := time.Now().Add(-4 * cfg.statsPingInterval()).UnixNano()
+	if old > pingANanos {
+		st, stale = echo(old)
+		if st.RTT != 0 || stale != 2 {
+			t.Fatalf("too-old echo should be rejected: rtt=%v stale=%d", st.RTT, stale)
+		}
+	} else {
+		stale = 1
+	}
+
+	// Echo B: newer than anything accepted so far.
+	st, staleB := echo(pingBNanos)
+	if st.RTT <= 0 || staleB != stale {
+		t.Fatalf("echo of the latest ping should be accepted: rtt=%v stale=%d", st.RTT, staleB)
 	}
 }
 

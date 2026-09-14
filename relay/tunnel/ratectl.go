@@ -659,7 +659,6 @@ func (rc *RateController) handlePeerStats(payload []byte) {
 	rc.prevPeerRecv = recvPackets
 	rc.prevPeerLost = lostPackets
 
-	lastSent := rc.lastPingSentNanos
 	lastAccepted := rc.lastAcceptedEchoNanos
 	pingInterval := rc.cfg.statsPingInterval()
 	rc.mu.Unlock()
@@ -676,7 +675,16 @@ func (rc *RateController) handlePeerStats(payload []byte) {
 			computedRtt = 0
 		}
 
-		if (echoNanos == lastSent || (lastAccepted > 0 && echoNanos > lastAccepted)) && computedRtt <= 3*pingInterval {
+		// Any echo NEWER than the last one we accepted is a valid sample for the
+		// ping it echoes -- the peer echoes the last ping it saw, which is often
+		// the one before our latest (both sides tick once a second), so
+		// demanding an exact match with the latest ping left the RTT unknown for
+		// most windows (observed 2026-09-14: staleEchoes climbing one per
+		// second, rtt=0s). What is genuinely stale is an echo older than one we
+		// already accepted, or one that implies an RTT beyond the 3-interval
+		// bound (the v0.3.10 collapse: pings dropped behind a full queue, a
+		// 6-7 s echo read as RTT).
+		if echoNanos > lastAccepted && computedRtt <= 3*pingInterval {
 			rtt = computedRtt
 			rc.mu.Lock()
 			rc.lastAcceptedEchoNanos = echoNanos

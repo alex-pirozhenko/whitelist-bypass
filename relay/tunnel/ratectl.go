@@ -189,17 +189,20 @@ type RateController struct {
 	policyMaster bool
 	logFn        func(string, ...any)
 
-	mu                   sync.Mutex
-	tier                 Tier
-	policy               Policy
-	lastActivity         time.Time
-	activeFPS            int
-	aimd                 aimdState
-	lastPeerPingNanos    int64
-	lastKeyframeReqCount uint64
-	lastStats            AIMDStats     // most recent AIMDStats handlePeerStats computed, for introspection (LastStats)
-	peerTier             Tier          // last tier received from the peer (TierActive if never)
-	ctlDrops             atomic.Uint64 // counts control frames dropped due to full send queue
+	mu                    sync.Mutex
+	tier                  Tier
+	policy                Policy
+	lastActivity          time.Time
+	activeFPS             int
+	aimd                  aimdState
+	lastPeerPingNanos     int64
+	lastKeyframeReqCount  uint64
+	lastStats             AIMDStats     // most recent AIMDStats handlePeerStats computed, for introspection (LastStats)
+	peerTier              Tier          // last tier received from the peer (TierActive if never)
+	ctlDrops              atomic.Uint64 // counts control frames dropped due to full send queue
+	lastPingSentNanos     int64         // nanos of the last ping sent by us
+	lastAcceptedEchoNanos int64         // nanos of the last accepted ping echo
+	staleEchoes           uint64        // count of rejected/stale echoes
 
 	ackMu sync.Mutex
 	acked chan struct{} // non-nil while a pushProfile()'d config is unacknowledged; see pushProfile/onPeerAck
@@ -452,7 +455,13 @@ func (rc *RateController) applyAIMD(stats AIMDStats) {
 	}
 
 	rttTooHigh := minRTT > 0 && stats.RTT > 0 && stats.RTT > minRTT*2
-	decrease := stats.LossPercent >= 2.0 || rttTooHigh || stats.KeyframeReqs > 2
+	// Rationale: with paced sending the tunnel RTT is dominated by our own pacing;
+	// loss is the real congestion signal (LossSource from the RTP reader;
+	// when no LossSource is wired loss stays 0 and AIMD only ever increases
+	// up to the ceiling — this is the intended behaviour until every joiner
+	// wires ReadTrackWithStats). Thus, a valid high RTT alone no longer decreases
+	// but blocks increases (by keeping rttOK for the increase gate).
+	decrease := stats.LossPercent >= 2.0 || (rttTooHigh && stats.LossPercent >= 0.5) || stats.KeyframeReqs > 2
 	if decrease {
 		next := int(float64(rc.aimd.maxFrameBytes) * 0.6)
 		rc.aimd.maxFrameBytes = clampInt(next, rc.cfg.AIMDFloor, ceiling)
@@ -550,11 +559,17 @@ func (rc *RateController) onPeerConfig(p Profile) {
 
 // sendControl sends a control frame on the tunnel.
 //
-// If the tunnel supports TrySendData, we use it to prevent blocking the read path
-// if the queue is full. Periodic frames (pings, stats) or resending configurations
-// and dropped acks can be dropped without stalling the entire data path.
+// If the tunnel supports SendControl, we prefer to use it to route control
+// frames through a dedicated control lane. If the tunnel only supports TrySendData,
+// we fall back to it to prevent blocking the read path if the queue is full.
+// Periodic frames (pings, stats) or resending configurations and dropped acks
+// can be dropped without stalling the entire data path.
 func (rc *RateController) sendControl(frame []byte) {
-	if tryer, ok := rc.tun.(interface{ TrySendData([]byte) bool }); ok {
+	if sender, ok := rc.tun.(interface{ SendControl([]byte) bool }); ok {
+		if !sender.SendControl(frame) {
+			rc.ctlDrops.Add(1)
+		}
+	} else if tryer, ok := rc.tun.(interface{ TrySendData([]byte) bool }); ok {
 		if !tryer.TrySendData(frame) {
 			rc.ctlDrops.Add(1)
 		}
@@ -581,8 +596,13 @@ func (rc *RateController) statsPingLoop() {
 }
 
 func (rc *RateController) sendPing() {
+	nowNanos := time.Now().UnixNano()
+	rc.mu.Lock()
+	rc.lastPingSentNanos = nowNanos
+	rc.mu.Unlock()
+
 	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], uint64(time.Now().UnixNano()))
+	binary.BigEndian.PutUint64(buf[:], uint64(nowNanos))
 	rc.sendControl(EncodeFrame(ControlConnID, MsgPing, buf[:]))
 }
 
@@ -627,13 +647,33 @@ func (rc *RateController) handlePeerStats(payload []byte) {
 	if total > 0 {
 		lossPct = float64(lostPackets) / float64(total) * 100
 	}
+
 	var rtt time.Duration
+	rc.mu.Lock()
+	lastSent := rc.lastPingSentNanos
+	lastAccepted := rc.lastAcceptedEchoNanos
+	pingInterval := rc.cfg.statsPingInterval()
+	rc.mu.Unlock()
+
 	if echoNanos > 0 {
-		rtt = time.Duration(time.Now().UnixNano() - echoNanos)
-		if rtt < 0 {
+		computedRtt := time.Duration(time.Now().UnixNano() - echoNanos)
+		if computedRtt < 0 {
+			computedRtt = 0
+		}
+
+		if (echoNanos == lastSent || (lastAccepted > 0 && echoNanos > lastAccepted)) && computedRtt <= 3*pingInterval {
+			rtt = computedRtt
+			rc.mu.Lock()
+			rc.lastAcceptedEchoNanos = echoNanos
+			rc.mu.Unlock()
+		} else {
 			rtt = 0
+			rc.mu.Lock()
+			rc.staleEchoes++
+			rc.mu.Unlock()
 		}
 	}
+
 	rc.mu.Lock()
 	feedback := rc.feedback
 	rc.mu.Unlock()
@@ -691,6 +731,7 @@ func (rc *RateController) logStatsLine(lastCounters *Counters) {
 	peerTier := rc.peerTier
 	maxFB := rc.aimd.maxFrameBytes
 	lastStats := rc.lastStats
+	staleEchoes := rc.staleEchoes
 
 	var bwe uint64
 	if rc.feedback != nil {
@@ -714,6 +755,11 @@ func (rc *RateController) logStatsLine(lastCounters *Counters) {
 		queue = q.QueueLen()
 	}
 
+	ctlQueue := 0
+	if cq, ok := rc.tun.(interface{ CtlQueueLen() int }); ok {
+		ctlQueue = cq.CtlQueueLen()
+	}
+
 	ctlDrops := rc.ctlDrops.Load()
 
 	var sentF, sentB, keepalives, recvF, recvB uint64
@@ -727,7 +773,7 @@ func (rc *RateController) logStatsLine(lastCounters *Counters) {
 		*lastCounters = current
 	}
 
-	rc.logFn("ratectl: stats tier=%s peerTier=%s fps=%d batch=%d maxFB=%d bwe=%d rtt=%s loss=%.1f%% kfReqs=%d sent=+%d/+%dB keepalives=+%d recv=+%d/+%dB queue=%d ctlDrops=%d",
+	rc.logFn("ratectl: stats tier=%s peerTier=%s fps=%d batch=%d maxFB=%d bwe=%d rtt=%s loss=%.1f%% kfReqs=%d sent=+%d/+%dB keepalives=+%d recv=+%d/+%dB queue=%d ctlDrops=%d ctlQ=%d staleEchoes=%d",
 		tier, peerTier, fps, batch, maxFB, bwe, lastStats.RTT, lastStats.LossPercent, lastStats.KeyframeReqs,
-		sentF, sentB, keepalives, recvF, recvB, queue, ctlDrops)
+		sentF, sentB, keepalives, recvF, recvB, queue, ctlDrops, ctlQueue, staleEchoes)
 }

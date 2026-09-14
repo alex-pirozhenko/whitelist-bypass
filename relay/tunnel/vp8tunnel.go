@@ -137,6 +137,7 @@ type VP8DataTunnel struct {
 	obf            *TunnelObfuscator
 	stopCh         chan struct{}
 	sendQueue      chan []byte
+	ctlQueue       chan []byte
 	cfgChan        chan struct{}
 
 	stopOnce sync.Once
@@ -220,6 +221,7 @@ func NewVP8DataTunnelWithQueue(track *webrtc.TrackLocalStaticSample, obf *Tunnel
 		logFn:           logFn,
 		stopCh:          make(chan struct{}),
 		sendQueue:       make(chan []byte, queueDepth),
+		ctlQueue:        make(chan []byte, 16),
 		cfgChan:         make(chan struct{}, 1),
 		fps:             defaultVP8FPS,
 		batch:           defaultVP8Batch,
@@ -339,6 +341,24 @@ func (t *VP8DataTunnel) QueueLen() int {
 		return len(t.sendQueue) + 1
 	}
 	return len(t.sendQueue)
+}
+
+func (t *VP8DataTunnel) CtlQueueLen() int {
+	return len(t.ctlQueue)
+}
+
+func (t *VP8DataTunnel) SendControl(frame []byte) bool {
+	if len(frame) == 0 {
+		return true
+	}
+	select {
+	case t.ctlQueue <- frame:
+		return true
+	case <-t.stopCh:
+		return false
+	default:
+		return false
+	}
 }
 
 func (t *VP8DataTunnel) SendData(data []byte) {
@@ -499,7 +519,14 @@ func (t *VP8DataTunnel) writerLoop() {
 			case <-t.cfgChan:
 				reconfigure = true
 			case <-ticker.C:
-				drainOne := func() ([]byte, bool) {
+				drainOne := func(allowControl bool) ([]byte, bool, bool) {
+					if allowControl {
+						select {
+						case v := <-t.ctlQueue:
+							return v, true, true
+						default:
+						}
+					}
 					t.overflowMu.Lock()
 					hasOverflow := len(t.overflow) > 0
 					var v []byte
@@ -509,17 +536,17 @@ func (t *VP8DataTunnel) writerLoop() {
 					}
 					t.overflowMu.Unlock()
 					if hasOverflow {
-						return v, true
+						return v, true, false
 					}
 					select {
 					case v := <-t.sendQueue:
-						return v, true
+						return v, true, false
 					default:
-						return nil, false
+						return nil, false, false
 					}
 				}
 
-				first, ok := drainOne()
+				first, ok, isControl := drainOne(true)
 				if !ok {
 					idle++
 					if idle < keepaliveEvery {
@@ -532,11 +559,18 @@ func (t *VP8DataTunnel) writerLoop() {
 				}
 				idle = 0
 
+				if isControl {
+					// Control frames must not wait behind the data backlog or RTT/ack signals measure our own queue.
+					// They are sent on their own tick and never coalesced with data.
+					sendFrame(first)
+					continue
+				}
+
 				maxFB := t.currentMaxFrameBytes()
 				combined := first
 				if maxFB > 0 {
 					for len(combined) < maxFB {
-						next, ok := drainOne()
+						next, ok, _ := drainOne(false)
 						if !ok {
 							break
 						}

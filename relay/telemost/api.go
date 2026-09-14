@@ -295,6 +295,14 @@ func SetSlotsMessage(key int) map[string]interface{} {
 	return slotsMessageWithSizes(key, StartupSlotSizes[len(StartupSlotSizes)-1], rnd)
 }
 
+func SetSlotsShutdownMessage(key int) map[string]interface{} {
+	msg := slotsMessageWithSizes(key, StartupSlotSizes[0], nil)
+	if setSlots, ok := msg["setSlots"].(map[string]interface{}); ok {
+		setSlots["shutdownAllVideo"] = true
+	}
+	return msg
+}
+
 func SetSlotsMessageWithSize(key, width, height int) map[string]interface{} {
 	template := make([][2]int, 12)
 	for i := range template {

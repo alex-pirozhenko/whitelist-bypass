@@ -54,3 +54,36 @@ func TestSetSlotsMessageWithSize(t *testing.T) {
 		}
 	}
 }
+
+func TestSetSlotsShutdownMessage(t *testing.T) {
+	key := 123
+	msg := SetSlotsShutdownMessage(key)
+
+	setSlots, ok := msg["setSlots"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing or invalid setSlots field")
+	}
+
+	if msgKey, _ := setSlots["key"].(int); msgKey != key {
+		t.Errorf("expected key %d, got %v", key, setSlots["key"])
+	}
+
+	if shutdown, _ := setSlots["shutdownAllVideo"].(bool); !shutdown {
+		t.Errorf("expected shutdownAllVideo to be true, got %v", setSlots["shutdownAllVideo"])
+	}
+
+	slots, ok := setSlots["slots"].([]map[string]interface{})
+	if !ok {
+		t.Fatal("missing or invalid slots field")
+	}
+	if len(slots) != 12 {
+		t.Fatalf("expected 12 slots, got %d", len(slots))
+	}
+	for i, slot := range slots {
+		w, _ := slot["width"].(int)
+		h, _ := slot["height"].(int)
+		if w != 0 || h != 0 {
+			t.Errorf("slot %d: expected 0x0, got %dx%d", i, w, h)
+		}
+	}
+}

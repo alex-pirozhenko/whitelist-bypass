@@ -157,6 +157,7 @@ type VP8DataTunnel struct {
 	sentBytes       atomic.Uint64
 	recvFrames      atomic.Uint64
 	recvBytes       atomic.Uint64
+	badFrames       atomic.Uint64
 	keepaliveFrames atomic.Uint64
 
 	OnData        func([]byte)
@@ -179,6 +180,7 @@ type Counters struct {
 	Keepalives uint64
 	RecvFrames uint64
 	RecvBytes  uint64
+	BadFrames  uint64 // carrier frames the obfuscator rejected (see VP8DataTunnel.HandleFrame)
 }
 
 func (t *VP8DataTunnel) Counters() Counters {
@@ -188,6 +190,7 @@ func (t *VP8DataTunnel) Counters() Counters {
 		Keepalives: t.keepaliveFrames.Load(),
 		RecvFrames: t.recvFrames.Load(),
 		RecvBytes:  t.recvBytes.Load(),
+		BadFrames:  t.badFrames.Load(),
 	}
 }
 
@@ -596,6 +599,12 @@ func (t *VP8DataTunnel) writerLoop() {
 func (t *VP8DataTunnel) HandleFrame(frame []byte) {
 	res := t.obf.Decode(frame)
 	if !res.HasFrame {
+		// Not a keepalive either: a frame that failed to authenticate.
+		// Every such frame is a hole in the inner byte stream, so count it
+		// and say so (the stats line carries the delta as bad=+n).
+		if n := t.badFrames.Add(1); n <= 3 || n%200 == 0 {
+			t.logFn("vp8tunnel: undecodable frame #%d (%dB)", n, len(frame))
+		}
 		return
 	}
 	if res.SelfEcho {

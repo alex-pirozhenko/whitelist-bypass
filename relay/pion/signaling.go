@@ -261,6 +261,7 @@ type vp8FrameReassembler struct {
 type feedResult struct {
 	Frame        []byte
 	IsDuplicate  bool
+	IsLate       bool // older than the last accepted packet; ignored, counted in RecvStats.Reordered
 	UnmarshalErr error
 	LogFirstPkts bool
 	VP8S         uint8
@@ -276,7 +277,6 @@ type feedResult struct {
 func (r *vp8FrameReassembler) feed(pkt *rtp.Packet, verbose bool) (res feedResult) {
 	r.stats.RecvPackets++
 
-	isLate := false
 	if r.haveLastSeq {
 		if pkt.SequenceNumber == r.lastSeq {
 			res.IsDuplicate = true
@@ -290,15 +290,22 @@ func (r *vp8FrameReassembler) feed(pkt *rtp.Packet, verbose bool) (res feedResul
 				r.frameValid = false
 				r.frameBuf = r.frameBuf[:0]
 			} else {
+				// Older than the last packet we accepted: a stale re-send (the
+				// SFU pads and probes with repeats of earlier packets) or a
+				// genuinely late packet. Either way it must NOT go into the
+				// frame being assembled -- appending it produced a frame that
+				// failed authentication and was dropped silently, a byte hole
+				// in the inner TCP stream that no loss counter could see
+				// (letmeout 2026-09-14: transfers ending in curl rc56 with
+				// loss=0.0% on both legs).
 				r.stats.Reordered++
-				isLate = true
+				res.IsLate = true
+				return res
 			}
 		}
 	}
-	if !isLate {
-		r.lastSeq = pkt.SequenceNumber
-		r.haveLastSeq = true
-	}
+	r.lastSeq = pkt.SequenceNumber
+	r.haveLastSeq = true
 
 	vp8Payload, err := r.vp8Pkt.Unmarshal(pkt.Payload)
 	if err != nil {
@@ -356,6 +363,15 @@ func readVP8Track(track *webrtc.TrackRemote, handler func([]byte), logFn func(st
 
 		res := r.feed(pkt, verbose)
 		if res.IsDuplicate {
+			continue
+		}
+		if res.IsLate {
+			if n := r.stats.Reordered; n <= 3 || n%500 == 0 {
+				logFn("%s: late/stale rtp packet seq=%d (last=%d) ignored, total=%d", prefix, pkt.SequenceNumber, r.lastSeq, n)
+			}
+			if onStats != nil {
+				onStats(r.stats)
+			}
 			continue
 		}
 

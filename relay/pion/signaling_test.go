@@ -193,3 +193,32 @@ func TestVP8FrameReassembler_Feed(t *testing.T) {
 		}
 	})
 }
+
+// A stale re-send of an older packet (the SFU repeats earlier packets as
+// padding/probing) must not end up inside the frame being assembled, and it
+// must not reset the frame either: the frame that was in flight completes.
+func TestLatePacketIgnoredMidFrame(t *testing.T) {
+	r := &vp8FrameReassembler{}
+	mk := func(seq uint16, s uint8, marker bool, body byte) *rtp.Packet {
+		// VP8 payload descriptor: X=0, S bit, PID 0; then one payload byte.
+		return &rtp.Packet{Header: rtp.Header{SequenceNumber: seq, Marker: marker}, Payload: []byte{s << 4, body}}
+	}
+	if res := r.feed(mk(100, 1, false, 0xA1), false); res.Frame != nil || res.IsLate {
+		t.Fatalf("first packet: %+v", res)
+	}
+	// stale repeat of an older packet arrives mid-frame
+	res := r.feed(mk(97, 1, true, 0xEE), false)
+	if !res.IsLate || res.Frame != nil {
+		t.Fatalf("stale packet should be ignored: %+v", res)
+	}
+	if r.stats.Reordered != 1 || r.stats.Gaps != 0 || r.stats.LostPackets != 0 {
+		t.Fatalf("stats after stale packet: %+v", r.stats)
+	}
+	res = r.feed(mk(101, 0, true, 0xA2), false)
+	if res.Frame == nil || len(res.Frame) != 2 || res.Frame[0] != 0xA1 || res.Frame[1] != 0xA2 {
+		t.Fatalf("frame in flight should complete untouched: %+v", res)
+	}
+	if r.lastSeq != 101 {
+		t.Fatalf("lastSeq moved by the stale packet: %d", r.lastSeq)
+	}
+}

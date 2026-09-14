@@ -25,8 +25,8 @@ const (
 	kcpStatsEvery     = 500
 
 	kcpWindowFloor      = 64
-	kcpWindowCeiling    = 512
-	kcpCarrierRTT       = 250 * time.Millisecond
+	kcpWindowCeiling    = 4096
+	kcpCarrierRTT       = 1 * time.Second
 	kcpWaitSndFactor    = 2
 	kcpBackpressurePoll = 2 * time.Millisecond
 
@@ -36,12 +36,20 @@ const (
 	KCPCarrierQueueDepth = kcpWaitSndFactor * kcpWindowCeiling
 )
 
-func computeKCPWindow(fps, batch int) int {
-	rate := fps * batch
-	if rate < 1 {
-		rate = defaultVP8FPS * defaultVP8Batch
+func computeKCPWindowFor(fps, batch, maxFrameBytes int) int {
+	ticks := fps * batch
+	if ticks < 1 {
+		ticks = defaultVP8FPS * defaultVP8Batch
 	}
-	window := int(float64(rate) * kcpCarrierRTT.Seconds())
+	segsPerTick := 1
+	if maxFrameBytes > 0 {
+		segsPerTick = (maxFrameBytes + kcpSegmentMTU - 1) / kcpSegmentMTU
+		if segsPerTick < 1 {
+			segsPerTick = 1
+		}
+	}
+	w := float64(ticks*segsPerTick) * kcpCarrierRTT.Seconds()
+	window := int(w)
 	if window < kcpWindowFloor {
 		return kcpWindowFloor
 	}
@@ -51,6 +59,14 @@ func computeKCPWindow(fps, batch int) int {
 	return window
 }
 
+func computeKCPWindow(fps, batch int) int {
+	return computeKCPWindowFor(fps, batch, 0)
+}
+
+var kcpWndSize = func(k *kcp.KCP, snd, rcv int) {
+	k.WndSize(snd, rcv)
+}
+
 type trackKCPSession struct {
 	conv    uint32
 	vp8     *VP8DataTunnel
@@ -58,6 +74,8 @@ type trackKCPSession struct {
 	kcpMu   sync.Mutex
 	kcp     *kcp.KCP
 	recvBuf []byte
+	outQ    chan []byte
+	stopCh  chan struct{}
 }
 
 func newTrackKCPSession(parent *MultiTrackKCPTunnel, vp8 *VP8DataTunnel, conv uint32, window int) *trackKCPSession {
@@ -66,6 +84,8 @@ func newTrackKCPSession(parent *MultiTrackKCPTunnel, vp8 *VP8DataTunnel, conv ui
 		vp8:     vp8,
 		parent:  parent,
 		recvBuf: make([]byte, kcpReceiveBufSize),
+		outQ:    make(chan []byte, KCPCarrierQueueDepth),
+		stopCh:  make(chan struct{}),
 	}
 	session.kcp = kcp.NewKCP(conv, func(buf []byte, size int) {
 		if size <= 0 {
@@ -75,19 +95,42 @@ func newTrackKCPSession(parent *MultiTrackKCPTunnel, vp8 *VP8DataTunnel, conv ui
 		segment[0] = kcpChannelReliable
 		copy(segment[1:], buf[:size])
 		parent.outputSegments.Add(1)
-		if !session.vp8.TrySendData(segment) {
+		select {
+		case session.outQ <- segment:
+		default:
 			parent.droppedSegments.Add(1)
 		}
 	})
 	session.kcp.NoDelay(1, 10, 2, 1)
-	session.kcp.WndSize(window, window)
+	kcpWndSize(session.kcp, window, kcpWindowCeiling)
 	session.kcp.SetMtu(kcpSegmentMTU)
+	go session.pump()
 	return session
+}
+
+func (s *trackKCPSession) pump() {
+	for {
+		select {
+		case <-s.parent.stopCh:
+			return
+		case <-s.stopCh:
+			return
+		case seg, ok := <-s.outQ:
+			if !ok {
+				return
+			}
+			s.vp8.SendData(seg)
+		}
+	}
+}
+
+func (s *trackKCPSession) stop() {
+	close(s.stopCh)
 }
 
 func (s *trackKCPSession) setWindow(window int) {
 	s.kcpMu.Lock()
-	s.kcp.WndSize(window, window)
+	kcpWndSize(s.kcp, window, kcpWindowCeiling)
 	s.kcpMu.Unlock()
 }
 
@@ -139,12 +182,13 @@ type MultiTrackKCPTunnel struct {
 	mt    *MultiTrackTunnel
 	logFn func(string, ...any)
 
-	mu       sync.Mutex
-	sessions []*trackKCPSession
-	convMap  map[uint32]*trackKCPSession
-	connPin  map[uint32]int
-	onData   func([]byte)
-	onClose  func()
+	mu        sync.Mutex
+	lastMaxFB int
+	sessions  []*trackKCPSession
+	convMap   map[uint32]*trackKCPSession
+	connPin   map[uint32]int
+	onData    func([]byte)
+	onClose   func()
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -313,13 +357,137 @@ func (t *MultiTrackKCPTunnel) SetOnClose(fn func()) {
 	t.mu.Unlock()
 }
 
+func (t *MultiTrackKCPTunnel) SetProfile(p Profile) {
+	t.mt.SetProfile(p)
+	if p.MaxFrameBytes > 0 {
+		t.mu.Lock()
+		t.lastMaxFB = p.MaxFrameBytes
+		t.mu.Unlock()
+	}
+	t.mu.Lock()
+	lastMaxFB := t.lastMaxFB
+	t.mu.Unlock()
+
+	fps, batch := t.FPS(), t.Batch()
+	window := computeKCPWindowFor(fps, batch, lastMaxFB)
+	t.applyWindow(window)
+}
+
+func (t *MultiTrackKCPTunnel) Counters() Counters {
+	return t.mt.Counters()
+}
+
+func (t *MultiTrackKCPTunnel) FPS() int {
+	subs := t.mt.SubTunnels()
+	if len(subs) > 0 {
+		return subs[0].FPS()
+	}
+	return defaultVP8FPS
+}
+
+func (t *MultiTrackKCPTunnel) Batch() int {
+	subs := t.mt.SubTunnels()
+	if len(subs) > 0 {
+		return subs[0].Batch()
+	}
+	return defaultVP8Batch
+}
+
 func (t *MultiTrackKCPTunnel) Reconfigure(fps, batch int) {
 	t.mt.Reconfigure(fps, batch)
-	window := computeKCPWindow(fps, batch)
+	t.mu.Lock()
+	lastMaxFB := t.lastMaxFB
+	t.mu.Unlock()
+	window := computeKCPWindowFor(fps, batch, lastMaxFB)
 	t.applyWindow(window)
 	if t.logFn != nil {
 		t.logFn("kcptunnel: reconfigure fps=%d batch=%d -> window=%d", fps, batch, window)
 	}
+}
+
+func (t *MultiTrackKCPTunnel) SendControl(frame []byte) bool {
+	t.mu.Lock()
+	if len(t.sessions) == 0 {
+		t.mu.Unlock()
+		return false
+	}
+	session0 := t.sessions[0]
+	t.mu.Unlock()
+
+	segment := make([]byte, len(frame)+1)
+	segment[0] = kcpChannelRaw
+	copy(segment[1:], frame)
+
+	return session0.vp8.SendControl(segment)
+}
+
+func (t *MultiTrackKCPTunnel) CtlQueueLen() int {
+	t.mu.Lock()
+	if len(t.sessions) == 0 {
+		t.mu.Unlock()
+		return 0
+	}
+	session0 := t.sessions[0]
+	t.mu.Unlock()
+
+	return session0.vp8.CtlQueueLen()
+}
+
+func (t *MultiTrackKCPTunnel) QueueLen() int {
+	t.mu.Lock()
+	sessions := make([]*trackKCPSession, len(t.sessions))
+	copy(sessions, t.sessions)
+	t.mu.Unlock()
+
+	total := 0
+	for _, session := range sessions {
+		total += session.waitSnd() + len(session.outQ)
+	}
+	return total
+}
+
+func (t *MultiTrackKCPTunnel) TrySendData(frame []byte) bool {
+	if len(frame) < 9 {
+		return false
+	}
+	connID := binary.BigEndian.Uint32(frame[4:8])
+	msgType := frame[8]
+
+	if msgType == MsgUDP || msgType == MsgUDPReply {
+		t.sendRaw(connID, frame)
+		return true
+	}
+	t.wake()
+
+	t.mu.Lock()
+	if len(t.sessions) == 0 {
+		t.mu.Unlock()
+		return false
+	}
+	index, pinned := t.connPin[connID]
+	if !pinned || index >= len(t.sessions) {
+		index = int(connID % uint32(len(t.sessions)))
+		t.connPin[connID] = index
+	}
+	session := t.sessions[index]
+	t.mu.Unlock()
+
+	if msgType == MsgData {
+		sndCap := int(t.currentWindow.Load()) * kcpWaitSndFactor
+		if session.waitSnd() >= sndCap {
+			return false
+		}
+	}
+
+	t.sentMessages.Add(1)
+	session.send(frame)
+
+	if msgType == MsgClose {
+		t.mu.Lock()
+		delete(t.connPin, connID)
+		t.mu.Unlock()
+	}
+	return true
 }
 
 func (t *MultiTrackKCPTunnel) applyWindow(window int) {
@@ -353,6 +521,8 @@ func (t *MultiTrackKCPTunnel) RemoveLastSession() {
 	t.sessions = t.sessions[:len(t.sessions)-1]
 	delete(t.convMap, last.conv)
 	t.mu.Unlock()
+
+	last.stop()
 }
 
 func (t *MultiTrackKCPTunnel) Stop() {

@@ -41,6 +41,7 @@ type TelemostHeadlessJoiner struct {
 	PCConfig          PeerConnectionConfigurer
 	AddTracks         AddTunnelTracksFunc
 	ReadTrackFn       ReadTrackFunc
+	ReadTrackStatsFn  ReadTrackStatsFunc
 
 	joinLink    string
 	displayName string
@@ -58,13 +59,19 @@ type TelemostHeadlessJoiner struct {
 	pubRemoteSet bool
 	pubPending   []webrtc.ICECandidateInit
 
-	sampleTrack *webrtc.TrackLocalStaticSample
-	vp8tunnel   *tunnel.VP8DataTunnel
-	obf         *tunnel.TunnelObfuscator
-	vp8FPS      int
-	vp8Batch    int
-	reliable    bool
-	dualTrack   bool
+	sampleTrack  *webrtc.TrackLocalStaticSample
+	vp8tunnel    *tunnel.VP8DataTunnel
+	obf          *tunnel.TunnelObfuscator
+	vp8FPS       int
+	vp8Batch     int
+	reliable     bool
+	reliableAuto bool
+	dualTrack    bool
+
+	kcptun   *tunnel.MultiTrackKCPTunnel
+	lossRecv atomic.Uint64
+	lossGaps atomic.Uint64
+	lossLost atomic.Uint64
 
 	httpClient *http.Client
 	instanceID string
@@ -130,6 +137,7 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 		VP8FPS                 int    `json:"vp8Fps"`
 		VP8Batch               int    `json:"vp8Batch"`
 		Reliable               bool   `json:"reliable"`
+		ReliableAuto           bool   `json:"reliableAuto"`
 		DualTrack              bool   `json:"dualTrack"`
 		TunnelSecret           string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
 		DisableSubscriberAudio bool   `json:"disableSubscriberAudio"`
@@ -167,6 +175,7 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	j.vp8FPS = params.VP8FPS
 	j.vp8Batch = params.VP8Batch
 	j.reliable = params.Reliable
+	j.reliableAuto = params.ReliableAuto
 	j.dualTrack = params.DualTrack
 	j.disableSubscriberAudio = params.DisableSubscriberAudio
 	j.idleUnsubscribeVideo = params.IdleUnsubscribeVideo
@@ -175,9 +184,9 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	j.activeRembBps = params.ActiveRembBps
 	j.idleSlotWidth = params.IdleSlotWidth
 	j.idleSlotHeight = params.IdleSlotHeight
-	j.logFn("telemost-joiner: link=%s name=%s vp8Fps=%d vp8Batch=%d dualTrack=%v localEpoch=0x%08x remb=%d/%d idleSlot=%dx%d subAudio=%v idleUnsubscribeVideo=%v subscriberAudioOff=%v",
+	j.logFn("telemost-joiner: link=%s name=%s vp8Fps=%d vp8Batch=%d dualTrack=%v localEpoch=0x%08x remb=%d/%d idleSlot=%dx%d subAudio=%v idleUnsubscribeVideo=%v subscriberAudioOff=%v reliable=%v reliableAuto=%v",
 		j.joinLink, j.displayName, params.VP8FPS, params.VP8Batch, j.dualTrack, obf.LocalEpoch(),
-		j.idleRembBps, j.activeRembBps, j.idleSlotWidth, j.idleSlotHeight, j.disableSubscriberAudio, j.idleUnsubscribeVideo, j.subscriberAudioOff)
+		j.idleRembBps, j.activeRembBps, j.idleSlotWidth, j.idleSlotHeight, j.disableSubscriberAudio, j.idleUnsubscribeVideo, j.subscriberAudioOff, j.reliable, j.reliableAuto)
 
 	j.Status.EmitStatus(common.StatusConnecting)
 	if err := j.runOnce(); err != nil {
@@ -284,6 +293,38 @@ func (j *TelemostHeadlessJoiner) resetSessionState() {
 		j.rembCancel = nil
 	}
 	j.rembLoopMu.Unlock()
+
+	if j.kcptun != nil {
+		j.kcptun.StopLayer()
+		j.kcptun = nil
+	}
+}
+
+func (j *TelemostHeadlessJoiner) trackStatsSink() func(recv, gaps, lost uint64) {
+	var prevRecv, prevGaps, prevLost uint64
+	return func(recv, gaps, lost uint64) {
+		dRecv := recv - prevRecv
+		dGaps := gaps - prevGaps
+		dLost := lost - prevLost
+
+		if recv < prevRecv {
+			dRecv = recv
+			dGaps = gaps
+			dLost = lost
+		}
+
+		prevRecv = recv
+		prevGaps = gaps
+		prevLost = lost
+
+		j.lossRecv.Add(dRecv)
+		j.lossGaps.Add(dGaps)
+		j.lossLost.Add(dLost)
+	}
+}
+
+func (j *TelemostHeadlessJoiner) RecvLossStats() (recvPackets, gaps, lostPackets uint64) {
+	return j.lossRecv.Load(), j.lossGaps.Load(), j.lossLost.Load()
 }
 
 func (j *TelemostHeadlessJoiner) Close() {
@@ -539,11 +580,20 @@ func (j *TelemostHeadlessJoiner) initPC() {
 			j.videoSSRC = uint32(track.SSRC())
 			j.videoSSRCMu.Unlock()
 		}
-		go j.ReadTrackFn(track, func(frame []byte) {
-			if j.vp8tunnel != nil {
-				j.vp8tunnel.HandleFrame(frame)
-			}
-		}, j.logFn, "telemost-joiner")
+		if j.ReadTrackStatsFn != nil {
+			sink := j.trackStatsSink()
+			go j.ReadTrackStatsFn(track, func(frame []byte) {
+				if j.vp8tunnel != nil {
+					j.vp8tunnel.HandleFrame(frame)
+				}
+			}, j.logFn, "telemost-joiner", sink)
+		} else {
+			go j.ReadTrackFn(track, func(frame []byte) {
+				if j.vp8tunnel != nil {
+					j.vp8tunnel.HandleFrame(frame)
+				}
+			}, j.logFn, "telemost-joiner")
+		}
 	})
 
 	pubPC, err := api.NewPeerConnection(config)
@@ -579,28 +629,40 @@ func (j *TelemostHeadlessJoiner) initPC() {
 			var active tunnel.DataTunnel = vp8tun
 			if j.reliable {
 				mt := tunnel.NewMultiTrackTunnel([]*tunnel.VP8DataTunnel{vp8tun})
-				active = tunnel.NewMultiTrackKCPTunnel(mt, j.logFn)
+				j.kcptun = tunnel.NewMultiTrackKCPTunnel(mt, j.logFn)
+				active = j.kcptun
 				j.logFn("telemost-joiner: per-track kcp reliability active over video tunnel")
-			}
-			if !j.configAck.acknowledged() {
-				trackCount := 1
-				if j.dualTrack {
-					trackCount = 2
+
+				j.activateTunnel(active, vp8tun)
+			} else if j.reliableAuto {
+				var firstMu sync.Mutex
+				firstDone := false
+				var first func([]byte)
+				first = func(payload []byte) {
+					firstMu.Lock()
+					if firstDone {
+						firstMu.Unlock()
+						return
+					}
+					firstDone = true
+					firstMu.Unlock()
+
+					activeTunnel, kcpTun := selectActiveTunnel(vp8tun, payload, j.logFn)
+					j.kcptun = kcpTun
+
+					activeTunnel = j.activateTunnel(activeTunnel, vp8tun)
+
+					if j.kcptun != nil {
+						j.kcptun.InjectSegment(payload)
+					} else {
+						if onData := vp8tun.OnData; onData != nil {
+							onData(payload)
+						}
+					}
 				}
-				acked, cancel := j.configAck.arm()
-				go sendVP8ConfigUntilAcked(acked, cancel, j.stopCh, active,
-					vp8tun.FPS(), vp8tun.Batch(), trackCount, j.logFn, "telemost-joiner")
-				j.logFn("telemost-joiner: pushed vp8 config to creator fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
-			}
-			// The wrapper is what routes the rate controller's tier edges into
-			// HintBandwidth, so EVERY tier-driven hint has to be in this
-			// condition -- idleUnsubscribeVideo was left out when it was
-			// added and never fired on the phone (2026-09-14 sweep).
-			if j.idleRembBps > 0 || j.activeRembBps > 0 || (j.idleSlotWidth > 0 && j.idleSlotHeight > 0) || j.idleUnsubscribeVideo {
-				active = newTelemostTunnelWrapper(active, j)
-			}
-			if j.OnConnected != nil {
-				j.OnConnected(active)
+				vp8tun.SetOnData(first)
+			} else {
+				j.activateTunnel(active, vp8tun)
 			}
 		}
 	})
@@ -1169,4 +1231,44 @@ func setTransceiverDirection(t *webrtc.RTPTransceiver, d webrtc.RTPTransceiverDi
 		return fmt.Errorf("setTransceiverDirection: only inactive is supported, got %s", d)
 	}
 	return t.Stop()
+}
+
+func selectActiveTunnel(vp8 *tunnel.VP8DataTunnel, firstPayload []byte, logFn func(string, ...any)) (tunnel.DataTunnel, *tunnel.MultiTrackKCPTunnel) {
+	if !tunnel.LooksLikeRelayFrame(firstPayload) {
+		mt := tunnel.NewMultiTrackTunnel([]*tunnel.VP8DataTunnel{vp8})
+		kcp := tunnel.NewMultiTrackKCPTunnel(mt, logFn)
+		if logFn != nil {
+			logFn("telemost-joiner: peer speaks kcp; per-track kcp reliability active (auto)")
+		}
+		return kcp, kcp
+	} else {
+		if logFn != nil {
+			logFn("telemost-joiner: peer speaks raw relay frames; no kcp (auto)")
+		}
+		return vp8, nil
+	}
+}
+
+func (j *TelemostHeadlessJoiner) activateTunnel(active tunnel.DataTunnel, vp8tun *tunnel.VP8DataTunnel) tunnel.DataTunnel {
+	if !j.configAck.acknowledged() {
+		trackCount := 1
+		if j.dualTrack {
+			trackCount = 2
+		}
+		acked, cancel := j.configAck.arm()
+		go sendVP8ConfigUntilAcked(acked, cancel, j.stopCh, active,
+			vp8tun.FPS(), vp8tun.Batch(), trackCount, j.logFn, "telemost-joiner")
+		j.logFn("telemost-joiner: pushed vp8 config to creator fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
+	}
+	// The wrapper is what routes the rate controller's tier edges into
+	// HintBandwidth, so EVERY tier-driven hint has to be in this
+	// condition -- idleUnsubscribeVideo was left out when it was
+	// added and never fired on the phone (2026-09-14 sweep).
+	if j.idleRembBps > 0 || j.activeRembBps > 0 || (j.idleSlotWidth > 0 && j.idleSlotHeight > 0) || j.idleUnsubscribeVideo {
+		active = newTelemostTunnelWrapper(active, j)
+	}
+	if j.OnConnected != nil {
+		j.OnConnected(active)
+	}
+	return active
 }

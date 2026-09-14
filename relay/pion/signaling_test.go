@@ -77,7 +77,7 @@ func TestVP8FrameReassembler_Feed(t *testing.T) {
 		if r.stats.Gaps != 1 {
 			t.Errorf("expected Gaps=1, got %d", r.stats.Gaps)
 		}
-		expectedLost := uint64(pkts1[2].SequenceNumber - pkts1[0].SequenceNumber)
+		expectedLost := uint64(pkts1[2].SequenceNumber - pkts1[0].SequenceNumber - 1)
 		if r.stats.LostPackets != expectedLost {
 			t.Errorf("expected LostPackets=%d, got %d", expectedLost, r.stats.LostPackets)
 		}
@@ -149,8 +149,47 @@ func TestVP8FrameReassembler_Feed(t *testing.T) {
 		if r.stats.Gaps != 1 {
 			t.Errorf("expected Gaps=1, got %d", r.stats.Gaps)
 		}
-		if r.stats.LostPackets != 2 {
-			t.Errorf("expected LostPackets=2, got %d", r.stats.LostPackets)
+		if r.stats.LostPackets != 1 {
+			t.Errorf("expected LostPackets=1, got %d", r.stats.LostPackets)
+		}
+	})
+
+	// 5. Forward gap and late/reordered packet
+	t.Run("GapAndLatePackets", func(t *testing.T) {
+		r := &vp8FrameReassembler{}
+		r.haveLastSeq = true
+		r.lastSeq = 100
+
+		// Forward gap from 100 to 105
+		pkt := &rtp.Packet{}
+		pkt.SequenceNumber = 105
+		pkt.Payload = []byte{0x10, 0x20} // non-empty so Unmarshal is happy
+		r.feed(pkt, false)
+
+		if r.stats.Gaps != 1 {
+			t.Errorf("expected Gaps=1, got %d", r.stats.Gaps)
+		}
+		if r.stats.LostPackets != 4 {
+			t.Errorf("expected LostPackets=4, got %d", r.stats.LostPackets)
+		}
+		if r.lastSeq != 105 {
+			t.Errorf("expected lastSeq=105, got %d", r.lastSeq)
+		}
+
+		// A late packet: seq 103 after 105
+		pktLate := &rtp.Packet{}
+		pktLate.SequenceNumber = 103
+		pktLate.Payload = []byte{0x10, 0x20}
+		r.feed(pktLate, false)
+
+		if r.stats.Reordered != 1 {
+			t.Errorf("expected Reordered=1, got %d", r.stats.Reordered)
+		}
+		if r.stats.LostPackets != 4 {
+			t.Errorf("expected LostPackets=4, got %d", r.stats.LostPackets)
+		}
+		if r.lastSeq != 105 {
+			t.Errorf("expected lastSeq to stay 105, got %d", r.lastSeq)
 		}
 	})
 }

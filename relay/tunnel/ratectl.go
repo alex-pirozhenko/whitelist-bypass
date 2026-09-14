@@ -132,6 +132,8 @@ type AIMDStats struct {
 	LossPercent  float64       // 0-100
 	RTT          time.Duration // 0 = "unknown this window" (treated as non-blocking for increases, and never triggers the RTT-based decrease rule)
 	KeyframeReqs int           // count of keyframe-request events observed since the PREVIOUS applyAIMD call
+	RecvPackets  uint64
+	LostPackets  uint64
 }
 
 const aimdPacketBytes = 1200 // "one packet's worth" per the spec's increase step
@@ -197,8 +199,10 @@ type RateController struct {
 	aimd                  aimdState
 	lastPeerPingNanos     int64
 	lastKeyframeReqCount  uint64
-	lastStats             AIMDStats     // most recent AIMDStats handlePeerStats computed, for introspection (LastStats)
-	peerTier              Tier          // last tier received from the peer (TierActive if never)
+	lastStats             AIMDStats // most recent AIMDStats handlePeerStats computed, for introspection (LastStats)
+	peerTier              Tier      // last tier received from the peer (TierActive if never)
+	prevPeerRecv          uint64
+	prevPeerLost          uint64
 	ctlDrops              atomic.Uint64 // counts control frames dropped due to full send queue
 	lastPingSentNanos     int64         // nanos of the last ping sent by us
 	lastAcceptedEchoNanos int64         // nanos of the last accepted ping echo
@@ -642,18 +646,29 @@ func (rc *RateController) handlePeerStats(payload []byte) {
 	lostPackets := binary.BigEndian.Uint64(payload[16:24])
 	echoNanos := int64(binary.BigEndian.Uint64(payload[24:32]))
 
-	var lossPct float64
-	total := recvPackets + lostPackets
-	if total > 0 {
-		lossPct = float64(lostPackets) / float64(total) * 100
-	}
-
+	var dRecv, dLost uint64
 	var rtt time.Duration
 	rc.mu.Lock()
+	if recvPackets < rc.prevPeerRecv {
+		dRecv = recvPackets
+		dLost = lostPackets
+	} else {
+		dRecv = recvPackets - rc.prevPeerRecv
+		dLost = lostPackets - rc.prevPeerLost
+	}
+	rc.prevPeerRecv = recvPackets
+	rc.prevPeerLost = lostPackets
+
 	lastSent := rc.lastPingSentNanos
 	lastAccepted := rc.lastAcceptedEchoNanos
 	pingInterval := rc.cfg.statsPingInterval()
 	rc.mu.Unlock()
+
+	var lossPct float64
+	dTotal := dRecv + dLost
+	if dTotal > 0 {
+		lossPct = float64(dLost) / float64(dTotal) * 100
+	}
 
 	if echoNanos > 0 {
 		computedRtt := time.Duration(time.Now().UnixNano() - echoNanos)
@@ -688,7 +703,7 @@ func (rc *RateController) handlePeerStats(payload []byte) {
 			kfReqs = int(cur - prev)
 		}
 	}
-	stats := AIMDStats{LossPercent: lossPct, RTT: rtt, KeyframeReqs: kfReqs}
+	stats := AIMDStats{LossPercent: lossPct, RTT: rtt, KeyframeReqs: kfReqs, RecvPackets: dRecv, LostPackets: dLost}
 	rc.mu.Lock()
 	rc.lastStats = stats
 	rc.mu.Unlock()
@@ -773,7 +788,7 @@ func (rc *RateController) logStatsLine(lastCounters *Counters) {
 		*lastCounters = current
 	}
 
-	rc.logFn("ratectl: stats tier=%s peerTier=%s fps=%d batch=%d maxFB=%d bwe=%d rtt=%s loss=%.1f%% kfReqs=%d sent=+%d/+%dB keepalives=+%d recv=+%d/+%dB queue=%d ctlDrops=%d ctlQ=%d staleEchoes=%d",
-		tier, peerTier, fps, batch, maxFB, bwe, lastStats.RTT, lastStats.LossPercent, lastStats.KeyframeReqs,
+	rc.logFn("ratectl: stats tier=%s peerTier=%s fps=%d batch=%d maxFB=%d bwe=%d rtt=%s loss=%.1f%%(+%d/+%d) kfReqs=%d sent=+%d/+%dB keepalives=+%d recv=+%d/+%dB queue=%d ctlDrops=%d ctlQ=%d staleEchoes=%d",
+		tier, peerTier, fps, batch, maxFB, bwe, lastStats.RTT, lastStats.LossPercent, lastStats.LostPackets, lastStats.RecvPackets, lastStats.KeyframeReqs,
 		sentF, sentB, keepalives, recvF, recvB, queue, ctlDrops, ctlQueue, staleEchoes)
 }

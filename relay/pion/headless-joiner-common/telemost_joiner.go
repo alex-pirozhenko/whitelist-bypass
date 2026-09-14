@@ -305,7 +305,13 @@ func (j *TelemostHeadlessJoiner) trackStatsSink() func(recv, gaps, lost uint64) 
 	return func(recv, gaps, lost uint64) {
 		dRecv := recv - prevRecv
 		dGaps := gaps - prevGaps
-		dLost := lost - prevLost
+		var dLost uint64
+		if lost >= prevLost {
+			dLost = lost - prevLost
+		} else {
+			// the reassembler un-counted a reordered packet: subtract
+			dLost = ^uint64(prevLost - lost - 1)
+		}
 
 		if recv < prevRecv {
 			dRecv = recv
@@ -635,32 +641,7 @@ func (j *TelemostHeadlessJoiner) initPC() {
 
 				j.activateTunnel(active, vp8tun)
 			} else if j.reliableAuto {
-				var firstMu sync.Mutex
-				firstDone := false
-				var first func([]byte)
-				first = func(payload []byte) {
-					firstMu.Lock()
-					if firstDone {
-						firstMu.Unlock()
-						return
-					}
-					firstDone = true
-					firstMu.Unlock()
-
-					activeTunnel, kcpTun := selectActiveTunnel(vp8tun, payload, j.logFn)
-					j.kcptun = kcpTun
-
-					activeTunnel = j.activateTunnel(activeTunnel, vp8tun)
-
-					if j.kcptun != nil {
-						j.kcptun.InjectSegment(payload)
-					} else {
-						if onData := vp8tun.OnData; onData != nil {
-							onData(payload)
-						}
-					}
-				}
-				vp8tun.SetOnData(first)
+				j.armAutoDetect(vp8tun)
 			} else {
 				j.activateTunnel(active, vp8tun)
 			}
@@ -1271,4 +1252,57 @@ func (j *TelemostHeadlessJoiner) activateTunnel(active tunnel.DataTunnel, vp8tun
 		j.OnConnected(active)
 	}
 	return active
+}
+
+// armAutoDetect installs a one-shot handler on the carrier that decides, from
+// the first inbound payload, whether the peer speaks KCP or raw relay frames,
+// activates the tunnel accordingly (OnConnected fires from here), and re-arms
+// itself whenever the peer RESTARTS (new obfuscator epoch). The device may
+// reconnect in a different mode while this side's PeerConnection lives on, and
+// a decision taken for the previous session must not outlive it: on 2026-09-14
+// the exit stayed "raw" from an earlier session while the phone came back
+// speaking KCP, and nothing moved. Every restart therefore yields a fresh
+// decision and a fresh OnConnected; the owner of the bridge is expected to
+// close the previous one.
+func (j *TelemostHeadlessJoiner) armAutoDetect(vp8tun *tunnel.VP8DataTunnel) {
+	var mu sync.Mutex
+	armed := true
+	var first func([]byte)
+	var rearm func()
+	first = func(payload []byte) {
+		mu.Lock()
+		if !armed {
+			mu.Unlock()
+			return
+		}
+		armed = false
+		mu.Unlock()
+
+		if old := j.kcptun; old != nil {
+			old.StopLayer()
+			j.kcptun = nil
+		}
+		activeTunnel, kcpTun := selectActiveTunnel(vp8tun, payload, j.logFn)
+		j.kcptun = kcpTun
+		// NewMultiTrackTunnel re-wires the carrier's restart hook to itself; put
+		// ours back so the next restart still re-arms detection.
+		vp8tun.SetOnPeerRestart(rearm)
+
+		activeTunnel = j.activateTunnel(activeTunnel, vp8tun)
+
+		if kcpTun != nil {
+			kcpTun.InjectSegment(payload)
+		} else if onData := vp8tun.OnData; onData != nil {
+			onData(payload)
+		}
+	}
+	rearm = func() {
+		mu.Lock()
+		armed = true
+		mu.Unlock()
+		j.logFn("telemost-joiner: peer restarted; re-detecting kcp/raw on its next frame (auto)")
+		vp8tun.SetOnData(first)
+	}
+	vp8tun.SetOnData(first)
+	vp8tun.SetOnPeerRestart(rearm)
 }

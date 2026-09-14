@@ -298,6 +298,16 @@ func (rb *RelayBridge) send(connID uint32, msgType byte, payload []byte) {
 	rb.currentTunnel().SendData(frame)
 }
 
+func profileFromConfig(fps, batch, maxFrameBytes, idleKeepaliveMs int, flags uint8) Profile {
+	return Profile{
+		FPS:           fps,
+		Batch:         batch,
+		MaxFrameBytes: maxFrameBytes,
+		IdleKeepalive: time.Duration(idleKeepaliveMs) * time.Millisecond,
+		Tier:          TierFromConfigFlags(flags),
+	}
+}
+
 func (rb *RelayBridge) handleTunnelData(data []byte) {
 	DecodeFrames(data, func(connID uint32, msgType byte, payload []byte) {
 		if connID == ControlConnID {
@@ -308,12 +318,11 @@ func (rb *RelayBridge) handleTunnelData(data []byte) {
 				if !ok {
 					return
 				}
-				_ = flags
 				if !rb.policyMaster {
 					rb.logFn("relay: peer requested vp8 pacing fps=%d batch=%d trackCount=%d maxFrameBytes=%d idleKeepaliveMs=%d",
 						fps, batch, trackCount, maxFrameBytes, idleKeepaliveMs)
 					if ctl != nil {
-						ctl.onPeerConfig(Profile{FPS: fps, Batch: batch, MaxFrameBytes: maxFrameBytes, IdleKeepalive: time.Duration(idleKeepaliveMs) * time.Millisecond})
+						ctl.onPeerConfig(profileFromConfig(fps, batch, maxFrameBytes, idleKeepaliveMs, flags))
 					} else {
 						rb.currentTunnel().Reconfigure(fps, batch)
 						rb.send(ControlConnID, MsgConfigAck, nil)

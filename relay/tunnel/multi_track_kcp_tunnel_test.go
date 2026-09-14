@@ -24,10 +24,13 @@ func TestKCPTunnelSatisfiesRateControllable(t *testing.T) {
 	// SetProfile reaches the sub-tunnel and sets currentWindow to computeKCPWindowFor(24, 30, 30000)
 	kcptun.SetProfile(Profile{FPS: 24, Batch: 30, MaxFrameBytes: 30000})
 
-	expectedWindow := computeKCPWindowFor(24, 30, 30000)
-	curWindow := int(kcptun.currentWindow.Load())
-	if curWindow != expectedWindow {
-		t.Errorf("expected window=%d, got %d", expectedWindow, curWindow)
+	// The profile only moves the cap; the live window starts at kcpWindowStart
+	// and follows the carrier's measured drain from there (adaptWindow).
+	if capW := kcptun.capWindow(); capW != computeKCPWindowFor(24, 30, 30000) {
+		t.Errorf("cap=%d, want %d", capW, computeKCPWindowFor(24, 30, 30000))
+	}
+	if cur := int(kcptun.currentWindow.Load()); cur != kcpWindowStart {
+		t.Errorf("window=%d after SetProfile, want the start value %d", cur, kcpWindowStart)
 	}
 }
 
@@ -313,5 +316,26 @@ func TestKCPSurvivesCarrierCoalescing(t *testing.T) {
 	}
 	if kcpA.droppedSegments.Load() != 0 {
 		t.Fatalf("sender dropped %d segments at its own queue", kcpA.droppedSegments.Load())
+	}
+}
+
+func TestNextWindowFollowsCarrierDrain(t *testing.T) {
+	cases := []struct {
+		name       string
+		cur, capW  int
+		segsPerSec float64
+		backlog    int
+		want       int
+	}{
+		{"grows while the carrier keeps up", 512, 4096, 600, 0, 750},
+		{"shrinks on output backlog", 2000, 4096, 2300, 1500, 1600},
+		{"rests at the start value when idle", 2000, 4096, 10, 0, 512},
+		{"never above the profile cap", 64, 64, 5000, 0, 64},
+		{"never below the floor", 50, 4096, 20, 0, 64},
+	}
+	for _, c := range cases {
+		if got := nextWindow(c.cur, c.capW, c.segsPerSec, c.backlog); got != c.want {
+			t.Errorf("%s: nextWindow(%d,%d,%.0f,%d)=%d, want %d", c.name, c.cur, c.capW, c.segsPerSec, c.backlog, got, c.want)
+		}
 	}
 }

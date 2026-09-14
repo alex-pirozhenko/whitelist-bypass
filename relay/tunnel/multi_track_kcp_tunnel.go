@@ -20,7 +20,7 @@ const (
 	// loses only its own frame, not a two-packet frame that readVP8Track
 	// would discard whole. 1200 RTP budget - 1 VP8 descriptor - interframe
 	// header - 24 XChaCha20 nonce - 16 Poly1305 tag - 1 channel tag.
-	kcpSegmentMTU     = 1200 - 1 - interframeHdrLen - 24 - 16 - 1
+	kcpSegmentMTU     = 1200 - 1 - interframeHdrLen - 24 - 16 - 1 - kcpUnitLenBytes
 	kcpReceiveBufSize = 128 * 1024
 	kcpStatsEvery     = 500
 
@@ -32,6 +32,17 @@ const (
 
 	kcpChannelReliable byte = 0x00
 	kcpChannelRaw      byte = 0x01
+
+	// kcpUnitLenBytes is the big-endian length that follows the channel tag of
+	// a reliable unit. Units must be self-delimiting: once a RateController
+	// sets MaxFrameBytes on the carrier, VP8DataTunnel's writer coalesces
+	// several queued units into ONE carrier frame, and the receiver gets them
+	// glued together. A raw unit carries a relay frame, which delimits itself
+	// (4-byte length prefix); a KCP segment does not, and kcp-go stops parsing
+	// at the first foreign byte -- so before this prefix every glued segment
+	// after the first was lost, ACKs included, and the reliable stream stalled
+	// (letmeout, 2026-09-14: KCP mode moved nothing while the raw lane worked).
+	kcpUnitLenBytes = 2
 
 	KCPCarrierQueueDepth = kcpWaitSndFactor * kcpWindowCeiling
 )
@@ -91,9 +102,10 @@ func newTrackKCPSession(parent *MultiTrackKCPTunnel, vp8 *VP8DataTunnel, conv ui
 		if size <= 0 {
 			return
 		}
-		segment := make([]byte, size+1)
+		segment := make([]byte, size+1+kcpUnitLenBytes)
 		segment[0] = kcpChannelReliable
-		copy(segment[1:], buf[:size])
+		binary.BigEndian.PutUint16(segment[1:3], uint16(size))
+		copy(segment[1+kcpUnitLenBytes:], buf[:size])
 		parent.outputSegments.Add(1)
 		select {
 		case session.outQ <- segment:
@@ -304,44 +316,59 @@ func (t *MultiTrackKCPTunnel) InjectSegment(payload []byte) {
 }
 
 func (t *MultiTrackKCPTunnel) handleDecodedSegment(payload []byte) {
-	if len(payload) < 1 {
-		return
-	}
-	channel := payload[0]
-	body := payload[1:]
-
-	if channel == kcpChannelRaw {
-		t.mu.Lock()
-		callback := t.onData
-		t.mu.Unlock()
-		if callback == nil {
+	// One carrier frame may hold several units (see kcpUnitLenBytes); walk them.
+	for len(payload) > 0 {
+		channel := payload[0]
+		switch channel {
+		case kcpChannelRaw:
+			// A raw unit is one relay frame: 4-byte big-endian length + body.
+			if len(payload) < 5 {
+				return
+			}
+			n := int(binary.BigEndian.Uint32(payload[1:5])) + 4
+			if n < 4 || 1+n > len(payload) {
+				return
+			}
+			body := payload[1 : 1+n]
+			payload = payload[1+n:]
+			t.mu.Lock()
+			callback := t.onData
+			t.mu.Unlock()
+			if callback != nil {
+				t.rawReceived.Add(1)
+				callback(body)
+			}
+		case kcpChannelReliable:
+			if len(payload) < 1+kcpUnitLenBytes {
+				return
+			}
+			n := int(binary.BigEndian.Uint16(payload[1 : 1+kcpUnitLenBytes]))
+			if n < 4 || 1+kcpUnitLenBytes+n > len(payload) {
+				return
+			}
+			body := payload[1+kcpUnitLenBytes : 1+kcpUnitLenBytes+n]
+			payload = payload[1+kcpUnitLenBytes+n:]
+			conv := binary.LittleEndian.Uint32(body[0:4])
+			t.mu.Lock()
+			session := t.convMap[conv]
+			callback := t.onData
+			t.mu.Unlock()
+			if session == nil {
+				continue
+			}
+			t.inputSegments.Add(1)
+			t.wake()
+			messages := session.input(body)
+			if callback == nil {
+				continue
+			}
+			for _, message := range messages {
+				t.deliveredMessages.Add(1)
+				callback(message)
+			}
+		default:
 			return
 		}
-		t.rawReceived.Add(1)
-		callback(body)
-		return
-	}
-
-	if len(body) < 4 {
-		return
-	}
-	conv := binary.LittleEndian.Uint32(body[0:4])
-	t.mu.Lock()
-	session := t.convMap[conv]
-	callback := t.onData
-	t.mu.Unlock()
-	if session == nil {
-		return
-	}
-	t.inputSegments.Add(1)
-	t.wake()
-	messages := session.input(body)
-	if callback == nil {
-		return
-	}
-	for _, message := range messages {
-		t.deliveredMessages.Add(1)
-		callback(message)
 	}
 }
 

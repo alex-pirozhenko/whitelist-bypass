@@ -404,7 +404,16 @@ func doRun(tf tokenFile, o runOpts) {
 		// bytes, so MsgStats/MsgPing genuinely round-trip and AIMD reacts to
 		// the peer's real measurements.
 		if o.bench && o.benchRateCtl {
-			rb = tunnel.NewRelayBridge(dt, "bench", 32*1024, logFn, true)
+			// The bridge's ActiveProfile must carry the rate this leg negotiated, or
+			// applyProfile re-imposes the 20/1 default on the first Active edge and
+			// the tunnel silently runs at batch 1 (letmeout#139): a 24/30 bench then
+			// tops out around 0.65 MB/s per direction and reads as a provider cap.
+			cfg := tunnel.DefaultRateControllerConfig()
+			if o.vp8FPS > 0 && o.vp8Batch > 0 {
+				cfg.ActiveProfile.FPS = o.vp8FPS
+				cfg.ActiveProfile.Batch = o.vp8Batch
+			}
+			rb = tunnel.NewRelayBridgeWithConfig(dt, "bench", 32*1024, logFn, true, cfg)
 			rb.SetOnBenchData(recvHandler)
 			logFn("bench: rate controller attached via RelayBridge (tiers, AIMD and real peer stats active)")
 		} else {

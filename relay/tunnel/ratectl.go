@@ -336,6 +336,14 @@ func (rc *RateController) tick() {
 	if !rc.policyMaster {
 		return
 	}
+	// A send backlog (a reliable layer still retransmitting, a carrier queue
+	// still draining) is activity: demoting to the drain tier's 10 frames/s
+	// with thousands of segments queued turns a one-second tail into minutes.
+	if q, ok := rc.tun.(interface{ QueueLen() int }); ok && q.QueueLen() > 0 {
+		rc.mu.Lock()
+		rc.lastActivity = time.Now()
+		rc.mu.Unlock()
+	}
 	rc.mu.Lock()
 	idleFor := time.Since(rc.lastActivity)
 	tier := rc.tier

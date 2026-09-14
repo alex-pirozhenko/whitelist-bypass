@@ -901,3 +901,32 @@ func TestSwapTunnelKeepsLossAndFeedbackSources(t *testing.T) {
 		t.Errorf("expected feedback to be preserved on ctl2")
 	}
 }
+
+type backlogTunnel struct {
+	fakeTunnel
+	queued int
+}
+
+func (b *backlogTunnel) QueueLen() int { return b.queued }
+
+// A tunnel that still reports a send backlog must not be demoted from Active.
+func TestBacklogHoldsActiveTier(t *testing.T) {
+	tun := &backlogTunnel{queued: 100}
+	cfg := testConfig()
+	rc := NewRateController(tun, cfg, true, nil)
+	rc.mu.Lock()
+	rc.lastActivity = time.Now().Add(-10 * cfg.ActiveToDrain)
+	rc.mu.Unlock()
+	rc.tick()
+	if got := rc.State(); got != TierActive {
+		t.Fatalf("tier %v with a backlog, want active", got)
+	}
+	tun.queued = 0
+	rc.mu.Lock()
+	rc.lastActivity = time.Now().Add(-10 * cfg.ActiveToDrain)
+	rc.mu.Unlock()
+	rc.tick()
+	if got := rc.State(); got == TierActive {
+		t.Fatalf("still active with no backlog and no activity")
+	}
+}

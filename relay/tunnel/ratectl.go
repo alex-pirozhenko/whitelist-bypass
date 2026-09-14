@@ -785,7 +785,7 @@ func (rc *RateController) logStatsLine(lastCounters *Counters) {
 
 	ctlDrops := rc.ctlDrops.Load()
 
-	var sentF, sentB, keepalives, recvF, recvB uint64
+	var sentF, sentB, keepalives, recvF, recvB, badF uint64
 	if rc.rc != nil {
 		current := rc.rc.Counters()
 		sentF = current.SentFrames - lastCounters.SentFrames
@@ -793,10 +793,11 @@ func (rc *RateController) logStatsLine(lastCounters *Counters) {
 		keepalives = current.Keepalives - lastCounters.Keepalives
 		recvF = current.RecvFrames - lastCounters.RecvFrames
 		recvB = current.RecvBytes - lastCounters.RecvBytes
+		badF = current.BadFrames - lastCounters.BadFrames
 		*lastCounters = current
 	}
 
-	rc.logFn("ratectl: stats tier=%s peerTier=%s fps=%d batch=%d maxFB=%d bwe=%d rtt=%s loss=%.1f%%(+%d/+%d) kfReqs=%d sent=+%d/+%dB keepalives=+%d recv=+%d/+%dB queue=%d ctlDrops=%d ctlQ=%d staleEchoes=%d",
+	rc.logFn("ratectl: stats tier=%s peerTier=%s fps=%d batch=%d maxFB=%d bwe=%d rtt=%s loss=%.1f%%(+%d/+%d) kfReqs=%d sent=+%d/+%dB keepalives=+%d recv=+%d/+%dB bad=+%d queue=%d ctlDrops=%d ctlQ=%d staleEchoes=%d",
 		tier, peerTier, fps, batch, maxFB, bwe, lastStats.RTT, lastStats.LossPercent, lastStats.LostPackets, lastStats.RecvPackets, lastStats.KeyframeReqs,
-		sentF, sentB, keepalives, recvF, recvB, queue, ctlDrops, ctlQueue, staleEchoes)
+		sentF, sentB, keepalives, recvF, recvB, badF, queue, ctlDrops, ctlQueue, staleEchoes)
 }

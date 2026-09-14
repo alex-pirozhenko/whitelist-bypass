@@ -230,3 +230,17 @@ func TestSendControlNeverBlocksWithFullDataQueue(t *testing.T) {
 		t.Fatalf("SendControl blocked!")
 	}
 }
+
+func TestUndecodableFrameIsCounted(t *testing.T) {
+	obf, _ := NewTunnelObfuscator([]byte("pump-secret-key-12345"))
+	tun := NewVP8DataTunnel(nil, obf, func(string, ...any) {})
+	got := 0
+	tun.SetOnData(func([]byte) { got++ })
+	tun.HandleFrame([]byte("definitely not an obfuscated frame, just bytes"))
+	if got != 0 {
+		t.Fatalf("garbage delivered as data")
+	}
+	if c := tun.Counters(); c.BadFrames != 1 {
+		t.Fatalf("BadFrames = %d, want 1", c.BadFrames)
+	}
+}

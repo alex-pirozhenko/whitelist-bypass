@@ -233,6 +233,7 @@ func (m *MultiTrackTunnel) Counters() Counters {
 		c.Keepalives += tc.Keepalives
 		c.RecvFrames += tc.RecvFrames
 		c.RecvBytes += tc.RecvBytes
+		c.BadFrames += tc.BadFrames
 	}
 	return c
 }

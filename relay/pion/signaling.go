@@ -256,7 +256,16 @@ type vp8FrameReassembler struct {
 	recvPkts    int
 	badCount    int
 	stats       RecvStats
+	// missing holds the sequence numbers counted in stats.LostPackets that
+	// might still arrive late (the SFU reorders, notably at session start).
+	// A late arrival that is in here un-counts itself: reordering is not
+	// loss, and telling the peer it is makes its AIMD collapse to the floor.
+	missing map[uint16]struct{}
 }
+
+// reorderWindow bounds how far behind lastSeq a missing sequence number is
+// remembered (and how large a single gap is tracked at all).
+const reorderWindow = 512
 
 type feedResult struct {
 	Frame        []byte
@@ -287,6 +296,19 @@ func (r *vp8FrameReassembler) feed(pkt *rtp.Packet, verbose bool) (res feedResul
 			if delta < 0x8000 {
 				r.stats.Gaps++
 				r.stats.LostPackets += uint64(delta - 1)
+				if int(delta) <= reorderWindow {
+					if r.missing == nil {
+						r.missing = make(map[uint16]struct{})
+					}
+					for sq := r.lastSeq + 1; sq != pkt.SequenceNumber; sq++ {
+						r.missing[sq] = struct{}{}
+					}
+				}
+				for sq := range r.missing {
+					if uint16(pkt.SequenceNumber-sq) > reorderWindow {
+						delete(r.missing, sq)
+					}
+				}
 				r.frameValid = false
 				r.frameBuf = r.frameBuf[:0]
 			} else {
@@ -299,6 +321,10 @@ func (r *vp8FrameReassembler) feed(pkt *rtp.Packet, verbose bool) (res feedResul
 				// (letmeout 2026-09-14: transfers ending in curl rc56 with
 				// loss=0.0% on both legs).
 				r.stats.Reordered++
+				if _, wasMissing := r.missing[pkt.SequenceNumber]; wasMissing {
+					delete(r.missing, pkt.SequenceNumber)
+					r.stats.LostPackets-- // it was not lost after all
+				}
 				res.IsLate = true
 				return res
 			}

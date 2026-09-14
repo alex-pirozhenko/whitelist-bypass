@@ -448,3 +448,39 @@ func TestSelectActiveTunnel(t *testing.T) {
 		t.Errorf("expected active tunnel to be the raw VP8 tunnel")
 	}
 }
+
+// The exit re-decides kcp/raw every time the peer restarts: the device may
+// reconnect in the other mode while this side's PeerConnection lives on.
+func TestAutoDetectReArmsOnPeerRestart(t *testing.T) {
+	j := NewTelemostHeadlessJoiner(func(string, ...any) {}, nil, nil, nil, nil, nil)
+	j.configAck.mark() // no config push in this test
+	secret := []byte("pump-secret-key-12345")
+	obf, _ := tunnel.NewTunnelObfuscator(secret)
+	vp8 := tunnel.NewVP8DataTunnelWithQueue(nil, obf, func(string, ...any) {}, 64)
+	var got []tunnel.DataTunnel
+	j.OnConnected = func(dt tunnel.DataTunnel) { got = append(got, dt) }
+	j.armAutoDetect(vp8)
+
+	raw := tunnel.EncodeFrame(1, tunnel.MsgPing, make([]byte, 8))
+	vp8.OnData(raw)
+	if len(got) != 1 || got[0] != tunnel.DataTunnel(vp8) {
+		t.Fatalf("first decision should be raw: %d %T", len(got), got)
+	}
+	vp8.OnData(raw) // no second decision without a restart
+	if len(got) != 1 {
+		t.Fatalf("decided again without a restart")
+	}
+
+	vp8.OnPeerRestart()                                          // the peer came back (new epoch)
+	vp8.OnData([]byte{0x00, 0x00, 0x04, 0x11, 0x22, 0x33, 0x44}) // a KCP-framed unit
+	if len(got) != 2 {
+		t.Fatalf("no decision after restart: %d", len(got))
+	}
+	if _, ok := got[1].(*tunnel.MultiTrackKCPTunnel); !ok {
+		t.Fatalf("second decision should be kcp, got %T", got[1])
+	}
+	if j.kcptun == nil {
+		t.Fatalf("kcp layer not recorded")
+	}
+	j.kcptun.StopLayer()
+}

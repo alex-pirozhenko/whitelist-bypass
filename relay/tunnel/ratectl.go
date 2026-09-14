@@ -654,7 +654,9 @@ func (rc *RateController) handlePeerStats(payload []byte) {
 		dLost = lostPackets
 	} else {
 		dRecv = recvPackets - rc.prevPeerRecv
-		dLost = lostPackets - rc.prevPeerLost
+		if lostPackets >= rc.prevPeerLost {
+			dLost = lostPackets - rc.prevPeerLost
+		} // else: the peer un-counted a reordered packet; nothing was lost this window
 	}
 	rc.prevPeerRecv = recvPackets
 	rc.prevPeerLost = lostPackets

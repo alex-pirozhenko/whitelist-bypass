@@ -185,8 +185,9 @@ func TestVP8FrameReassembler_Feed(t *testing.T) {
 		if r.stats.Reordered != 1 {
 			t.Errorf("expected Reordered=1, got %d", r.stats.Reordered)
 		}
-		if r.stats.LostPackets != 4 {
-			t.Errorf("expected LostPackets=4, got %d", r.stats.LostPackets)
+		// 103 filled part of the 101..104 gap: reordering, not loss.
+		if r.stats.LostPackets != 3 {
+			t.Errorf("expected LostPackets=3 after the late packet un-counted itself, got %d", r.stats.LostPackets)
 		}
 		if r.lastSeq != 105 {
 			t.Errorf("expected lastSeq to stay 105, got %d", r.lastSeq)
@@ -220,5 +221,28 @@ func TestLatePacketIgnoredMidFrame(t *testing.T) {
 	}
 	if r.lastSeq != 101 {
 		t.Fatalf("lastSeq moved by the stale packet: %d", r.lastSeq)
+	}
+}
+
+// Reordering is not loss: a packet that arrives after the gap it belonged to
+// was counted must un-count itself.
+func TestReorderedPacketUncountsLoss(t *testing.T) {
+	r := &vp8FrameReassembler{}
+	mk := func(seq uint16) *rtp.Packet {
+		return &rtp.Packet{Header: rtp.Header{SequenceNumber: seq, Marker: true}, Payload: []byte{0x10, 0x00}}
+	}
+	r.feed(mk(100), false)
+	r.feed(mk(103), false) // 101, 102 missing
+	if r.stats.LostPackets != 2 || r.stats.Gaps != 1 {
+		t.Fatalf("after gap: %+v", r.stats)
+	}
+	r.feed(mk(101), false) // late
+	r.feed(mk(102), false) // late
+	if r.stats.LostPackets != 0 || r.stats.Reordered != 2 {
+		t.Fatalf("after late arrivals: %+v", r.stats)
+	}
+	r.feed(mk(101), false) // a second copy is just a stale duplicate
+	if r.stats.LostPackets != 0 || r.stats.Reordered != 3 {
+		t.Fatalf("after stale duplicate: %+v", r.stats)
 	}
 }

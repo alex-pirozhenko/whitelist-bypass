@@ -45,6 +45,22 @@ const (
 	kcpUnitLenBytes = 2
 
 	KCPCarrierQueueDepth = kcpWaitSndFactor * kcpWindowCeiling
+
+	// The send window tracks what the carrier actually drains (adaptWindow):
+	// it starts at kcpWindowStart, grows by kcpWindowRTTFactor per second
+	// while the carrier keeps up (an implicit slow start -- with W in
+	// flight the carrier can only ship W per RTT, so the measured rate
+	// tracks the window until the carrier saturates), shrinks when the
+	// output queue backs up, and rests at kcpWindowStart when idle. The
+	// theoretical ticks x segments-per-tick value is only the CAP: on
+	// 2026-09-14 the exit's carrier shipped ~220 frames/s where the formula
+	// assumed 720, the window sat at 2x the real bandwidth-delay product,
+	// every RTO was spurious, and the output queue never drained.
+	kcpWindowStart      = 512
+	kcpWindowRTTFactor  = 1.25
+	kcpAdaptEveryTicks  = 100 // 1 s at the fast update cadence
+	kcpBacklogShrinkNum = 4
+	kcpBacklogShrinkDen = 5
 )
 
 func computeKCPWindowFor(fps, batch, maxFrameBytes int) int {
@@ -113,14 +129,12 @@ func newTrackKCPSession(parent *MultiTrackKCPTunnel, vp8 *VP8DataTunnel, conv ui
 			parent.droppedSegments.Add(1)
 		}
 	})
-	// nodelay, 10 ms interval, fast resend after 2 dup-acks, and congestion
-	// control ON (last arg 0). Without it KCP blasts its whole window every
-	// RTT regardless of what the paced carrier drains: on 2026-09-14 the
-	// exit's output queue sat full for the whole download, every segment
-	// past it was dropped and retransmitted, and the backlog then took
-	// minutes to drain at the drain tier's 10 frames/s while every new
-	// connect timed out behind it.
-	session.kcp.NoDelay(1, 10, 2, 0)
+	// nodelay, 10 ms interval, fast resend after 2 dup-acks, KCP's own
+	// congestion control OFF: it halves and resets cwnd on every loss burst,
+	// and the SFU drops whole frames (many segments at once), so it settled
+	// at ~1 segment per second-long RTT (2026-09-14: 735 KB in 120 s). The
+	// send window is governed by adaptWindow instead.
+	session.kcp.NoDelay(1, 10, 2, 1)
 	kcpWndSize(session.kcp, window, kcpWindowCeiling)
 	session.kcp.SetMtu(kcpSegmentMTU)
 	go session.pump()
@@ -203,11 +217,14 @@ type MultiTrackKCPTunnel struct {
 
 	mu        sync.Mutex
 	lastMaxFB int
-	sessions  []*trackKCPSession
-	convMap   map[uint32]*trackKCPSession
-	connPin   map[uint32]int
-	onData    func([]byte)
-	onClose   func()
+
+	lastSentBytes uint64
+	lastAdaptAt   time.Time
+	sessions      []*trackKCPSession
+	convMap       map[uint32]*trackKCPSession
+	connPin       map[uint32]int
+	onData        func([]byte)
+	onClose       func()
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -236,9 +253,10 @@ func NewMultiTrackKCPTunnel(mt *MultiTrackTunnel, logFn func(string, ...any)) *M
 	subs := mt.SubTunnels()
 	window := kcpWindowFloor
 	if len(subs) > 0 {
-		window = computeKCPWindow(subs[0].FPS(), subs[0].Batch())
+		window = minInt(computeKCPWindow(subs[0].FPS(), subs[0].Batch()), kcpWindowStart)
 	}
 	t.currentWindow.Store(int32(window))
+	t.lastAdaptAt = time.Now()
 	for i, sub := range subs {
 		conv := uint32(kcpConvBase + i)
 		session := newTrackKCPSession(t, sub, conv, window)
@@ -403,8 +421,89 @@ func (t *MultiTrackKCPTunnel) SetProfile(p Profile) {
 	t.mu.Unlock()
 
 	fps, batch := t.FPS(), t.Batch()
-	window := computeKCPWindowFor(fps, batch, lastMaxFB)
-	t.applyWindow(window)
+	t.fitWindow(computeKCPWindowFor(fps, batch, lastMaxFB))
+}
+
+// fitWindow keeps the live window inside [min(start, cap), cap] for a new cap:
+// a profile with room lifts a window that never left the floor up to the
+// start value, and a smaller cap clamps it.
+func (t *MultiTrackKCPTunnel) fitWindow(capW int) {
+	target := int(t.currentWindow.Load())
+	if lo := minInt(kcpWindowStart, capW); target < lo {
+		target = lo
+	} else if target > capW {
+		target = capW
+	}
+	t.applyWindow(target) // always: the receive window is re-pinned to the ceiling on every profile
+}
+
+// capWindow is the ceiling adaptWindow may grow to for the current profile.
+func (t *MultiTrackKCPTunnel) capWindow() int {
+	t.mu.Lock()
+	lastMaxFB := t.lastMaxFB
+	t.mu.Unlock()
+	return computeKCPWindowFor(t.FPS(), t.Batch(), lastMaxFB)
+}
+
+// outQBacklog is how many produced segments are still waiting for the carrier.
+func (t *MultiTrackKCPTunnel) outQBacklog() int {
+	t.mu.Lock()
+	sessions := make([]*trackKCPSession, len(t.sessions))
+	copy(sessions, t.sessions)
+	t.mu.Unlock()
+	n := 0
+	for _, s := range sessions {
+		n += len(s.outQ)
+	}
+	return n
+}
+
+// nextWindow is adaptWindow's decision, kept pure for tests: cur is the
+// window now, capW the profile cap, segsPerSec the carrier's measured drain,
+// backlog the segments waiting for the carrier.
+func nextWindow(cur, capW int, segsPerSec float64, backlog int) int {
+	var target int
+	switch {
+	case segsPerSec < float64(kcpWindowFloor):
+		// idle or a trickle: rest where the next burst starts sensibly
+		target = minInt(cur, kcpWindowStart)
+	case backlog > cur/2:
+		// the carrier is not keeping up with what we already committed
+		target = cur * kcpBacklogShrinkNum / kcpBacklogShrinkDen
+	default:
+		target = int(segsPerSec * kcpWindowRTTFactor)
+	}
+	if target < kcpWindowFloor {
+		target = kcpWindowFloor
+	}
+	if target > capW {
+		target = capW
+	}
+	return target
+}
+
+func (t *MultiTrackKCPTunnel) adaptWindow() {
+	now := time.Now()
+	c := t.mt.Counters()
+	dt := now.Sub(t.lastAdaptAt).Seconds()
+	dB := c.SentBytes - t.lastSentBytes
+	t.lastSentBytes = c.SentBytes
+	t.lastAdaptAt = now
+	if dt <= 0 {
+		return
+	}
+	cur := int(t.currentWindow.Load())
+	target := nextWindow(cur, t.capWindow(), float64(dB)/dt/float64(kcpSegmentMTU), t.outQBacklog())
+	if target != cur {
+		t.applyWindow(target)
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (t *MultiTrackKCPTunnel) Counters() Counters {
@@ -432,10 +531,10 @@ func (t *MultiTrackKCPTunnel) Reconfigure(fps, batch int) {
 	t.mu.Lock()
 	lastMaxFB := t.lastMaxFB
 	t.mu.Unlock()
-	window := computeKCPWindowFor(fps, batch, lastMaxFB)
-	t.applyWindow(window)
+	capW := computeKCPWindowFor(fps, batch, lastMaxFB)
+	t.fitWindow(capW)
 	if t.logFn != nil {
-		t.logFn("kcptunnel: reconfigure fps=%d batch=%d -> window=%d", fps, batch, window)
+		t.logFn("kcptunnel: reconfigure fps=%d batch=%d -> window cap=%d (now %d)", fps, batch, capW, t.currentWindow.Load())
 	}
 }
 
@@ -626,6 +725,9 @@ func (t *MultiTrackKCPTunnel) updateLoop() {
 				}
 			}
 			ticks++
+			if ticks%kcpAdaptEveryTicks == 0 {
+				t.adaptWindow()
+			}
 			if common.Debug && ticks%kcpStatsEvery == 0 && t.logFn != nil {
 				t.logFn("kcptunnel: sessions=%d window=%d sent=%d delivered=%d out_segs=%d in_segs=%d raw_out=%d raw_in=%d dropped=%d",
 					len(sessions), t.currentWindow.Load(), t.sentMessages.Load(), t.deliveredMessages.Load(),

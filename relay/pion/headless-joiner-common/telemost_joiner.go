@@ -592,7 +592,11 @@ func (j *TelemostHeadlessJoiner) initPC() {
 					vp8tun.FPS(), vp8tun.Batch(), trackCount, j.logFn, "telemost-joiner")
 				j.logFn("telemost-joiner: pushed vp8 config to creator fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
 			}
-			if j.idleRembBps > 0 || j.activeRembBps > 0 || (j.idleSlotWidth > 0 && j.idleSlotHeight > 0) {
+			// The wrapper is what routes the rate controller's tier edges into
+			// HintBandwidth, so EVERY tier-driven hint has to be in this
+			// condition -- idleUnsubscribeVideo was left out when it was
+			// added and never fired on the phone (2026-09-14 sweep).
+			if j.idleRembBps > 0 || j.activeRembBps > 0 || (j.idleSlotWidth > 0 && j.idleSlotHeight > 0) || j.idleUnsubscribeVideo {
 				active = newTelemostTunnelWrapper(active, j)
 			}
 			if j.OnConnected != nil {

@@ -18,6 +18,23 @@ const (
 
 const ControlConnID uint32 = 0
 
+// ConfigFlagTierMask defines bits 0-1 of the MsgConfig flags byte, which carry
+// the pushing side's Tier (0 active, 1 drain, 2 idle, 3 deep-idle).
+const ConfigFlagTierMask uint8 = 0x03
+
+// Compile-time guard ensuring all four Tier values fit in the ConfigFlagTierMask.
+var _ = [1]byte{}[3-int(TierDeepIdle)]
+
+// TierFromConfigFlags extracts the Tier from MsgConfig flags.
+func TierFromConfigFlags(flags uint8) Tier {
+	return Tier(flags & ConfigFlagTierMask)
+}
+
+// ConfigFlagsForTier encodes a Tier into the MsgConfig flags format.
+func ConfigFlagsForTier(t Tier) uint8 {
+	return uint8(t) & ConfigFlagTierMask
+}
+
 type DataTunnel interface {
 	SendData(data []byte)
 	SetOnData(fn func([]byte))

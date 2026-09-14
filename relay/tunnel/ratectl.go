@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,6 +50,11 @@ type RateControllerConfig struct {
 	StatsPingInterval    time.Duration
 	AIMDHold             time.Duration
 	AIMDIncreaseInterval time.Duration
+
+	// StatsLogInterval is how often the periodic stats line is logged.
+	// Zero means the default 5s interval is used. A negative duration
+	// disables stats logging entirely.
+	StatsLogInterval time.Duration
 }
 
 const (
@@ -191,7 +197,9 @@ type RateController struct {
 	aimd                 aimdState
 	lastPeerPingNanos    int64
 	lastKeyframeReqCount uint64
-	lastStats            AIMDStats // most recent AIMDStats handlePeerStats computed, for introspection (LastStats)
+	lastStats            AIMDStats     // most recent AIMDStats handlePeerStats computed, for introspection (LastStats)
+	peerTier             Tier          // last tier received from the peer (TierActive if never)
+	ctlDrops             atomic.Uint64 // counts control frames dropped due to full send queue
 
 	ackMu sync.Mutex
 	acked chan struct{} // non-nil while a pushProfile()'d config is unacknowledged; see pushProfile/onPeerAck
@@ -208,6 +216,7 @@ func NewRateController(tun DataTunnel, cfg RateControllerConfig, policyMaster bo
 		policyMaster: policyMaster,
 		logFn:        logFn,
 		tier:         TierActive,
+		peerTier:     TierActive,
 		lastActivity: time.Now(),
 		stopCh:       make(chan struct{}),
 	}
@@ -274,6 +283,9 @@ func (rc *RateController) SetPolicy(p Policy) {
 func (rc *RateController) Start() {
 	go rc.tierLoop()
 	go rc.statsPingLoop()
+	if rc.cfg.StatsLogInterval >= 0 {
+		go rc.statsLogLoop()
+	}
 }
 
 func (rc *RateController) Stop() {
@@ -314,6 +326,9 @@ func (rc *RateController) tierLoop() {
 }
 
 func (rc *RateController) tick() {
+	if !rc.policyMaster {
+		return
+	}
 	rc.mu.Lock()
 	idleFor := time.Since(rc.lastActivity)
 	tier := rc.tier
@@ -479,8 +494,8 @@ func (rc *RateController) pushProfile(p Profile) {
 	// same constant: fps=0 batch=16 trackCount=0 maxFrameBytes=0
 	// idleKeepaliveMs=2048. Rate control has therefore never worked over the
 	// wire. See TestPushProfileFrameRoundTrip.
-	frame := EncodeVP8Config(p.FPS, p.Batch, 1, p.MaxFrameBytes, idleMs, 0)
-	send := func() { rc.tun.SendData(frame) }
+	frame := EncodeVP8Config(p.FPS, p.Batch, 1, p.MaxFrameBytes, idleMs, ConfigFlagsForTier(p.Tier))
+	send := func() { rc.sendControl(frame) }
 	send()
 	go func() {
 		ticker := time.NewTicker(configPushResendPeriod)
@@ -511,14 +526,41 @@ func (rc *RateController) onPeerAck() {
 	}
 }
 
+// onPeerConfig processes a configuration profile pushed by the peer.
+//
+// Each side owns its own send rates (the exit's rate is server configuration,
+// the phone's is the phone's). Therefore, we ignore the peer's actual FPS,
+// batch size, and other rate limits, and only use the pushed Tier as a policy
+// signal to switch our own rate profile tier.
 func (rc *RateController) onPeerConfig(p Profile) {
 	rc.mu.Lock()
 	rc.tier = p.Tier
+	rc.peerTier = p.Tier
 	rc.mu.Unlock()
-	if rc.rc != nil {
-		rc.rc.SetProfile(p)
+
+	rc.applyProfile(p.Tier)
+
+	if rc.logFn != nil {
+		rc.logFn("ratectl: peer tier -> %s (peer fps=%d batch=%d maxFrameBytes=%d idleKeepalive=%s ignored; using own profile)",
+			p.Tier, p.FPS, p.Batch, p.MaxFrameBytes, p.IdleKeepalive)
 	}
-	rc.tun.SendData(EncodeFrame(ControlConnID, MsgConfigAck, nil))
+
+	rc.sendControl(EncodeFrame(ControlConnID, MsgConfigAck, nil))
+}
+
+// sendControl sends a control frame on the tunnel.
+//
+// If the tunnel supports TrySendData, we use it to prevent blocking the read path
+// if the queue is full. Periodic frames (pings, stats) or resending configurations
+// and dropped acks can be dropped without stalling the entire data path.
+func (rc *RateController) sendControl(frame []byte) {
+	if tryer, ok := rc.tun.(interface{ TrySendData([]byte) bool }); ok {
+		if !tryer.TrySendData(frame) {
+			rc.ctlDrops.Add(1)
+		}
+	} else {
+		rc.tun.SendData(frame)
+	}
 }
 
 func (rc *RateController) statsPingLoop() {
@@ -541,7 +583,7 @@ func (rc *RateController) statsPingLoop() {
 func (rc *RateController) sendPing() {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(time.Now().UnixNano()))
-	rc.tun.SendData(EncodeFrame(ControlConnID, MsgPing, buf[:]))
+	rc.sendControl(EncodeFrame(ControlConnID, MsgPing, buf[:]))
 }
 
 func (rc *RateController) handlePeerPing(payload []byte) {
@@ -568,7 +610,7 @@ func (rc *RateController) sendStats() {
 	binary.BigEndian.PutUint64(buf[8:16], gaps)
 	binary.BigEndian.PutUint64(buf[16:24], lostPackets)
 	binary.BigEndian.PutUint64(buf[24:32], uint64(echo))
-	rc.tun.SendData(EncodeFrame(ControlConnID, MsgStats, buf))
+	rc.sendControl(EncodeFrame(ControlConnID, MsgStats, buf))
 }
 
 func (rc *RateController) handlePeerStats(payload []byte) {
@@ -618,4 +660,74 @@ func (rc *RateController) policyForTransfer() Policy {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 	return rc.policy
+}
+
+func (rc *RateController) statsLogLoop() {
+	interval := rc.cfg.StatsLogInterval
+	if interval == 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var lastCounters Counters
+	for {
+		select {
+		case <-rc.stopCh:
+			return
+		case <-ticker.C:
+			rc.logStatsLine(&lastCounters)
+		}
+	}
+}
+
+func (rc *RateController) logStatsLine(lastCounters *Counters) {
+	if rc.logFn == nil {
+		return
+	}
+
+	rc.mu.Lock()
+	tier := rc.tier
+	peerTier := rc.peerTier
+	maxFB := rc.aimd.maxFrameBytes
+	lastStats := rc.lastStats
+
+	var bwe uint64
+	if rc.feedback != nil {
+		if est, ok := rc.feedback.BandwidthEstimate(); ok {
+			bwe = est
+		}
+	}
+	rc.mu.Unlock()
+
+	fps := 0
+	batch := 0
+	if f, ok := rc.tun.(interface{ FPS() int }); ok {
+		fps = f.FPS()
+	}
+	if b, ok := rc.tun.(interface{ Batch() int }); ok {
+		batch = b.Batch()
+	}
+
+	queue := 0
+	if q, ok := rc.tun.(interface{ QueueLen() int }); ok {
+		queue = q.QueueLen()
+	}
+
+	ctlDrops := rc.ctlDrops.Load()
+
+	var sentF, sentB, keepalives, recvF, recvB uint64
+	if rc.rc != nil {
+		current := rc.rc.Counters()
+		sentF = current.SentFrames - lastCounters.SentFrames
+		sentB = current.SentBytes - lastCounters.SentBytes
+		keepalives = current.Keepalives - lastCounters.Keepalives
+		recvF = current.RecvFrames - lastCounters.RecvFrames
+		recvB = current.RecvBytes - lastCounters.RecvBytes
+		*lastCounters = current
+	}
+
+	rc.logFn("ratectl: stats tier=%s peerTier=%s fps=%d batch=%d maxFB=%d bwe=%d rtt=%s loss=%.1f%% kfReqs=%d sent=+%d/+%dB keepalives=+%d recv=+%d/+%dB queue=%d ctlDrops=%d",
+		tier, peerTier, fps, batch, maxFB, bwe, lastStats.RTT, lastStats.LossPercent, lastStats.KeyframeReqs,
+		sentF, sentB, keepalives, recvF, recvB, queue, ctlDrops)
 }

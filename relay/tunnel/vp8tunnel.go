@@ -168,7 +168,8 @@ type VP8DataTunnel struct {
 	// coalesced frame but didn't fit under MaxFrameBytes. It is drained before
 	// pulling anything newer from sendQueue so per-connection byte-stream order
 	// is preserved across ticks. Owned exclusively by the writerLoop goroutine.
-	overflow []byte
+	overflowMu sync.Mutex
+	overflow   []byte
 }
 
 type Counters struct {
@@ -330,6 +331,16 @@ func (t *VP8DataTunnel) Batch() int {
 	return t.batch
 }
 
+func (t *VP8DataTunnel) QueueLen() int {
+	t.overflowMu.Lock()
+	n := len(t.overflow)
+	t.overflowMu.Unlock()
+	if n > 0 {
+		return len(t.sendQueue) + 1
+	}
+	return len(t.sendQueue)
+}
+
 func (t *VP8DataTunnel) SendData(data []byte) {
 	if len(data) == 0 {
 		return
@@ -489,9 +500,15 @@ func (t *VP8DataTunnel) writerLoop() {
 				reconfigure = true
 			case <-ticker.C:
 				drainOne := func() ([]byte, bool) {
-					if len(t.overflow) > 0 {
-						v := t.overflow
+					t.overflowMu.Lock()
+					hasOverflow := len(t.overflow) > 0
+					var v []byte
+					if hasOverflow {
+						v = t.overflow
 						t.overflow = nil
+					}
+					t.overflowMu.Unlock()
+					if hasOverflow {
 						return v, true
 					}
 					select {
@@ -524,7 +541,9 @@ func (t *VP8DataTunnel) writerLoop() {
 							break
 						}
 						if len(combined)+len(next) > maxFB {
+							t.overflowMu.Lock()
 							t.overflow = next
+							t.overflowMu.Unlock()
 							break
 						}
 						buf := make([]byte, 0, len(combined)+len(next))

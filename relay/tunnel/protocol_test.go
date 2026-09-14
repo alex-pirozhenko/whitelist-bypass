@@ -135,3 +135,13 @@ func TestEncodeDecodeVP8Config(t *testing.T) {
 		}
 	})
 }
+
+func TestConfigFlagsTierRoundTrip(t *testing.T) {
+	for _, tier := range []Tier{TierActive, TierDrain, TierIdle, TierDeepIdle} {
+		flags := ConfigFlagsForTier(tier)
+		decoded := TierFromConfigFlags(flags)
+		if decoded != tier {
+			t.Errorf("round trip failed for %s: got flags %02x, decoded %s", tier, flags, decoded)
+		}
+	}
+}

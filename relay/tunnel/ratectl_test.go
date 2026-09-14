@@ -2,6 +2,8 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -434,5 +436,237 @@ func TestPushProfileDistinguishesProfiles(t *testing.T) {
 	}
 	if idleFPS != 2 || idleBatch != 1 {
 		t.Errorf("idle profile decoded fps=%d batch=%d, want 2/1", idleFPS, idleBatch)
+	}
+}
+
+func TestMasterPushesIdleNonMasterFollows(t *testing.T) {
+	fakeMaster := &fakeTunnel{}
+	cfgMaster := testConfig()
+	rcMaster := NewRateController(fakeMaster, cfgMaster, true, nil)
+	rcMaster.Start()
+	defer rcMaster.Stop()
+
+	fakeNonMaster := &fakeTunnel{}
+	cfgNonMaster := testConfig()
+	// ensure different active FPS/batch so we can distinguish profiles
+	cfgNonMaster.IdleProfile.FPS = 3
+	cfgNonMaster.IdleProfile.Batch = 2
+	rcNonMaster := NewRateController(fakeNonMaster, cfgNonMaster, false, nil)
+	rcNonMaster.Start()
+	defer rcNonMaster.Stop()
+
+	// Master transition to Idle -> push idle profile
+	rcMaster.applyProfile(TierIdle)
+
+	fakeMaster.mu.Lock()
+	sentLen := len(fakeMaster.sent)
+	fakeMaster.mu.Unlock()
+	if sentLen == 0 {
+		t.Fatalf("master did not send any configuration frames")
+	}
+
+	fakeMaster.mu.Lock()
+	lastSentFrame := fakeMaster.sent[sentLen-1]
+	fakeMaster.mu.Unlock()
+
+	// Decode master's config frame
+	var decodedPayload []byte
+	DecodeFrames(lastSentFrame, func(connID uint32, msgType byte, payload []byte) {
+		if connID == ControlConnID && msgType == MsgConfig {
+			decodedPayload = payload
+		}
+	})
+	if decodedPayload == nil {
+		t.Fatalf("no MsgConfig frame found in master's sent frames")
+	}
+
+	fps, batch, _, maxFB, idleMs, flags, ok := DecodeVP8Config(decodedPayload)
+	if !ok {
+		t.Fatalf("failed to decode master's config payload")
+	}
+
+	p := profileFromConfig(fps, batch, maxFB, idleMs, flags)
+	rcNonMaster.onPeerConfig(p)
+
+	// Assert non-master is now in State() == TierIdle
+	if rcNonMaster.State() != TierIdle {
+		t.Errorf("expected non-master to transition to TierIdle, got %s", rcNonMaster.State())
+	}
+
+	// Assert non-master's tunnel received SetProfile with its OWN IdleProfile
+	pLast, ok := fakeNonMaster.lastProfile()
+	if !ok {
+		t.Fatalf("non-master tunnel did not receive SetProfile")
+	}
+	if pLast.FPS != cfgNonMaster.IdleProfile.FPS || pLast.Batch != cfgNonMaster.IdleProfile.Batch {
+		t.Errorf("non-master applied peer's fps/batch (%d/%d), expected own idle profile's (%d/%d)",
+			pLast.FPS, pLast.Batch, cfgNonMaster.IdleProfile.FPS, cfgNonMaster.IdleProfile.Batch)
+	}
+
+	// Assert no MsgPing/MsgStats frames are sent afterwards for > a few ping intervals
+	fakeNonMaster.mu.Lock()
+	fakeNonMaster.sent = nil
+	fakeNonMaster.mu.Unlock()
+
+	time.Sleep(3 * cfgNonMaster.statsPingInterval())
+
+	fakeNonMaster.mu.Lock()
+	sentLenAfter := len(fakeNonMaster.sent)
+	fakeNonMaster.mu.Unlock()
+	if sentLenAfter > 0 {
+		t.Errorf("expected no control frames to be sent from non-master in idle state, but got %d", sentLenAfter)
+	}
+}
+
+func TestNonMasterNeverSelfDemotes(t *testing.T) {
+	fake := &fakeTunnel{}
+	cfg := testConfig()
+
+	// Master with same setup -> Drain then Idle (existing behaviour)
+	rcMaster := NewRateController(fake, cfg, true, nil)
+	rcMaster.mu.Lock()
+	rcMaster.lastActivity = time.Now().Add(-200 * time.Millisecond) // far in past
+	rcMaster.mu.Unlock()
+
+	rcMaster.tick() // first tick should go Drain
+	if rcMaster.State() != TierDrain {
+		t.Errorf("expected master to self-demote to TierDrain, got %s", rcMaster.State())
+	}
+	rcMaster.tick() // second tick should go Idle
+	if rcMaster.State() != TierIdle {
+		t.Errorf("expected master to self-demote to TierIdle, got %s", rcMaster.State())
+	}
+
+	// Non-master with same setup -> still Active
+	rcNonMaster := NewRateController(fake, cfg, false, nil)
+	rcNonMaster.mu.Lock()
+	rcNonMaster.lastActivity = time.Now().Add(-200 * time.Millisecond) // far in past
+	rcNonMaster.mu.Unlock()
+
+	rcNonMaster.tick()
+	if rcNonMaster.State() != TierActive {
+		t.Errorf("expected non-master to remain TierActive, got %s", rcNonMaster.State())
+	}
+	rcNonMaster.tick()
+	if rcNonMaster.State() != TierActive {
+		t.Errorf("expected non-master to remain TierActive after multiple ticks, got %s", rcNonMaster.State())
+	}
+}
+
+type fakeTrySendTunnel struct {
+	fakeTunnel
+	trySendResult bool
+}
+
+func (f *fakeTrySendTunnel) TrySendData(data []byte) bool {
+	if f.trySendResult {
+		f.SendData(data)
+	}
+	return f.trySendResult
+}
+
+func TestControlFramesDontBlock(t *testing.T) {
+	// 1. TrySendData returns false -> drops increment
+	fakeFull := &fakeTrySendTunnel{trySendResult: false}
+	rcFull := NewRateController(fakeFull, testConfig(), true, nil)
+
+	rcFull.pushProfile(Profile{FPS: 20})
+	rcFull.sendPing()
+	rcFull.sendStats()
+	rcFull.onPeerConfig(Profile{Tier: TierIdle})
+
+	if drops := rcFull.ctlDrops.Load(); drops < 4 {
+		t.Errorf("expected at least 4 control drops, got %d", drops)
+	}
+
+	// 2. TrySendData returns true -> works normally
+	fakeOk := &fakeTrySendTunnel{trySendResult: true}
+	rcOk := NewRateController(fakeOk, testConfig(), true, nil)
+
+	rcOk.pushProfile(Profile{FPS: 20})
+	rcOk.sendPing()
+	rcOk.sendStats()
+	rcOk.onPeerConfig(Profile{Tier: TierIdle})
+
+	if drops := rcOk.ctlDrops.Load(); drops != 0 {
+		t.Errorf("expected 0 control drops when TrySendData returns true, got %d", drops)
+	}
+
+	// 3. Fallback to SendData if TrySendData is not implemented
+	fakeFallback := &fakeTunnel{}
+	rcFallback := NewRateController(fakeFallback, testConfig(), true, nil)
+
+	rcFallback.pushProfile(Profile{FPS: 20})
+	rcFallback.sendPing()
+	rcFallback.sendStats()
+	rcFallback.onPeerConfig(Profile{Tier: TierIdle})
+
+	if drops := rcFallback.ctlDrops.Load(); drops != 0 {
+		t.Errorf("expected 0 control drops on fallback, got %d", drops)
+	}
+	fakeFallback.mu.Lock()
+	sentLen := len(fakeFallback.sent)
+	fakeFallback.mu.Unlock()
+	if sentLen == 0 {
+		t.Errorf("expected frames to be sent via fallback SendData, but got 0")
+	}
+}
+
+func TestStatsLine(t *testing.T) {
+	fake := &fakeTunnel{}
+	var lines []string
+	var mu sync.Mutex
+	logFn := func(format string, args ...any) {
+		mu.Lock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+
+	cfg := testConfig()
+	cfg.StatsLogInterval = 10 * time.Millisecond
+
+	rc := NewRateController(fake, cfg, true, logFn)
+	rc.Start()
+	time.Sleep(30 * time.Millisecond)
+	rc.Stop()
+
+	mu.Lock()
+	hasStats := false
+	for _, line := range lines {
+		if strings.Contains(line, "ratectl: stats") && strings.Contains(line, "tier=") && strings.Contains(line, "queue=") {
+			hasStats = true
+			break
+		}
+	}
+	mu.Unlock()
+
+	if !hasStats {
+		t.Errorf("expected ratectl: stats line with tier= and queue=, got logs:\n%v", lines)
+	}
+
+	// with a negative interval none appears
+	mu.Lock()
+	lines = nil
+	mu.Unlock()
+
+	cfgNeg := testConfig()
+	cfgNeg.StatsLogInterval = -1 * time.Second
+	rcNeg := NewRateController(fake, cfgNeg, true, logFn)
+	rcNeg.Start()
+	time.Sleep(30 * time.Millisecond)
+	rcNeg.Stop()
+
+	mu.Lock()
+	hasStatsNeg := false
+	for _, line := range lines {
+		if strings.Contains(line, "ratectl: stats") {
+			hasStatsNeg = true
+			break
+		}
+	}
+	mu.Unlock()
+
+	if hasStatsNeg {
+		t.Errorf("did not expect stats line with negative interval, got logs:\n%v", lines)
 	}
 }

@@ -315,8 +315,8 @@ func TestEndToEndRealLossDrivesAIMD(t *testing.T) {
 	// relative to StatsPingInterval keeps minRTT anchored near that stable
 	// floor instead of near zero, which is what a real deployment's actual
 	// network RTT would do too.
-	sender.controlDelay = 25 * time.Millisecond
-	receiver.controlDelay = 25 * time.Millisecond
+	sender.controlDelay = 10 * time.Millisecond
+	receiver.controlDelay = 10 * time.Millisecond
 
 	noopLog := func(string, ...any) {}
 

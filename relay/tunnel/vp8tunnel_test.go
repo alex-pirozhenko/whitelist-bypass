@@ -162,3 +162,71 @@ func TestVP8DataTunnelDataPump(t *testing.T) {
 		t.Fatalf("timed out waiting for data pump message")
 	}
 }
+
+func TestControlLaneDrainedFirst(t *testing.T) {
+	secret := []byte("pump-secret-key-12345")
+	obfSender, _ := NewTunnelObfuscator(secret)
+	obfReceiver, _ := NewTunnelObfuscator(secret)
+
+	senderTun := NewVP8DataTunnelWithQueue(nil, obfSender, func(string, ...any) {}, 256)
+
+	emitted := make(chan []byte, 250)
+	senderTun.WriteFrame = func(frame []byte) error {
+		emitted <- frame
+		return nil
+	}
+
+	// Enqueue 200 data items
+	for i := 0; i < 200; i++ {
+		senderTun.SendData([]byte{byte(i)})
+	}
+
+	// Send 1 control frame
+	controlFrame := []byte("control-ping-msg")
+	senderTun.SendControl(controlFrame)
+
+	// Start the tunnel (FPS 100, batch 1)
+	senderTun.Start(100, 1)
+	defer senderTun.Stop()
+
+	// Wait for the first emitted frame
+	select {
+	case frame := <-emitted:
+		res := obfReceiver.Decode(frame)
+		if !res.HasFrame {
+			t.Fatalf("expected decoded frame")
+		}
+		if !bytes.Equal(res.Payload, controlFrame) {
+			t.Errorf("expected control frame to be drained first, got payload %q", res.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for first emitted frame")
+	}
+}
+
+func TestSendControlNeverBlocksWithFullDataQueue(t *testing.T) {
+	secret := []byte("pump-secret-key-12345")
+	obfSender, _ := NewTunnelObfuscator(secret)
+	senderTun := NewVP8DataTunnelWithQueue(nil, obfSender, func(string, ...any) {}, 128)
+
+	// Fill the data queue completely
+	for i := 0; i < 128; i++ {
+		senderTun.TrySendData([]byte{byte(i)})
+	}
+
+	// Call SendControl. It should be non-blocking even with full data queue.
+	done := make(chan bool, 1)
+	go func() {
+		ok := senderTun.SendControl([]byte("ping"))
+		done <- ok
+	}()
+
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Errorf("expected SendControl to succeed (returns true)")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("SendControl blocked!")
+	}
+}

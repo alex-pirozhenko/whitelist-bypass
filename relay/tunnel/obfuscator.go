@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -72,9 +73,20 @@ type DecodeResult struct {
 	Keepalive   bool
 	SelfEcho    bool
 	PeerRestart bool
-	Payload     []byte
-	PeerEpoch   uint32
+	// StaleEpoch marks a frame from the peer epoch that a restart just
+	// superseded (see staleEpochGrace); HasFrame is false for it.
+	StaleEpoch bool
+	Payload    []byte
+	PeerEpoch  uint32
 }
+
+// staleEpochGrace is how long, after a peer restart, frames carrying the
+// previous epoch are dropped instead of being taken for yet another restart.
+// The peer's old session keeps sending for a while after its replacement
+// comes up (its PeerConnection dies asynchronously); on 2026-09-14 the exit
+// saw the two epochs alternate, declared a restart on each flip, and rebuilt
+// its bridge -- closing every live relay connection -- twice within a second.
+const staleEpochGrace = 30 * time.Second
 
 type TunnelObfuscator struct {
 	aead       cipher.AEAD
@@ -83,6 +95,8 @@ type TunnelObfuscator struct {
 	mu        sync.Mutex
 	peerEpoch uint32
 	hasPeer   bool
+	prevEpoch uint32    // the epoch replaced by the last restart
+	restartAt time.Time // when that restart was seen
 }
 
 func DeriveSecretFromJoinLink(joinLink string) []byte {
@@ -255,6 +269,12 @@ func (o *TunnelObfuscator) Decode(frame []byte) DecodeResult {
 		o.peerEpoch = peerEpoch
 		o.hasPeer = true
 	} else if o.peerEpoch != peerEpoch {
+		if peerEpoch == o.prevEpoch && time.Since(o.restartAt) < staleEpochGrace {
+			o.mu.Unlock()
+			return DecodeResult{StaleEpoch: true, PeerEpoch: peerEpoch}
+		}
+		o.prevEpoch = o.peerEpoch
+		o.restartAt = time.Now()
 		o.peerEpoch = peerEpoch
 		res.PeerRestart = true
 	}

@@ -158,6 +158,7 @@ type VP8DataTunnel struct {
 	recvFrames      atomic.Uint64
 	recvBytes       atomic.Uint64
 	badFrames       atomic.Uint64
+	staleFrames     atomic.Uint64
 	keepaliveFrames atomic.Uint64
 
 	OnData        func([]byte)
@@ -598,6 +599,12 @@ func (t *VP8DataTunnel) writerLoop() {
 
 func (t *VP8DataTunnel) HandleFrame(frame []byte) {
 	res := t.obf.Decode(frame)
+	if res.StaleEpoch {
+		if n := t.staleFrames.Add(1); n <= 3 || n%500 == 0 {
+			t.logFn("vp8tunnel: frame from the superseded peer epoch 0x%08x dropped (#%d)", res.PeerEpoch, n)
+		}
+		return
+	}
 	if !res.HasFrame {
 		// Not a keepalive either: a frame that failed to authenticate.
 		// Every such frame is a hole in the inner byte stream, so count it

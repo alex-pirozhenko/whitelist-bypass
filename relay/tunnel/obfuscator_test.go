@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os/exec"
 	"testing"
+	"time"
 )
 
 func TestObfuscatorKeyframeAndInterframeRoundTrip(t *testing.T) {
@@ -110,5 +111,36 @@ func TestVP8BitstreamDecodesInFFmpeg(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("ffmpeg failed to decode synthetic VP8 frames: %v, output: %s", err, string(out))
+	}
+}
+
+// After a restart, frames still arriving from the superseded epoch (the
+// peer's old session dying asynchronously) must not be taken for another
+// restart: they are dropped as StaleEpoch for a grace period.
+func TestStaleEpochAfterRestartIsDropped(t *testing.T) {
+	secret := []byte("pump-secret-key-12345")
+	a1, _ := NewTunnelObfuscator(secret) // peer, first session
+	a2, _ := NewTunnelObfuscator(secret) // peer, replacement session
+	b, _ := NewTunnelObfuscator(secret)  // us
+	f1 := a1.EncodeDataKeyframe([]byte("one"))
+	f2 := a2.EncodeDataKeyframe([]byte("two"))
+
+	if r := b.Decode(f1); !r.HasFrame || r.PeerRestart {
+		t.Fatalf("first frame: %+v", r)
+	}
+	if r := b.Decode(f2); !r.HasFrame || !r.PeerRestart {
+		t.Fatalf("replacement should be a restart: %+v", r)
+	}
+	if r := b.Decode(f1); r.HasFrame || !r.StaleEpoch || r.PeerRestart {
+		t.Fatalf("old session's tail should be dropped as stale, got %+v", r)
+	}
+	if r := b.Decode(f2); !r.HasFrame || r.PeerRestart {
+		t.Fatalf("current epoch keeps flowing: %+v", r)
+	}
+	b.mu.Lock()
+	b.restartAt = time.Now().Add(-2 * staleEpochGrace)
+	b.mu.Unlock()
+	if r := b.Decode(f1); !r.HasFrame || !r.PeerRestart {
+		t.Fatalf("after the grace period the old epoch is a real restart again: %+v", r)
 	}
 }

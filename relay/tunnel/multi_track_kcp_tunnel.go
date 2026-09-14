@@ -113,7 +113,14 @@ func newTrackKCPSession(parent *MultiTrackKCPTunnel, vp8 *VP8DataTunnel, conv ui
 			parent.droppedSegments.Add(1)
 		}
 	})
-	session.kcp.NoDelay(1, 10, 2, 1)
+	// nodelay, 10 ms interval, fast resend after 2 dup-acks, and congestion
+	// control ON (last arg 0). Without it KCP blasts its whole window every
+	// RTT regardless of what the paced carrier drains: on 2026-09-14 the
+	// exit's output queue sat full for the whole download, every segment
+	// past it was dropped and retransmitted, and the backlog then took
+	// minutes to drain at the drain tier's 10 frames/s while every new
+	// connect timed out behind it.
+	session.kcp.NoDelay(1, 10, 2, 0)
 	kcpWndSize(session.kcp, window, kcpWindowCeiling)
 	session.kcp.SetMtu(kcpSegmentMTU)
 	go session.pump()

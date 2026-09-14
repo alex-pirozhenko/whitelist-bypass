@@ -92,6 +92,19 @@ type TelemostHeadlessJoiner struct {
 	boundPeers       map[string]bool
 	unboundPeers     map[string]bool
 	boundMu          sync.Mutex
+
+	disableSubscriberAudio bool
+	idleRembBps            int
+	activeRembBps          int
+	idleSlotWidth          int
+	idleSlotHeight         int
+
+	videoSSRCMu sync.Mutex
+	videoSSRC   uint32
+
+	rembLoopMu sync.Mutex
+	rembBps    int
+	rembCancel context.CancelFunc
 }
 
 func NewTelemostHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, status StatusEmitter, pcConfig PeerConnectionConfigurer, addTracks AddTunnelTracksFunc, readTrackFn ReadTrackFunc) *TelemostHeadlessJoiner {
@@ -109,13 +122,18 @@ func NewTelemostHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc
 
 func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	var params struct {
-		JoinLink     string `json:"joinLink"`
-		DisplayName  string `json:"displayName"`
-		VP8FPS       int    `json:"vp8Fps"`
-		VP8Batch     int    `json:"vp8Batch"`
-		Reliable     bool   `json:"reliable"`
-		DualTrack    bool   `json:"dualTrack"`
-		TunnelSecret string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
+		JoinLink               string `json:"joinLink"`
+		DisplayName            string `json:"displayName"`
+		VP8FPS                 int    `json:"vp8Fps"`
+		VP8Batch               int    `json:"vp8Batch"`
+		Reliable               bool   `json:"reliable"`
+		DualTrack              bool   `json:"dualTrack"`
+		TunnelSecret           string `json:"tunnelSecret"` // callpath: per-device obfuscator secret
+		DisableSubscriberAudio bool   `json:"disableSubscriberAudio"`
+		IdleRembBps            int    `json:"idleRembBps"`
+		ActiveRembBps          int    `json:"activeRembBps"`
+		IdleSlotWidth          int    `json:"idleSlotWidth"`
+		IdleSlotHeight         int    `json:"idleSlotHeight"`
 	}
 	if err := json.Unmarshal([]byte(jsonParams), &params); err != nil {
 		j.logFn("telemost-joiner: failed to parse params: %v", err)
@@ -145,8 +163,14 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	j.vp8Batch = params.VP8Batch
 	j.reliable = params.Reliable
 	j.dualTrack = params.DualTrack
-	j.logFn("telemost-joiner: link=%s name=%s vp8Fps=%d vp8Batch=%d dualTrack=%v localEpoch=0x%08x",
-		j.joinLink, j.displayName, params.VP8FPS, params.VP8Batch, j.dualTrack, obf.LocalEpoch())
+	j.disableSubscriberAudio = params.DisableSubscriberAudio
+	j.idleRembBps = params.IdleRembBps
+	j.activeRembBps = params.ActiveRembBps
+	j.idleSlotWidth = params.IdleSlotWidth
+	j.idleSlotHeight = params.IdleSlotHeight
+	j.logFn("telemost-joiner: link=%s name=%s vp8Fps=%d vp8Batch=%d dualTrack=%v localEpoch=0x%08x remb=%d/%d idleSlot=%dx%d subAudio=%v",
+		j.joinLink, j.displayName, params.VP8FPS, params.VP8Batch, j.dualTrack, obf.LocalEpoch(),
+		j.idleRembBps, j.activeRembBps, j.idleSlotWidth, j.idleSlotHeight, j.disableSubscriberAudio)
 
 	j.Status.EmitStatus(common.StatusConnecting)
 	if err := j.runOnce(); err != nil {
@@ -239,6 +263,17 @@ func (j *TelemostHeadlessJoiner) resetSessionState() {
 	j.boundPeers = nil
 	j.unboundPeers = nil
 	j.boundMu.Unlock()
+
+	j.videoSSRCMu.Lock()
+	j.videoSSRC = 0
+	j.videoSSRCMu.Unlock()
+
+	j.rembLoopMu.Lock()
+	if j.rembCancel != nil {
+		j.rembCancel()
+		j.rembCancel = nil
+	}
+	j.rembLoopMu.Unlock()
 }
 
 func (j *TelemostHeadlessJoiner) Close() {
@@ -434,7 +469,7 @@ func (j *TelemostHeadlessJoiner) sendHello() {
 			"capabilitiesOffer":   tmapi.CapabilitiesOffer,
 			"sdkInfo":             map[string]interface{}{"implementation": "browser", "version": "6.0.0", "userAgent": common.UserAgent, "hwConcurrency": 8},
 			"sdkInitializationId": uuid.New().String(),
-			"disablePublisher":    false, "disableSubscriber": false, "disableSubscriberAudio": false,
+			"disablePublisher":    false, "disableSubscriber": false, "disableSubscriberAudio": j.disableSubscriberAudio,
 		},
 	})
 	j.logFn("telemost-joiner: -> hello")
@@ -489,6 +524,11 @@ func (j *TelemostHeadlessJoiner) initPC() {
 
 	subPC.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		j.logFn("telemost-joiner: sub remote track: %s", track.Codec().MimeType)
+		if track.Codec().MimeType == webrtc.MimeTypeVP8 {
+			j.videoSSRCMu.Lock()
+			j.videoSSRC = uint32(track.SSRC())
+			j.videoSSRCMu.Unlock()
+		}
 		go j.ReadTrackFn(track, func(frame []byte) {
 			if j.vp8tunnel != nil {
 				j.vp8tunnel.HandleFrame(frame)
@@ -541,6 +581,9 @@ func (j *TelemostHeadlessJoiner) initPC() {
 				go sendVP8ConfigUntilAcked(acked, cancel, j.stopCh, active,
 					vp8tun.FPS(), vp8tun.Batch(), trackCount, j.logFn, "telemost-joiner")
 				j.logFn("telemost-joiner: pushed vp8 config to creator fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
+			}
+			if j.idleRembBps > 0 || j.activeRembBps > 0 || (j.idleSlotWidth > 0 && j.idleSlotHeight > 0) {
+				active = newTelemostTunnelWrapper(active, j)
 			}
 			if j.OnConnected != nil {
 				j.OnConnected(active)

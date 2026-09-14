@@ -295,6 +295,14 @@ func SetSlotsMessage(key int) map[string]interface{} {
 	return slotsMessageWithSizes(key, StartupSlotSizes[len(StartupSlotSizes)-1], rnd)
 }
 
+func SetSlotsMessageWithSize(key, width, height int) map[string]interface{} {
+	template := make([][2]int, 12)
+	for i := range template {
+		template[i] = [2]int{width, height}
+	}
+	return slotsMessageWithSizes(key, template, nil)
+}
+
 func StartupSetSlotsMessage(i, key int) map[string]interface{} {
 	rnd := mathrand.New(mathrand.NewSource(time.Now().UnixNano() + int64(i)))
 	return slotsMessageWithSizes(key, StartupSlotSizes[i], rnd)

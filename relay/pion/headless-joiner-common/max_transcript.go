@@ -187,6 +187,106 @@ func filterStats(report webrtc.StatsReport) []map[string]any {
 	return out
 }
 
+// SelectedCandidatePair is the candidate-type summary of the ICE pair a
+// session actually settled on: which local/remote candidate type (host, srflx,
+// prflx or relay) carries the media. It exists so a caller (and a log query)
+// can tell a full-rate direct session apart from one that fell back to a MAX
+// TURN allocation, which is quota-capped to roughly a tenth of the throughput.
+type SelectedCandidatePair struct {
+	Local  string `json:"local"`
+	Remote string `json:"remote"`
+}
+
+// String renders the pair the way it is logged: "local=host remote=srflx".
+func (p SelectedCandidatePair) String() string {
+	return fmt.Sprintf("local=%s remote=%s", p.Local, p.Remote)
+}
+
+// selectedCandidatePairTypes extracts the nominated, succeeded candidate pair
+// from a getStats() report and resolves both of its candidate ids to candidate
+// types. Reports the zero pair and false when the report has no such pair (or
+// no local-candidate entry for it), which is the normal state before ICE
+// finishes.
+//
+// If a report somehow carries more than one nominated+succeeded pair, the
+// busiest one wins (ties broken by id) so the answer is deterministic despite
+// StatsReport being a map.
+func selectedCandidatePairTypes(report webrtc.StatsReport) (SelectedCandidatePair, bool) {
+	var best *webrtc.ICECandidatePairStats
+	for _, s := range report {
+		pair, ok := s.(webrtc.ICECandidatePairStats)
+		if !ok || !pair.Nominated || pair.State != webrtc.StatsICECandidatePairStateSucceeded {
+			continue
+		}
+		cur := pair
+		if best == nil {
+			best = &cur
+			continue
+		}
+		curBytes := cur.BytesSent + cur.BytesReceived
+		bestBytes := best.BytesSent + best.BytesReceived
+		if curBytes > bestBytes || (curBytes == bestBytes && cur.ID < best.ID) {
+			best = &cur
+		}
+	}
+	if best == nil {
+		return SelectedCandidatePair{}, false
+	}
+	out := SelectedCandidatePair{Remote: "unknown"}
+	for _, s := range report {
+		c, ok := s.(webrtc.ICECandidateStats)
+		if !ok {
+			continue
+		}
+		switch c.ID {
+		case best.LocalCandidateID:
+			out.Local = c.CandidateType.String()
+		case best.RemoteCandidateID:
+			out.Remote = c.CandidateType.String()
+		}
+	}
+	if out.Local == "" {
+		return SelectedCandidatePair{}, false
+	}
+	return out, true
+}
+
+// SelectedCandidatePair reports the candidate pair the current PeerConnection
+// settled on, once ICE has picked one. ok is false before that (and again
+// after a PeerConnection rebuild, until the new one connects).
+func (h *MaxHeadlessJoiner) SelectedCandidatePair() (SelectedCandidatePair, bool) {
+	if h == nil {
+		return SelectedCandidatePair{}, false
+	}
+	p := h.selectedPair.Load()
+	if p == nil {
+		return SelectedCandidatePair{}, false
+	}
+	return *p, true
+}
+
+// recordSelectedCandidatePair samples pc's stats and latches the selected pair.
+// Safe (and cheap) to call from every "connected" transition: the first call
+// that actually finds a pair wins and everything after it is a no-op.
+func (h *MaxHeadlessJoiner) recordSelectedCandidatePair(pc *webrtc.PeerConnection) {
+	if pc == nil || h.selectedPair.Load() != nil {
+		return
+	}
+	h.noteSelectedCandidatePair(pc.GetStats())
+}
+
+// noteSelectedCandidatePair is recordSelectedCandidatePair's testable half: it
+// latches the pair found in report (exactly once per PeerConnection) and emits
+// the one countable log line plus a transcript state line.
+func (h *MaxHeadlessJoiner) noteSelectedCandidatePair(report webrtc.StatsReport) {
+	pair, ok := selectedCandidatePairTypes(report)
+	if !ok || !h.selectedPair.CompareAndSwap(nil, &pair) {
+		return
+	}
+	h.logFn("max-joiner: selected candidate pair %s", pair)
+	h.trState("iceSelectedPair", pair.String(), "")
+}
+
 // startStatsLoop emits a "stats" line every 2 s for pc until it is closed or
 // the joiner stops. Keyed on the pc pointer, so a recreated PeerConnection
 // gets its own loop and the old one drains out on its own.

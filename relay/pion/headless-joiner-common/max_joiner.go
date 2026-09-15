@@ -204,6 +204,14 @@ type MaxHeadlessAuthParams struct {
 	// duplicating that branch. See ForceReadTrackFn below for how this is wired.
 	ForceVP8Read bool `json:"forceVp8Read"`
 
+	// Reliable wraps the underlying VP8 tunnel in a MultiTrackKCPTunnel for
+	// per-track KCP reliability over the video carrier.
+	Reliable bool `json:"reliable"`
+
+	// ReliableAuto automatically detects whether the peer speaks KCP or raw
+	// relay frames by peeking the first inbound payload, re-arming on peer restart.
+	ReliableAuto bool `json:"reliableAuto"`
+
 	// ws2 client params (all have defaults; only override if set).
 	AppVersion      string `json:"appVersion"`
 	ProtocolVersion string `json:"protocolVersion"`
@@ -335,6 +343,7 @@ type MaxHeadlessJoiner struct {
 	sampleAudioTrack  *webrtc.TrackLocalStaticSample
 	sfuTrackBound     bool
 	vp8tunnel         *tunnel.VP8DataTunnel
+	kcptun            *tunnel.MultiTrackKCPTunnel
 	producerSessionID string
 	configAck         configAckTracker
 
@@ -412,7 +421,7 @@ func (h *MaxHeadlessJoiner) RunWithParams(jsonParams string) {
 			return
 		}
 	}
-	h.logFn("max-joiner: auth params received role=%s tunnelMode=%s", params.Role, params.TunnelMode)
+	h.logFn("max-joiner: auth params received role=%s tunnelMode=%s reliable=%v reliableAuto=%v", params.Role, params.TunnelMode, params.Reliable, params.ReliableAuto)
 
 	h.Status.EmitStatus(common.StatusConnecting)
 	if err := h.runOnce(); err != nil {
@@ -534,6 +543,10 @@ func (h *MaxHeadlessJoiner) resetSessionState() {
 	h.peerMu.Unlock()
 	h.offerOnce = sync.Once{}
 	// SFU media plane.
+	if h.kcptun != nil {
+		h.kcptun.StopLayer()
+		h.kcptun = nil
+	}
 	if h.vp8tunnel != nil {
 		h.vp8tunnel.Stop()
 	}
@@ -564,6 +577,14 @@ func (h *MaxHeadlessJoiner) Close() {
 	if ws != nil {
 		ws.Close()
 	}
+	if h.kcptun != nil {
+		h.kcptun.StopLayer()
+		h.kcptun = nil
+	}
+	if h.vp8tunnel != nil {
+		h.vp8tunnel.Stop()
+		h.vp8tunnel = nil
+	}
 	if h.pc != nil {
 		h.closePC(h.pc)
 	}
@@ -572,12 +593,21 @@ func (h *MaxHeadlessJoiner) Close() {
 	}
 }
 
+// closeTransport tears down the transport ws and tunnel.
 func (h *MaxHeadlessJoiner) closeTransport() {
 	h.wsMu.Lock()
 	ws := h.ws
 	h.wsMu.Unlock()
 	if ws != nil {
 		ws.Close()
+	}
+	if h.kcptun != nil {
+		h.kcptun.StopLayer()
+		h.kcptun = nil
+	}
+	if h.vp8tunnel != nil {
+		h.vp8tunnel.Stop()
+		h.vp8tunnel = nil
 	}
 }
 
@@ -1753,16 +1783,7 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 			h.vp8tunnel = tunnel.NewVP8DataTunnelRTP(h.rtpTrack, h.obf, h.logFn)
 			vp8tun := h.vp8tunnel
 			vp8tun.Start(h.params.VP8FPS, h.params.VP8Batch)
-			if !h.configAck.acknowledged() {
-				acked, cancel := h.configAck.arm()
-				go sendVP8ConfigUntilAcked(acked, cancel, h.stopCh, vp8tun,
-					vp8tun.FPS(), vp8tun.Batch(), 1, h.logFn, "max-joiner")
-				h.logFn("max-joiner: pushed vp8 config fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
-			}
-			wrapped := newSFUTunnelWrapper(vp8tun, h)
-			if h.OnConnected != nil {
-				h.OnConnected(wrapped)
-			}
+			h.activateTunnel(vp8tun)
 		}
 	})
 	turnUser := ""
@@ -2172,16 +2193,7 @@ func (h *MaxHeadlessJoiner) initPC() {
 			h.vp8tunnel = tunnel.NewVP8DataTunnelRTP(h.rtpTrack, h.obf, h.logFn)
 			vp8tun := h.vp8tunnel
 			vp8tun.Start(h.params.VP8FPS, h.params.VP8Batch)
-			if !h.configAck.acknowledged() {
-				acked, cancel := h.configAck.arm()
-				go sendVP8ConfigUntilAcked(acked, cancel, h.stopCh, vp8tun,
-					vp8tun.FPS(), vp8tun.Batch(), 1, h.logFn, "max-joiner")
-				h.logFn("max-joiner: pushed vp8 config fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
-			}
-			wrapped := newSFUTunnelWrapper(vp8tun, h)
-			if h.OnConnected != nil {
-				h.OnConnected(wrapped)
-			}
+			h.activateTunnel(vp8tun)
 		}
 	})
 
@@ -2739,6 +2751,41 @@ func (h *MaxHeadlessJoiner) setRemoteUfrag(u string) {
 	h.remoteUfrag = u
 }
 
+// activateTunnel is what both media paths (SFU consumer PC, DIRECT PC) run once the PC is connected.
+func (h *MaxHeadlessJoiner) activateTunnel(vp8tun *tunnel.VP8DataTunnel) {
+	if h.params != nil && h.params.Reliable {
+		mt := tunnel.NewMultiTrackTunnel([]*tunnel.VP8DataTunnel{vp8tun})
+		h.kcptun = tunnel.NewMultiTrackKCPTunnel(mt, h.logFn)
+		h.logFn("max-joiner: per-track kcp reliability active over video tunnel")
+		h.activateActiveTunnel(h.kcptun, vp8tun)
+	} else if h.params != nil && h.params.ReliableAuto {
+		armKCPAutoDetect(vp8tun, h.logFn, "max-joiner", func(active tunnel.DataTunnel, kcp *tunnel.MultiTrackKCPTunnel) tunnel.DataTunnel {
+			if old := h.kcptun; old != nil {
+				old.StopLayer()
+				h.kcptun = nil
+			}
+			h.kcptun = kcp
+			return h.activateActiveTunnel(active, vp8tun)
+		})
+	} else {
+		h.activateActiveTunnel(vp8tun, vp8tun)
+	}
+}
+
+func (h *MaxHeadlessJoiner) activateActiveTunnel(active tunnel.DataTunnel, vp8tun *tunnel.VP8DataTunnel) tunnel.DataTunnel {
+	if !h.configAck.acknowledged() {
+		acked, cancel := h.configAck.arm()
+		go sendVP8ConfigUntilAcked(acked, cancel, h.stopCh, active,
+			vp8tun.FPS(), vp8tun.Batch(), 1, h.logFn, "max-joiner")
+		h.logFn("max-joiner: pushed vp8 config fps=%d batch=%d", vp8tun.FPS(), vp8tun.Batch())
+	}
+	wrapped := newSFUTunnelWrapper(active, h)
+	if h.OnConnected != nil {
+		h.OnConnected(wrapped)
+	}
+	return wrapped
+}
+
 // sfuTunnelWrapper wraps a VP8 DataTunnel in SFU mode to intercept control-plane
 // frames (MsgConfig and MsgConfigAck on ControlConnID), automatically acknowledging
 // incoming config requests and confirming handshake completion without leaking
@@ -2834,4 +2881,37 @@ func (w *sfuTunnelWrapper) CtlQueueLen() int {
 		return cq.CtlQueueLen()
 	}
 	return 0
+}
+
+func (w *sfuTunnelWrapper) OnData(data []byte) {
+	w.onData(data)
+}
+
+func (w *sfuTunnelWrapper) FPS() int {
+	if f, ok := w.DataTunnel.(interface{ FPS() int }); ok {
+		return f.FPS()
+	}
+	return 0
+}
+
+func (w *sfuTunnelWrapper) Batch() int {
+	if b, ok := w.DataTunnel.(interface{ Batch() int }); ok {
+		return b.Batch()
+	}
+	return 0
+}
+
+func (w *sfuTunnelWrapper) QueueLen() int {
+	if q, ok := w.DataTunnel.(interface{ QueueLen() int }); ok {
+		return q.QueueLen()
+	}
+	return 0
+}
+
+func (w *sfuTunnelWrapper) TrySendData(frame []byte) bool {
+	if tsd, ok := w.DataTunnel.(interface{ TrySendData([]byte) bool }); ok {
+		return tsd.TrySendData(frame)
+	}
+	w.DataTunnel.SendData(frame)
+	return true
 }

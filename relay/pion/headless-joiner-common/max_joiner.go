@@ -362,6 +362,12 @@ type MaxHeadlessJoiner struct {
 	sfuSlots      map[string]*sfuSlot
 	sfuSlotAssign map[string]SFUStreamDesc
 
+	// selectedPair is the candidate-type summary of the ICE pair the CURRENT
+	// PeerConnection settled on, latched once per PC (see
+	// recordSelectedCandidatePair) and cleared when a PC is rebuilt. Read it
+	// with SelectedCandidatePair.
+	selectedPair atomic.Pointer[SelectedCandidatePair]
+
 	reconnectAttempt atomic.Int32
 	stopCh           chan struct{}
 	stopOnce         sync.Once
@@ -1685,6 +1691,7 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 		return
 	}
 	h.pc = pc
+	h.selectedPair.Store(nil)
 	h.attachTranscriptStateHandlers(pc)
 	h.startStatsLoop(pc)
 
@@ -1762,6 +1769,9 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		h.trState("ice", state.String(), "")
 		h.logFn("max-joiner: ICE state: %s", state.String())
+		if state == webrtc.ICEConnectionStateConnected || state == webrtc.ICEConnectionStateCompleted {
+			h.recordSelectedCandidatePair(pc)
+		}
 	})
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
@@ -1771,6 +1781,9 @@ func (h *MaxHeadlessJoiner) initPCSFU() {
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		h.trState("conn", state.String(), "")
 		h.logFn("max-joiner: PC state: %s", state.String())
+		if state == webrtc.PeerConnectionStateConnected {
+			h.recordSelectedCandidatePair(pc)
+		}
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
 			h.logFn("max-joiner: PC %s, closing transport to trigger reconnect", state.String())
 			h.closeTransport()
@@ -2057,29 +2070,65 @@ func (h *MaxHeadlessJoiner) describeSFUTrack(track *webrtc.TrackRemote) string {
 		track.Kind(), track.Codec().MimeType, track.SSRC(), track.StreamID(), track.ID(), slotID, mid, carries)
 }
 
+// maxRelayAcceptanceMinWait is how long the DIRECT-topology ICE agent refuses
+// to nominate a TURN `relay` candidate pair, so that host/srflx pairs get a
+// chance to validate first.
+//
+// Why it is needed: pion's controlling selector nominates
+// getBestValidCandidatePair() — the best pair that has ALREADY validated — and
+// once s.nominatedPair is set it never moves to a better pair
+// (third_party/pion-ice-v4/selection.go). With pion's 2 s default, any run in
+// which the peer's host/srflx checks are still outstanding at t=2 s latches the
+// whole session onto relay. MAX quotas each TURN allocation hard, so those
+// sessions deliver ~0.22 MB/s per direction instead of 2.5-2.9 MB/s; measured
+// at roughly 1 run in 6 on 2026-09-15.
+//
+// The tradeoff: a genuinely relay-only network now sits in ICE checking for
+// this long before it can connect. That is well inside ICE's own 30 s failure
+// budget (5 s disconnected + 25 s failed) and costs a few seconds of setup on a
+// network that was going to be relay-slow anyway; in exchange a network that
+// does have a working direct path stops falling back to a quota-capped relay
+// prematurely.
+const maxRelayAcceptanceMinWait = 7 * time.Second
+
+// maxDirectICEMaxBindingRequests raises pion's per-pair binding-request budget
+// (default 7) on the DIRECT path, matching what initPCSFU already does.
+//
+// Without it maxRelayAcceptanceMinWait would be inert: pingAllCandidates marks
+// a pair Failed once bindingRequestCount exceeds the budget, and at the 200 ms
+// default check interval that retires host/srflx pairs after ~1.4 s — before
+// the relay wait has even elapsed — after which they are never pinged again
+// (the "Maximum requests reached for pair ... marking it as failed" trace comes
+// from our OWN agent, not from the MAX media server). 50 requests keeps a pair
+// in the checklist for ~10 s, i.e. past the wait above.
+const maxDirectICEMaxBindingRequests = 50
+
+// applyDirectICESelectionTuning biases DIRECT-topology ICE away from
+// prematurely nominating a TURN relay pair, and reports whether it applied
+// anything.
+//
+// It is deliberately a no-op when the caller asked for iceTransportPolicy
+// "relay": there a relay pair is the ONLY thing that can ever be nominated, so
+// delaying it is pure harm. pion already encodes that (agent_config.go's
+// defaultRelayAcceptanceMinWaitFor returns 0 for a relay-only candidate-type
+// set), and calling SetRelayAcceptanceMinWait unconditionally would override
+// that sensible default back into a multi-second stall on the very mode
+// letmeout uses for censored networks.
+func applyDirectICESelectionTuning(se *webrtc.SettingEngine, policy webrtc.ICETransportPolicy) bool {
+	if se == nil || policy != webrtc.ICETransportPolicyAll {
+		return false
+	}
+	se.SetRelayAcceptanceMinWait(maxRelayAcceptanceMinWait)
+	se.SetICEMaxBindingRequests(maxDirectICEMaxBindingRequests)
+	return true
+}
+
 func (h *MaxHeadlessJoiner) initPC() {
 	if h.params.MediaMode == "sfu" {
 		h.initPCSFU()
 		return
 	}
 	iceServers := h.iceServers()
-
-	settingEngine := webrtc.SettingEngine{}
-	settingEngine.DisableCloseByDTLS(true)
-	settingEngine.DetachDataChannels()
-	if h.params != nil && h.params.Role == maxRoleAnswerer {
-		settingEngine.SetAnsweringDTLSRole(webrtc.DTLSRoleClient)
-	}
-	settingEngine.SetNetworkTypes([]webrtc.NetworkType{
-		webrtc.NetworkTypeUDP4,
-		webrtc.NetworkTypeTCP4,
-	})
-	lf := plog.NewDefaultLoggerFactory()
-	lf.DefaultLogLevel = plog.LogLevelTrace
-	settingEngine.LoggerFactory = lf
-	if h.PCConfig != nil {
-		h.PCConfig.ConfigureSettingEngine(&settingEngine)
-	}
 
 	// Relay-only ICE. This is what the real client does in whitelist/restricted
 	// mode: its SDK exposes forceRelayPolicy, which sets
@@ -2094,6 +2143,30 @@ func (h *MaxHeadlessJoiner) initPC() {
 		icePolicy = webrtc.ICETransportPolicyAll
 	}
 	h.logFn("max-joiner: ICE transport policy=%s", icePolicy)
+
+	settingEngine := webrtc.SettingEngine{}
+	settingEngine.DisableCloseByDTLS(true)
+	settingEngine.DetachDataChannels()
+	if h.params != nil && h.params.Role == maxRoleAnswerer {
+		settingEngine.SetAnsweringDTLSRole(webrtc.DTLSRoleClient)
+	}
+	settingEngine.SetNetworkTypes([]webrtc.NetworkType{
+		webrtc.NetworkTypeUDP4,
+		webrtc.NetworkTypeTCP4,
+	})
+	if applyDirectICESelectionTuning(&settingEngine, icePolicy) {
+		h.logFn("max-joiner: ICE selection tuning: relayAcceptanceMinWait=%s maxBindingRequests=%d",
+			maxRelayAcceptanceMinWait, maxDirectICEMaxBindingRequests)
+	}
+	lf := plog.NewDefaultLoggerFactory()
+	lf.DefaultLogLevel = plog.LogLevelTrace
+	settingEngine.LoggerFactory = lf
+	// Last, so an embedder's ConfigureSettingEngine can still override anything
+	// above (the ICE selection tuning included).
+	if h.PCConfig != nil {
+		h.PCConfig.ConfigureSettingEngine(&settingEngine)
+	}
+
 	pcCfg := webrtc.Configuration{
 		ICEServers:         iceServers,
 		ICETransportPolicy: icePolicy,
@@ -2105,9 +2178,13 @@ func (h *MaxHeadlessJoiner) initPC() {
 		return
 	}
 	h.pc = pc
+	h.selectedPair.Store(nil)
 	h.attachTranscriptStateHandlers(pc)
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		h.trState("ice", state.String(), "")
+		if state == webrtc.ICEConnectionStateConnected || state == webrtc.ICEConnectionStateCompleted {
+			h.recordSelectedCandidatePair(pc)
+		}
 	})
 	h.startStatsLoop(pc)
 
@@ -2181,6 +2258,9 @@ func (h *MaxHeadlessJoiner) initPC() {
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		h.trState("conn", state.String(), "")
 		h.logFn("max-joiner: PC state: %s", state.String())
+		if state == webrtc.PeerConnectionStateConnected {
+			h.recordSelectedCandidatePair(pc)
+		}
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
 			h.logFn("max-joiner: PC %s, closing transport to trigger reconnect", state.String())
 			h.closeTransport()

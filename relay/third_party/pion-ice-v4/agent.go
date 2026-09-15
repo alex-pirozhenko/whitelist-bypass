@@ -779,6 +779,8 @@ func (a *Agent) pingAllCandidates() {
 		a.log.Warn("Failed to ping without candidate pairs. Connection is not possible yet.")
 	}
 
+	selector := a.getSelector()
+
 	for _, p := range a.checklist {
 		if p.state == CandidatePairStateWaiting {
 			p.state = CandidatePairStateInProgress
@@ -786,11 +788,22 @@ func (a *Agent) pingAllCandidates() {
 			continue
 		}
 
+		// RELAY HEAD START (letmeout fork): controllingSelector.PingCandidate
+		// swallows relay-local checks during the grace window (see
+		// relayCheckDeferred in selection.go). Ask it here too so a check that
+		// is never sent does not consume the pair's binding-request budget —
+		// otherwise ~4 of the default 7 requests would be spent on silence
+		// before the grace even expires. The pair stays InProgress, so it is
+		// retried on the next tick and resumes normally after the grace.
+		if cs, ok := selector.(*controllingSelector); ok && cs.deferRelayCheck(p.Local) {
+			continue
+		}
+
 		if p.bindingRequestCount > a.maxBindingRequests {
 			a.log.Tracef("Maximum requests reached for pair %s, marking it as failed", p)
 			p.state = CandidatePairStateFailed
 		} else {
-			a.getSelector().PingCandidate(p.Local, p.Remote)
+			selector.PingCandidate(p.Local, p.Remote)
 			p.bindingRequestCount++
 		}
 	}

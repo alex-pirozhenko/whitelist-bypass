@@ -2070,55 +2070,55 @@ func (h *MaxHeadlessJoiner) describeSFUTrack(track *webrtc.TrackRemote) string {
 		track.Kind(), track.Codec().MimeType, track.SSRC(), track.StreamID(), track.ID(), slotID, mid, carries)
 }
 
-// maxRelayAcceptanceMinWait is how long the DIRECT-topology ICE agent refuses
-// to nominate a TURN `relay` candidate pair, so that host/srflx pairs get a
-// chance to validate first.
-//
-// Why it is needed: pion's controlling selector nominates
-// getBestValidCandidatePair() — the best pair that has ALREADY validated — and
-// once s.nominatedPair is set it never moves to a better pair
-// (third_party/pion-ice-v4/selection.go). With pion's 2 s default, any run in
-// which the peer's host/srflx checks are still outstanding at t=2 s latches the
-// whole session onto relay. MAX quotas each TURN allocation hard, so those
-// sessions deliver ~0.22 MB/s per direction instead of 2.5-2.9 MB/s; measured
-// at roughly 1 run in 6 on 2026-09-15.
-//
-// The tradeoff: a genuinely relay-only network now sits in ICE checking for
-// this long before it can connect. That is well inside ICE's own 30 s failure
-// budget (5 s disconnected + 25 s failed) and costs a few seconds of setup on a
-// network that was going to be relay-slow anyway; in exchange a network that
-// does have a working direct path stops falling back to a quota-capped relay
-// prematurely.
-const maxRelayAcceptanceMinWait = 7 * time.Second
-
 // maxDirectICEMaxBindingRequests raises pion's per-pair binding-request budget
 // (default 7) on the DIRECT path, matching what initPCSFU already does.
 //
-// Without it maxRelayAcceptanceMinWait would be inert: pingAllCandidates marks
-// a pair Failed once bindingRequestCount exceeds the budget, and at the 200 ms
-// default check interval that retires host/srflx pairs after ~1.4 s — before
-// the relay wait has even elapsed — after which they are never pinged again
-// (the "Maximum requests reached for pair ... marking it as failed" trace comes
-// from our OWN agent, not from the MAX media server). 50 requests keeps a pair
-// in the checklist for ~10 s, i.e. past the wait above.
+// What it buys: pingAllCandidates retires a pair once bindingRequestCount
+// exceeds the budget, and at the 200 ms default check interval the stock
+// budget of 7 retires every unanswered pair after ~1.4 s, after which it is
+// never pinged again (the "Maximum requests reached for pair ... marking it as
+// failed" trace comes from our OWN agent, not from the MAX media server). On
+// the DIRECT path a peer's host/srflx pair can easily need longer than that —
+// the two sides gather and start checking at different times — so 50 requests
+// (~10 s of checking) keeps the alternatives to relay alive long enough to
+// answer. It is harmless under any ICE transport policy; initPCSFU sets the
+// same value unconditionally.
+//
+// It is NOT what keeps DIRECT ICE off a relay pair. That is done in the
+// vendored pion fork — see the RELAY HEAD START comments in
+// relay/third_party/pion-ice-v4/selection.go.
 const maxDirectICEMaxBindingRequests = 50
 
-// applyDirectICESelectionTuning biases DIRECT-topology ICE away from
-// prematurely nominating a TURN relay pair, and reports whether it applied
-// anything.
+// applyDirectICESelectionTuning applies the DIRECT-topology ICE settings that
+// belong on the SettingEngine, and reports whether it applied anything.
 //
-// It is deliberately a no-op when the caller asked for iceTransportPolicy
-// "relay": there a relay pair is the ONLY thing that can ever be nominated, so
-// delaying it is pure harm. pion already encodes that (agent_config.go's
-// defaultRelayAcceptanceMinWaitFor returns 0 for a relay-only candidate-type
-// set), and calling SetRelayAcceptanceMinWait unconditionally would override
-// that sensible default back into a multi-second stall on the very mode
-// letmeout uses for censored networks.
-func applyDirectICESelectionTuning(se *webrtc.SettingEngine, policy webrtc.ICETransportPolicy) bool {
-	if se == nil || policy != webrtc.ICETransportPolicyAll {
+// HISTORY, so the next reader does not re-derive a disproven theory (fork PR
+// #24): this function used to also call SetRelayAcceptanceMinWait(7s), on the
+// theory that relay was being selected because host/srflx pairs had not
+// validated inside pion's 2 s relay gate. That call was INERT and the theory
+// was wrong. *AcceptanceMinWait is read only by
+// controllingSelector.isNominatable, and our vendored pion attaches
+// USE-CANDIDATE to every connectivity check (the AGGRESSIVE NOMINATION patch
+// the MAX ice-lite media server requires), so
+// controllingSelector.HandleSuccessResponse takes its
+// `pendingRequest.isUseCandidate && selectedPair == nil` branch and the FIRST
+// binding success is selected outright — isNominatable is never consulted.
+// Measurement agreed: over 46 DIRECT trials / 92 legs on 2026-09-15, eight of
+// the nine relay selections happened 338-546 ms in, far INSIDE the 2 s gate
+// that supposedly forbade them, and in seven of those eight a host pair
+// validated 1-4 ms later.
+//
+// What actually governs selection on this path — and therefore where the fix
+// lives — is which check goes on the wire first. The fork now withholds
+// relay-local checks for a short grace after ICE starts
+// (relayHeadStartGrace in relay/third_party/pion-ice-v4/selection.go), with
+// the relay-only carve-out handled there too: pion knows its own candidate
+// types, so iceTransportPolicy "relay" needs no special-casing from this side
+// any more.
+func applyDirectICESelectionTuning(se *webrtc.SettingEngine) bool {
+	if se == nil {
 		return false
 	}
-	se.SetRelayAcceptanceMinWait(maxRelayAcceptanceMinWait)
 	se.SetICEMaxBindingRequests(maxDirectICEMaxBindingRequests)
 	return true
 }
@@ -2154,9 +2154,8 @@ func (h *MaxHeadlessJoiner) initPC() {
 		webrtc.NetworkTypeUDP4,
 		webrtc.NetworkTypeTCP4,
 	})
-	if applyDirectICESelectionTuning(&settingEngine, icePolicy) {
-		h.logFn("max-joiner: ICE selection tuning: relayAcceptanceMinWait=%s maxBindingRequests=%d",
-			maxRelayAcceptanceMinWait, maxDirectICEMaxBindingRequests)
+	if applyDirectICESelectionTuning(&settingEngine) {
+		h.logFn("max-joiner: ICE selection tuning: maxBindingRequests=%d", maxDirectICEMaxBindingRequests)
 	}
 	lf := plog.NewDefaultLoggerFactory()
 	lf.DefaultLogLevel = plog.LogLevelTrace

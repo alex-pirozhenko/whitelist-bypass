@@ -115,6 +115,8 @@ type runOpts struct {
 	benchSize, benchIntervalMS int
 	benchRateCtl               bool
 	benchCSVPath               string
+	reliable                   bool
+	reliableAuto               bool
 }
 
 func main() {
@@ -144,6 +146,8 @@ func main() {
 	benchIntervalMS := flag.Int("bench-interval-ms", 50, "run/bench: interval between sends in ms (default 50)")
 	benchRateCtl := flag.Bool("bench-ratectl", true, "run/bench: drive the tunnel through the rate controller, so idle tiers and the AIMD frame size are exercised and reported (set false to measure the raw tunnel)")
 	benchCSV := flag.String("bench-csv", "", "run/bench: write one CSV line per second to this path (t,sentFrames,sentBytes,keepalives,recvFrames,recvBytes,gaps,lostPkts,rttMs,lossPct,maxFrameBytes,state)")
+	reliable := flag.Bool("reliable", false, "run: wrap video tunnel in per-track KCP reliability")
+	reliableAuto := flag.Bool("reliable-auto", false, "run: auto-detect KCP vs raw relay framing from peer")
 	flag.Parse()
 
 	if *tokenPath == "" {
@@ -171,6 +175,8 @@ func main() {
 		bench: *bench, benchSender: *benchSender, benchSize: *benchSize, benchIntervalMS: *benchIntervalMS,
 		benchRateCtl: *benchRateCtl,
 		benchCSVPath: *benchCSV,
+		reliable:     *reliable,
+		reliableAuto: *reliableAuto,
 	}
 
 	switch *mode {
@@ -252,6 +258,8 @@ func authParams(tf tokenFile, o runOpts) string {
 		SFUVideoWidth:      o.sfuWidth,
 		SFUVideoHeight:     o.sfuHeight,
 		ForceVP8Read:       o.mediaMode == "sfu" || o.mediaMode == "direct",
+		Reliable:           o.reliable,
+		ReliableAuto:       o.reliableAuto,
 	}
 	pj, _ := json.Marshal(params)
 	return string(pj)
@@ -497,7 +505,7 @@ func doRun(tf tokenFile, o runOpts) {
 				for i := range buf {
 					buf[i] = byte(i & 0xff)
 				}
-				logFn(">>> STARTING BENCHMARK chunk=%d bytes interval=%v", chunkSize, interval)
+				logFn(">>> STARTING BENCHMARK chunk=%d bytes interval=%v reliable=%v reliableAuto=%v", chunkSize, interval, o.reliable, o.reliableAuto)
 				seq := 0
 				ticker := time.NewTicker(interval)
 				defer ticker.Stop()

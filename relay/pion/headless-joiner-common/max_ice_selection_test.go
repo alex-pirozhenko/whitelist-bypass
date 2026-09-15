@@ -31,64 +31,76 @@ func relayAcceptanceMinWaitOf(se *webrtc.SettingEngine) (d time.Duration, set, o
 	return time.Duration(f.Elem().Int()), true, true
 }
 
-// TestApplyDirectICESelectionTuningPolicyGate pins the one decision that is
-// easy to get wrong: the relay wait must be applied for iceTransportPolicy
-// "all" and must NOT be applied for "relay", where relay is the only candidate
-// type and delaying its nomination would only stall the connection.
-func TestApplyDirectICESelectionTuningPolicyGate(t *testing.T) {
-	t.Run("policy all applies the wait", func(t *testing.T) {
+// maxBindingRequestsOf is the binding-request-budget counterpart of
+// relayAcceptanceMinWaitOf. Same reflect caveats.
+func maxBindingRequestsOf(se *webrtc.SettingEngine) (n uint16, set, ok bool) {
+	f := reflect.ValueOf(se).Elem().FieldByName("iceMaxBindingRequests")
+	if !f.IsValid() || f.Kind() != reflect.Ptr {
+		return 0, false, false
+	}
+	if f.IsNil() {
+		return 0, false, true
+	}
+	return uint16(f.Elem().Uint()), true, true
+}
+
+// TestApplyDirectICESelectionTuning pins what the DIRECT path puts on the
+// SettingEngine — and, just as importantly, what it must NOT put there.
+//
+// The relay acceptance wait must stay unset. Fork PR #24 set it to 7 s on a
+// theory that measurement disproved (see applyDirectICESelectionTuning's
+// comment); with the fork's aggressive nomination it never influenced
+// selection, and leaving a large value behind would only stall the
+// regular-nomination fallback paths. The relay bias now lives in the vendored
+// pion fork (relayHeadStartGrace), which is also where the relay-only
+// carve-out is enforced.
+func TestApplyDirectICESelectionTuning(t *testing.T) {
+	t.Run("sets the binding-request budget", func(t *testing.T) {
 		se := &webrtc.SettingEngine{}
-		if !applyDirectICESelectionTuning(se, webrtc.ICETransportPolicyAll) {
-			t.Fatal("expected tuning to be applied for policy=all")
+		if !applyDirectICESelectionTuning(se) {
+			t.Fatal("expected tuning to be applied")
 		}
-		got, set, ok := relayAcceptanceMinWaitOf(se)
+		got, set, ok := maxBindingRequestsOf(se)
 		if !ok {
-			t.Skip("SettingEngine.timeout.ICERelayAcceptanceMinWait not introspectable in this pion/webrtc version")
+			t.Skip("SettingEngine.iceMaxBindingRequests not introspectable in this pion/webrtc version")
 		}
 		if !set {
-			t.Fatal("relay acceptance min wait was not set on the SettingEngine")
+			t.Fatal("max binding requests was not set on the SettingEngine")
 		}
-		if got != maxRelayAcceptanceMinWait {
-			t.Fatalf("relay acceptance min wait = %s, want %s", got, maxRelayAcceptanceMinWait)
+		if got != maxDirectICEMaxBindingRequests {
+			t.Fatalf("max binding requests = %d, want %d", got, maxDirectICEMaxBindingRequests)
 		}
 	})
 
-	t.Run("policy relay leaves pion's relay-only default alone", func(t *testing.T) {
+	t.Run("leaves the relay acceptance wait at pion's default", func(t *testing.T) {
 		se := &webrtc.SettingEngine{}
-		if applyDirectICESelectionTuning(se, webrtc.ICETransportPolicyRelay) {
-			t.Fatal("expected tuning to be skipped for policy=relay")
-		}
+		applyDirectICESelectionTuning(se)
 		_, set, ok := relayAcceptanceMinWaitOf(se)
 		if ok && set {
-			t.Fatal("relay acceptance min wait must stay unset for policy=relay")
+			t.Fatal("relay acceptance min wait must stay unset: it is inert under aggressive " +
+				"nomination and only slows pion's fallback paths")
 		}
 	})
 
 	t.Run("nil engine", func(t *testing.T) {
-		if applyDirectICESelectionTuning(nil, webrtc.ICETransportPolicyAll) {
+		if applyDirectICESelectionTuning(nil) {
 			t.Fatal("expected false for a nil SettingEngine")
 		}
 	})
 }
 
-// TestMaxRelayAcceptanceMinWaitBounds guards the two ends of the tradeoff the
-// constant encodes: long enough to outlast pion's 2 s default (the window that
-// produced the relay latch), short enough to stay inside ICE's 30 s
-// disconnected+failed budget, and covered by the binding-request budget so the
-// host/srflx pairs are still being pinged when the wait expires.
-func TestMaxRelayAcceptanceMinWaitBounds(t *testing.T) {
-	if maxRelayAcceptanceMinWait <= 2*time.Second {
-		t.Fatalf("relay wait %s does not extend pion's 2s default", maxRelayAcceptanceMinWait)
+// TestMaxDirectICEMaxBindingRequestsBounds guards the budget against being
+// trimmed back toward pion's default: at the 200 ms check interval it has to
+// keep a pair in the checklist for several seconds, long enough for a peer
+// that gathered late to answer.
+func TestMaxDirectICEMaxBindingRequestsBounds(t *testing.T) {
+	const checkInterval = 200 * time.Millisecond
+	pingWindow := time.Duration(maxDirectICEMaxBindingRequests) * checkInterval
+	if pingWindow < 5*time.Second {
+		t.Fatalf("binding-request budget covers only %s of checking", pingWindow)
 	}
-	if maxRelayAcceptanceMinWait >= 30*time.Second {
-		t.Fatalf("relay wait %s exceeds ICE's 30s failure budget", maxRelayAcceptanceMinWait)
-	}
-	// pion pings every 200ms (defaultCheckInterval), so the budget covers
-	// maxDirectICEMaxBindingRequests*200ms before a pair is retired.
-	pingWindow := time.Duration(maxDirectICEMaxBindingRequests) * 200 * time.Millisecond
-	if pingWindow <= maxRelayAcceptanceMinWait {
-		t.Fatalf("binding-request budget covers only %s, which expires before the %s relay wait",
-			pingWindow, maxRelayAcceptanceMinWait)
+	if maxDirectICEMaxBindingRequests != 50 {
+		t.Fatalf("budget = %d, want 50 to match initPCSFU", maxDirectICEMaxBindingRequests)
 	}
 }
 

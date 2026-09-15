@@ -31,6 +31,85 @@ func (s *controllingSelector) Start() {
 	s.nominatedPair = nil
 }
 
+// RELAY HEAD START (letmeout fork): how long after ICE start the controlling
+// agent refuses to send a connectivity check whose LOCAL candidate is a TURN
+// relay, so host/srflx pairs get to answer first.
+//
+// Why a plain time window and not one of the *AcceptanceMinWait knobs: the
+// only reader of those is isNominatable, and on this fork isNominatable is
+// never reached for the decision that matters. PingCandidate below attaches
+// USE-CANDIDATE to EVERY check (see the AGGRESSIVE NOMINATION comment), so
+// pendingRequest.isUseCandidate is always true and HandleSuccessResponse's
+// `else if selectedPair == nil { setSelectedPair(pair) }` branch makes the
+// FIRST binding success win outright — no priority comparison, no acceptance
+// wait. Selection here is a pure first-response-wins race, so the only lever
+// that can bias it is not putting the relay check on the wire yet.
+//
+// Why 750ms: measured over 46 MAX DIRECT trials / 92 ICE legs (2026-09-15),
+// relay was the selected LOCAL candidate on 9 legs — 9.8% of all legs, 17.4%
+// of offerer (controlling) legs. Eight of those 9 landed between 338ms and
+// 546ms after ICE start, and in 7 of the 8 a host pair validated just 1-4ms
+// later — i.e. the responses arrive essentially together and the winner is
+// decided by checklist order. 750ms clears the slowest observed relay win
+// (546ms) with ~200ms of headroom while staying far inside ICE's own budget
+// (5s disconnected + 25s failed).
+//
+// What it costs: on a network where relay really is the only workable path
+// under iceTransportPolicy "all" (1 of the 92 legs), connect time grows by
+// the grace plus at most one 200ms check tick — roughly 0.75-0.95s. Under
+// iceTransportPolicy "relay" it costs nothing at all; see deferRelayCheck.
+const relayHeadStartGrace = 750 * time.Millisecond
+
+// relayCheckDeferred is the RELAY HEAD START (letmeout fork) decision, split
+// out from the agent so it can be unit-tested without a live ICE agent.
+//
+// It gates ONLY the window before anything is selected, and only for local
+// relay candidates on an agent that has non-relay candidate types to fall
+// back on. Once sinceStart reaches relayHeadStartGrace it returns false
+// forever, so behaviour after the grace is byte-for-byte what it is today.
+func relayCheckDeferred(localType CandidateType, sinceStart time.Duration, relayOnly, pairSelected bool) bool {
+	if localType != CandidateTypeRelay {
+		return false
+	}
+	// Relay-only candidate set (iceTransportPolicy "relay", the mode letmeout
+	// uses on censored networks): a relay pair is the only thing that can ever
+	// be selected, so delaying it is pure harm. This mirrors how upstream pion
+	// special-cases the same set in defaultRelayAcceptanceMinWaitFor.
+	if relayOnly {
+		return false
+	}
+	// A pair is already selected: this is a keepalive/renomination check, not
+	// the initial race. Never suppress those.
+	if pairSelected {
+		return false
+	}
+
+	return sinceStart < relayHeadStartGrace
+}
+
+// isRelayOnly reports whether the agent can only ever produce relay pairs.
+// RELAY HEAD START (letmeout fork) helper; mirrors the test in
+// defaultRelayAcceptanceMinWaitFor.
+func (a *Agent) isRelayOnly() bool {
+	return len(a.candidateTypes) == 1 && a.candidateTypes[0] == CandidateTypeRelay
+}
+
+// deferRelayCheck is relayCheckDeferred wired to live agent state.
+// RELAY HEAD START (letmeout fork).
+func (s *controllingSelector) deferRelayCheck(local Candidate) bool {
+	// Start() has not run, so there is no window to be inside of. Fail open.
+	if s.startTime.IsZero() {
+		return false
+	}
+
+	return relayCheckDeferred(
+		local.Type(),
+		time.Since(s.startTime),
+		s.agent.isRelayOnly(),
+		s.agent.getSelectedPair() != nil,
+	)
+}
+
 func (s *controllingSelector) isNominatable(c Candidate) bool {
 	switch {
 	case c.Type() == CandidateTypeHost:
@@ -202,6 +281,24 @@ func (s *controllingSelector) PingCandidate(local, remote Candidate) {
 	// the SFU never answers the pre-nomination checks. isUseCandidate is
 	// auto-derived from the message (agent.sendBindingRequest), so the first
 	// success still selects the pair correctly.
+	//
+	// RELAY HEAD START (letmeout fork): because of the above, whichever check
+	// is answered first wins outright. During the first relayHeadStartGrace
+	// after ICE start we therefore do not put a relay-local check on the wire
+	// at all, giving host/srflx pairs a head start. Skipping the send (rather
+	// than dropping USE-CANDIDATE from it) leaves the pair in
+	// CandidatePairStateInProgress, so pingAllCandidates keeps it in the
+	// checklist and resumes normal aggressive checks the moment the grace
+	// expires; a pair that had been allowed to reach ...StateSucceeded would
+	// never be pinged again and could only be selected via the much slower
+	// regular-nomination path. See relayCheckDeferred for the grace's bounds
+	// and for the relay-only carve-out.
+	if s.deferRelayCheck(local) {
+		s.log.Tracef("Deferring relay check (%s, %s): inside the %s relay head-start grace",
+			local, remote, relayHeadStartGrace)
+
+		return
+	}
 	msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
 		stun.NewUsername(s.agent.remoteUfrag+":"+s.agent.localUfrag),
 		UseCandidate(),

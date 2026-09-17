@@ -66,9 +66,15 @@ func (p *VP8Packetizer) Packetize(frame []byte, isKeyframe bool, tsDelta uint32,
 	if p.pictureID == 0 {
 		p.pictureID = 1
 	}
-	if isKeyframe {
-		p.tl0picidx++
-	}
+	// TID is hardcoded to 0 below (single temporal layer), so every frame --
+	// keyframe or interframe -- belongs to TL0. RFC 7741's TL0PICIDX must
+	// increment on every TL0 frame, not just keyframes: freezing it across a
+	// run of interframes while TID stays 0 is an internally-inconsistent
+	// descriptor a real single-layer VP8 encoder never produces, and a
+	// giveaway to anything parsing the payload descriptor. isKeyframe is
+	// intentionally unused here now; kept in the signature for callers and
+	// because a future multi-layer TID would need it again.
+	p.tl0picidx++
 
 	buildDescriptor := func(startOfPartition bool) []byte {
 		b0 := byte(0x80) // X=1
@@ -133,6 +139,7 @@ type VP8DataTunnel struct {
 	packetizer     *VP8Packetizer
 	needKeyframe   atomic.Bool
 	keyframePeriod int
+	frameSeq       atomic.Uint64
 	logFn          func(string, ...any)
 	obf            *TunnelObfuscator
 	stopCh         chan struct{}
@@ -201,6 +208,27 @@ func (t *VP8DataTunnel) SetOnPeerRestart(fn func()) { t.OnPeerRestart = fn }
 
 func (t *VP8DataTunnel) RequestKeyframe() {
 	t.needKeyframe.Store(true)
+}
+
+// dueForKeyframe decides, for the next emitted sample (data or keepalive),
+// whether it should carry the keyframe tag. Two independent triggers OR
+// together: an explicit RequestKeyframe() call (e.g. the SFU sent a PLI/FIR
+// on the video sender, see max_joiner.go) always wins and is consumed
+// exactly once; otherwise the tunnel free-runs a periodic cadence of one
+// keyframe every keyframePeriod emitted samples, counting keepalives too --
+// a real VP8 encoder keeps ticking its GOP clock through silence, it doesn't
+// pause it, so the fake stream must not either.
+func (t *VP8DataTunnel) dueForKeyframe() bool {
+	// frameSeq must advance exactly once per call regardless of which
+	// branch below decides the outcome -- if a forced keyframe (RequestKeyframe)
+	// skipped the increment, the periodic cadence would land on the same
+	// counter value again next call and double up (observed as two
+	// keyframes back-to-back instead of the intended 1-in-keyframePeriod).
+	n := t.frameSeq.Add(1) - 1
+	period := uint64(t.keyframePeriod)
+	cadenceDue := period <= 1 || n%period == 0
+	forced := t.needKeyframe.Swap(false)
+	return cadenceDue || forced
 }
 
 func NewVP8DataTunnel(track *webrtc.TrackLocalStaticSample, obf *TunnelObfuscator, logFn func(string, ...any)) *VP8DataTunnel {
@@ -504,14 +532,24 @@ func (t *VP8DataTunnel) writerLoop() {
 		}
 
 		sendFrame := func(data []byte) {
-			isKf := true
-			s := t.obf.EncodeDataKeyframe(data)
+			isKf := t.dueForKeyframe()
+			var s []byte
+			if isKf {
+				s = t.obf.EncodeDataKeyframe(data)
+			} else {
+				s = t.obf.EncodeData(data)
+			}
 			emit(s, isKf, false)
 		}
 
 		sendKeepalive := func(padLen int) {
-			isKf := true
-			s := t.obf.EncodeKeepalive(padLen)
+			isKf := t.dueForKeyframe()
+			var s []byte
+			if isKf {
+				s = t.obf.EncodeKeepalive(padLen)
+			} else {
+				s = t.obf.EncodeKeepaliveInterframe(padLen)
+			}
 			emit(s, isKf, true)
 		}
 

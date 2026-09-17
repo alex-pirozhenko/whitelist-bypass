@@ -243,12 +243,10 @@ func (o *TunnelObfuscator) Decode(frame []byte) DecodeResult {
 		return DecodeResult{}
 	}
 	var hdrLen, epochOff int
-	isKeyframe := false
 	switch frame[0] {
 	case vp8Keyframe[0]:
 		hdrLen = keyframeHdrLen
 		epochOff = vp8KeyframeLen
-		isKeyframe = true
 	case vp8Interframe[0]:
 		hdrLen = interframeHdrLen
 		epochOff = vp8InterframeLen
@@ -290,11 +288,18 @@ func (o *TunnelObfuscator) Decode(frame []byte) DecodeResult {
 	ciphertext := body[nonceSize:]
 	plaintext, err := o.aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		if isKeyframe {
-			res.Keepalive = true
-			return res
-		}
-		return DecodeResult{}
+		// A keepalive's body is random padding, not a real AEAD ciphertext,
+		// so it fails Open() by construction; that is expected and must not
+		// be counted as a corrupt frame. This used to only be recognized for
+		// the keyframe tag (isKeyframe), because every keepalive the sender
+		// emitted was keyframe-tagged. Now that EncodeKeepaliveInterframe
+		// puts keepalives under the interframe tag too (real cadence), the
+		// receiver must treat an unauthenticated body the same way
+		// regardless of which tag carried it -- otherwise interframe-tagged
+		// keepalives get miscounted as bad/corrupt frames instead of
+		// recognized as keepalives.
+		res.Keepalive = true
+		return res
 	}
 	res.Payload = plaintext
 	return res

@@ -159,6 +159,7 @@ type VP8DataTunnel struct {
 	profileIdleKeepalive time.Duration // 0 = use the jittered keepaliveMin/Max range (today's default)
 	maxFrameBytes        int           // cfgMu-protected; 0 = coalescing disabled (today's behavior)
 	tier                 Tier          // cfgMu-protected; informational only, see Profile.Tier
+	keepaliveInterframe  bool          // cfgMu-protected; see TunnelConfig.KeepaliveInterframe, default false
 
 	sentFrames      atomic.Uint64
 	sentBytes       atomic.Uint64
@@ -205,6 +206,61 @@ func (t *VP8DataTunnel) Counters() Counters {
 func (t *VP8DataTunnel) SetOnData(fn func([]byte))  { t.OnData = fn }
 func (t *VP8DataTunnel) SetOnClose(fn func())       { t.OnClose = fn }
 func (t *VP8DataTunnel) SetOnPeerRestart(fn func()) { t.OnPeerRestart = fn }
+
+// TunnelConfig carries construction-time wire-compatibility toggles for a
+// VP8DataTunnel -- knobs that gate a specific *receiver* capability, unlike
+// Profile (which only tunes send-side rate/pacing and is always safe for any
+// decoder that already understands this tunnel's wire format at all).
+type TunnelConfig struct {
+	// KeepaliveInterframe, when true, lets idle keepalives ride the same I/P
+	// keyframe cadence introduced for data frames (see dueForKeyframe):
+	// ~1-in-keyframePeriod keepalives are keyframe-tagged (EncodeKeepalive),
+	// the rest interframe-tagged (EncodeKeepaliveInterframe).
+	//
+	// Default false: every keepalive is sent via EncodeKeepalive (keyframe
+	// tag), byte-for-byte identical to this tunnel's behavior before the I/P
+	// cadence change. This is required for backward compatibility -- every
+	// already-deployed device APK runs the pre-cadence obfuscator.go, whose
+	// Decode() only recognizes an AEAD-authentication failure as a keepalive
+	// under the keyframe tag (see the isKeyframe-gated branch this package's
+	// history shows was removed from Decode). An interframe-tagged keepalive
+	// sent to that decoder is NOT recognized as a keepalive -- it falls
+	// through to the same code path as a genuinely corrupt frame
+	// (DecodeResult{}, HasFrame=false), which VP8DataTunnel.HandleFrame on
+	// the receiving side counts as badFrames and logs as "undecodable
+	// frame". Data frames are unaffected by this flag in either direction:
+	// old decoders already accept interframe-tagged DATA frames fine (the
+	// success path through Decode -- AEAD Open() succeeds -- never
+	// depended on which tag the frame carried, before or after this
+	// package's I/P cadence change; only the Open()-failure/keepalive
+	// branch was tag-gated).
+	//
+	// Flip to true only once every device in the fleet is running a
+	// decoder new enough to treat both tags symmetrically in Decode's
+	// Open()-failure branch.
+	KeepaliveInterframe bool
+}
+
+// ApplyConfig applies a TunnelConfig's toggles. Safe to call before or after
+// Start(); like SetProfile, it is cfgMu-protected and picked up by the next
+// sendKeepalive call.
+func (t *VP8DataTunnel) ApplyConfig(cfg TunnelConfig) {
+	t.SetKeepaliveInterframe(cfg.KeepaliveInterframe)
+}
+
+// SetKeepaliveInterframe sets the KeepaliveInterframe toggle (see
+// TunnelConfig). Default is false.
+func (t *VP8DataTunnel) SetKeepaliveInterframe(enabled bool) {
+	t.cfgMu.Lock()
+	t.keepaliveInterframe = enabled
+	t.cfgMu.Unlock()
+}
+
+func (t *VP8DataTunnel) keepaliveInterframeEnabled() bool {
+	t.cfgMu.Lock()
+	defer t.cfgMu.Unlock()
+	return t.keepaliveInterframe
+}
 
 func (t *VP8DataTunnel) RequestKeyframe() {
 	t.needKeyframe.Store(true)
@@ -544,6 +600,20 @@ func (t *VP8DataTunnel) writerLoop() {
 
 		sendKeepalive := func(padLen int) {
 			isKf := t.dueForKeyframe()
+			// dueForKeyframe is always consulted (even when the interframe
+			// path below is disabled) so toggling KeepaliveInterframe never
+			// shifts the cadence counter data frames key off of -- only
+			// which encode function a non-cadence-due keepalive uses
+			// changes.
+			if !isKf && !t.keepaliveInterframeEnabled() {
+				// KeepaliveInterframe is off (the default): every keepalive
+				// stays keyframe-tagged via EncodeKeepalive, byte-identical
+				// to this tunnel's pre-cadence behavior, for compatibility
+				// with decoders that don't yet accept an interframe-tagged
+				// keepalive (see TunnelConfig.KeepaliveInterframe).
+				emit(t.obf.EncodeKeepalive(padLen), true, true)
+				return
+			}
 			var s []byte
 			if isKf {
 				s = t.obf.EncodeKeepalive(padLen)

@@ -114,6 +114,12 @@ func TestKeyframeCadenceOnDataFrames(t *testing.T) {
 // (EncodeKeepalive). Before this fix, sendKeepalive hardcoded isKf := true
 // unconditionally, so a real SFU/anti-fraud parser would see a 100%-keyframe
 // stream even at idle.
+//
+// This behavior is opt-in via TunnelConfig.KeepaliveInterframe (default
+// false, see TestKeepaliveInterframeDefaultOffMatchesPreCadenceBehavior for
+// the default-off, backward-compatible path) -- old decoders in the fleet
+// only recognize an AEAD-auth failure as a keepalive under the keyframe tag,
+// so this test explicitly enables the flag to exercise the new path.
 func TestKeyframeCadenceOnIdleKeepalives(t *testing.T) {
 	sender, err := NewTunnelObfuscator([]byte("cadence-idle-secret"))
 	if err != nil {
@@ -125,6 +131,7 @@ func TestKeyframeCadenceOnIdleKeepalives(t *testing.T) {
 	}
 
 	tun := NewVP8DataTunnelWithQueue(nil, sender, func(string, ...any) {}, 64)
+	tun.SetKeepaliveInterframe(true)
 	// Force a tight, deterministic keepalive cadence: with fps=2000 the
 	// sample interval is 500us, and a 1ms idle-keepalive period yields a
 	// keepalive roughly every 2 ticks -- fast enough to collect hundreds of
@@ -304,5 +311,94 @@ func TestVP8DataTunnelDataPumpAcrossKeyframeBoundary(t *testing.T) {
 	}
 	if !sawInterframeTag.Load() {
 		t.Errorf("expected at least one interframe-tagged data frame across %d messages (period=%d)", numMsgs, period)
+	}
+}
+
+// TestKeepaliveInterframeDefaultOffMatchesPreCadenceBehavior is the compat
+// gate this PR's review requested: every deployed device APK runs the
+// pre-cadence obfuscator.go, whose Decode() only recognizes an AEAD-auth
+// failure as a keepalive under the keyframe tag (see the isKeyframe-gated
+// branch removed from Decode by this commit). TunnelConfig.KeepaliveInterframe
+// defaults to false, and this test asserts that with it left at the zero
+// value (never touched), an otherwise-idle stream's keepalives are:
+//  1. 100% keyframe-tagged (never falling onto the interframe path), and
+//  2. byte-identical, header for header, to what the pre-existing
+//     EncodeKeepalive(padLen) API produces directly -- i.e. exactly the
+//     wire shape old decoders were built against, unaffected by this PR's
+//     cadence machinery. (EncodeKeepalive's trailing bytes beyond the fixed
+//     keyframeHdrLen-byte header are random padding, not reproducible
+//     byte-for-byte across calls, so the header prefix is what's compared.)
+//
+// Data frames are intentionally NOT covered by this flag (see
+// TestKeyframeCadenceOnDataFrames) -- old decoders already accept
+// interframe-tagged DATA frames today (Decode's success path never keyed
+// off which tag arrived, only its Open()-failure/keepalive branch did), so
+// the data-frame I/P cadence from this PR is safe to ship unconditionally.
+func TestKeepaliveInterframeDefaultOffMatchesPreCadenceBehavior(t *testing.T) {
+	secret := []byte("compat-gate-secret")
+	sender, err := NewTunnelObfuscator(secret)
+	if err != nil {
+		t.Fatalf("NewTunnelObfuscator sender: %v", err)
+	}
+	receiver, err := NewTunnelObfuscator(secret)
+	if err != nil {
+		t.Fatalf("NewTunnelObfuscator receiver: %v", err)
+	}
+
+	tun := NewVP8DataTunnelWithQueue(nil, sender, func(string, ...any) {}, 64)
+	// KeepaliveInterframe is intentionally left at its zero value (false) --
+	// this test is exactly about verifying that default.
+	tun.profileIdleKeepalive = time.Millisecond
+
+	const period = defaultKeyframeRate
+	const numKeepalives = period * 5 // 200, well more than one cadence period
+
+	captured := make(chan []byte, numKeepalives*2)
+	tun.WriteFrame = func(frame []byte) error {
+		cp := make([]byte, len(frame))
+		copy(cp, frame)
+		select {
+		case captured <- cp:
+		default:
+		}
+		return nil
+	}
+
+	tun.Start(2000, 1)
+	defer tun.Stop()
+
+	// The header (fixed keyframeHdrLen bytes: 160-byte libvpx keyframe +
+	// 4-byte epoch) is deterministic for a fixed localEpoch and independent
+	// of padLen; obtain it directly from EncodeKeepalive(0) (no padding) to
+	// compare against every captured frame's header prefix.
+	wantHeader := sender.EncodeKeepalive(0)
+	if len(wantHeader) != keyframeHdrLen {
+		t.Fatalf("EncodeKeepalive(0) length = %d, want keyframeHdrLen=%d", len(wantHeader), keyframeHdrLen)
+	}
+
+	frames := make([][]byte, 0, numKeepalives)
+	for len(frames) < numKeepalives {
+		select {
+		case f := <-captured:
+			frames = append(frames, f)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out after capturing %d/%d idle keepalives", len(frames), numKeepalives)
+		}
+	}
+
+	for i, f := range frames {
+		if !isKeyframeTagged(t, f) {
+			t.Fatalf("frame %d: KeepaliveInterframe=false but frame was interframe-tagged (tag=0x%02x) -- old decoders would classify this as undecodable", i, f[0])
+		}
+		if len(f) < keyframeHdrLen {
+			t.Fatalf("frame %d: length %d < keyframeHdrLen %d", i, len(f), keyframeHdrLen)
+		}
+		if !bytes.Equal(f[:keyframeHdrLen], wantHeader) {
+			t.Fatalf("frame %d: header %v != EncodeKeepalive(0) header %v -- not byte-compatible with the pre-cadence keepalive wire shape", i, f[:keyframeHdrLen], wantHeader)
+		}
+		res := receiver.Decode(f)
+		if !res.HasFrame || !res.Keepalive {
+			t.Fatalf("frame %d: did not decode as a keepalive: %+v", i, res)
+		}
 	}
 }

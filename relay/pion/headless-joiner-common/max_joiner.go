@@ -930,6 +930,22 @@ func (h *MaxHeadlessJoiner) handleConnection(m map[string]interface{}) {
 			}
 			h.sendAllocateConsumer()
 		}
+		// The signalling join is complete: op166 VideoChatJoin was accepted
+		// (joinCall), the ws2 socket is up, the server sent its "connection"
+		// notification with this session's TURN/STUN grant, and the
+		// PeerConnection is built and gathering. What has NOT happened is a
+		// remote peer answering — in DIRECT topology that only happens when a
+		// real device joins, so h.pc will sit in "new"/"checking" until then
+		// and StatusTunnelConnected (emitted from OnConnectionStateChange)
+		// will not fire.
+		//
+		// Emit here so a supervisor can tell "in the room, waiting for a
+		// peer" apart from "the join failed", which are otherwise identical
+		// from the outside: both are just silence after StatusConnecting.
+		// Guarded by the same h.pc == nil check as initPC, so a repeated
+		// "connection" notification does not re-emit it.
+		h.logFn("max-joiner: signalling joined, waiting for a peer self=%s topology=%s", h.selfUID, topology)
+		h.Status.EmitStatus(common.StatusJoined)
 	}
 }
 

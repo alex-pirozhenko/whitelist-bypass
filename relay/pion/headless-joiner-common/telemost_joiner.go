@@ -27,6 +27,27 @@ const (
 	TmPingPeriod = 5 * time.Second
 )
 
+// iceResolveBudget bounds the *total* wall-clock time the joiner may spend
+// pre-resolving the ICE server hostnames named in serverHello, before it
+// creates its PeerConnections.
+//
+// Pre-resolution is an optimisation only: it lets the ICE agent skip a DNS
+// round trip and keeps the lookup on the joiner's own ResolveFn. Pion resolves
+// turn:/stun: hostnames itself, lazily, at gathering time, so failing to
+// pre-resolve costs at worst that server's candidates -- never PeerConnection
+// creation. The MAX joiner never pre-resolves its ICE servers at all
+// (max_joiner.go iceServers()) and pairs fine.
+//
+// It used to be unbounded and serial: one ResolveFn call per *URL*, each with
+// the caller's own multi-second timeout, and a failure was not negatively
+// cached so the same dead hostname was retried once per URL. On 2026-09-18 a
+// real device hit exactly that -- turn.tel.yandex.net timed out 5s x 4 URLs,
+// so the PeerConnections were not created until 20.1s after serverHello, past
+// the client's 15s per-provider readiness deadline. ICE never started, and
+// because parseICEServersFromHello runs on the websocket read loop the whole
+// signalling session stalled with it. Hence: concurrent, budgeted, non-fatal.
+const iceResolveBudget = 1500 * time.Millisecond
+
 type TelemostHeadlessJoiner struct {
 	logFn       func(string, ...any)
 	OnConnected func(tunnel.DataTunnel)
@@ -258,17 +279,10 @@ func (j *TelemostHeadlessJoiner) resetSessionState() {
 	if j.vp8tunnel != nil {
 		j.vp8tunnel.Stop()
 	}
-	if j.subPC != nil {
-		j.subPC.Close()
-	}
-	if j.pubPC != nil {
-		j.pubPC.Close()
-	}
-	j.subPC = nil
+	j.closePCPair()
 	j.subSeq = 0
 	j.subRemoteSet = false
 	j.subPending = nil
-	j.pubPC = nil
 	j.pubSeq = 0
 	j.pubRemoteSet = false
 	j.pubPending = nil
@@ -346,11 +360,21 @@ func (j *TelemostHeadlessJoiner) Close() {
 	if j.vp8tunnel != nil {
 		j.vp8tunnel.Stop()
 	}
+	j.closePCPair()
+}
+
+// closePCPair closes and forgets the current subscriber/publisher
+// PeerConnection pair. Closing a PeerConnection is what tears down its ICE
+// agent, DTLS transport and any TURN allocation behind it; dropping the
+// pointer alone leaves all three running for the life of the process.
+func (j *TelemostHeadlessJoiner) closePCPair() {
 	if j.subPC != nil {
 		j.subPC.Close()
+		j.subPC = nil
 	}
 	if j.pubPC != nil {
 		j.pubPC.Close()
+		j.pubPC = nil
 	}
 }
 
@@ -544,6 +568,30 @@ func (j *TelemostHeadlessJoiner) sendICE(cand *webrtc.ICECandidate, target strin
 }
 
 func (j *TelemostHeadlessJoiner) initPC() {
+	// Re-init safety. initPC is driven straight off handleMessage's
+	// serverHello branch, and Telemost sends a fresh serverHello whenever it
+	// re-hellos on an existing websocket. That used to overwrite j.subPC and
+	// j.pubPC outright, orphaning the previous pair -- ICE agent, DTLS
+	// transport and TURN allocation all still live, none of them reachable.
+	// Under session churn on the exit that measured ~+125 goroutines/h.
+	// MaxHeadlessJoiner already closes its PC before recreating it (see the
+	// sessionId-changed branch of producer-updated in max_joiner.go); the
+	// reconnect path here does too, via resetSessionState. Only the
+	// same-session re-init was missing it.
+	//
+	// The isClosed() check covers the other half seen in the 2026-09-18
+	// capture: PCs built 20s after serverHello, into a session the ladder had
+	// already abandoned, going straight to "closed". Build nothing for a
+	// joiner that is already shutting down.
+	if j.isClosed() {
+		j.logFn("telemost-joiner: initPC skipped, joiner already closed")
+		return
+	}
+	if j.subPC != nil || j.pubPC != nil {
+		j.logFn("telemost-joiner: re-init on serverHello, closing previous sub+pub PCs")
+		j.closePCPair()
+	}
+
 	config := webrtc.Configuration{ICEServers: j.iceServers}
 
 	settingEngine := webrtc.SettingEngine{}
@@ -1041,6 +1089,73 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 	}
 }
 
+// iceHostsOf returns the distinct non-literal hostnames named by the ICE
+// server URLs, in first-seen order. IP literals need no resolution.
+func iceHostsOf(iceServers []webrtc.ICEServer) []string {
+	var hosts []string
+	seen := make(map[string]bool)
+	for _, s := range iceServers {
+		for _, u := range s.URLs {
+			host := common.ExtractICEHost(u)
+			if host == "" || net.ParseIP(host) != nil || seen[host] {
+				continue
+			}
+			seen[host] = true
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
+}
+
+type iceHostResult struct {
+	host string
+	ip   string
+	err  error
+}
+
+// resolveICEHosts resolves every host concurrently -- once per host, not once
+// per URL -- and abandons the lot after iceResolveBudget. Hosts that failed or
+// did not answer in time are simply absent from the returned map; the caller
+// keeps their hostname URL. It never returns an error: a slow or broken
+// resolver must not be able to delay PeerConnection creation.
+func (j *TelemostHeadlessJoiner) resolveICEHosts(hosts []string) map[string]string {
+	out := make(map[string]string, len(hosts))
+	resolve := j.ResolveFn
+	if len(hosts) == 0 || resolve == nil {
+		return out
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), iceResolveBudget)
+	defer cancel()
+	// Buffered by len(hosts): a goroutine whose ResolveFn only returns long
+	// after the budget expired can still deliver its result and exit instead
+	// of blocking forever on the send.
+	results := make(chan iceHostResult, len(hosts))
+	for _, host := range hosts {
+		go func(host string) {
+			ip, err := resolve(host)
+			results <- iceHostResult{host: host, ip: ip, err: err}
+		}(host)
+	}
+	for range hosts {
+		select {
+		case r := <-results:
+			switch {
+			case r.err != nil:
+				j.logFn("telemost-joiner: resolve ICE host %s failed: %s (keeping hostname)", common.MaskAddr(r.host), common.MaskError(r.err))
+			case r.ip == "":
+				j.logFn("telemost-joiner: resolve ICE host %s returned no address (keeping hostname)", common.MaskAddr(r.host))
+			default:
+				out[r.host] = r.ip
+				j.logFn("telemost-joiner: resolved ICE host %s -> %s", r.host, r.ip)
+			}
+		case <-ctx.Done():
+			j.logFn("telemost-joiner: ICE host pre-resolution gave up after %s, %d/%d resolved (keeping hostnames for the rest)", iceResolveBudget, len(out), len(hosts))
+			return out
+		}
+	}
+	return out
+}
+
 func (j *TelemostHeadlessJoiner) parseICEServersFromHello(sh map[string]interface{}) {
 	rtcCfg, ok := sh["rtcConfiguration"].(map[string]interface{})
 	if !ok {
@@ -1068,7 +1183,7 @@ func (j *TelemostHeadlessJoiner) parseICEServersFromHello(sh map[string]interfac
 		}
 		iceServers = append(iceServers, ice)
 	}
-	resolved := make(map[string]string)
+	resolved := j.resolveICEHosts(iceHostsOf(iceServers))
 	for i, s := range iceServers {
 		for k, u := range s.URLs {
 			host := common.ExtractICEHost(u)
@@ -1077,14 +1192,9 @@ func (j *TelemostHeadlessJoiner) parseICEServersFromHello(sh map[string]interfac
 			}
 			ip, ok := resolved[host]
 			if !ok {
-				var err error
-				ip, err = j.ResolveFn(host)
-				if err != nil {
-					j.logFn("telemost-joiner: resolve ICE host %s failed: %s", common.MaskAddr(host), common.MaskError(err))
-					continue
-				}
-				resolved[host] = ip
-				j.logFn("telemost-joiner: resolved ICE host %s -> %s", host, ip)
+				// Non-fatal by design: keep the hostname URL exactly as the
+				// SFU sent it and let pion's ICE agent resolve it lazily.
+				continue
 			}
 			iceServers[i].URLs[k] = strings.Replace(u, host, ip, 1)
 		}

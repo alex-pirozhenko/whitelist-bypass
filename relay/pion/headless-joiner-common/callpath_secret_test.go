@@ -122,6 +122,22 @@ func TestCallpathTunnelSecret(t *testing.T) {
 		}
 
 		// 6b. Test with EncodeData (interframe)
+		//
+		// This used to assert HasFrame=false here (asymmetric with 6a):
+		// before the tunnel emitted real I/P cadence, no legitimate frame
+		// ever carried the interframe tag with a body that fails to
+		// authenticate, so any interframe-tagged decrypt failure could only
+		// be noise/corruption and was worth flagging via badFrames.
+		// EncodeKeepaliveInterframe (see vp8tunnel.go's writerLoop cadence)
+		// now legitimately sends interframe-tagged frames whose body is
+		// random padding that fails AEAD Open() by construction, exactly
+		// like a keyframe-tagged keepalive always has. Decode() was made
+		// symmetric across both tags so the receiver doesn't need to care
+		// which tag a keepalive arrived under -- which means a decrypt
+		// failure on either tag now falls back to Keepalive=true, matching
+		// 6a. The security property this sub-test actually exists to prove
+		// -- a wrong secret never yields the real payload -- is unaffected:
+		// Payload stays empty either way, asserted below exactly as before.
 		interframeEncA := obfA.EncodeData(payload)
 		resInterframeB := obfB.Decode(interframeEncA)
 
@@ -131,8 +147,11 @@ func TestCallpathTunnelSecret(t *testing.T) {
 		if len(resInterframeB.Payload) != 0 {
 			t.Errorf("expected decrypted payload to be empty on decrypt failure, got: %q", resInterframeB.Payload)
 		}
-		if resInterframeB.HasFrame {
-			t.Errorf("expected HasFrame to be false for interframe header decrypt failure")
+		if !resInterframeB.HasFrame {
+			t.Errorf("expected HasFrame to be true for interframe header decrypt failure (symmetric with keyframe fallback)")
+		}
+		if !resInterframeB.Keepalive {
+			t.Errorf("expected Keepalive to be true for interframe header decrypt failure fallback")
 		}
 	})
 }

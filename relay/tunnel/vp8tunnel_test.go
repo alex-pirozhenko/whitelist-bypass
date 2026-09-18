@@ -60,7 +60,12 @@ func TestVP8PacketizerMatchesOptionA(t *testing.T) {
 		t.Errorf("payload mismatch: got %x, want %x", pkt.Payload[5:], frame)
 	}
 
-	// 2. Packetize Interframe: TL0PICIDX must NOT increment
+	// 2. Packetize Interframe: TL0PICIDX MUST still increment. TID is
+	// hardcoded to 0 (single temporal layer, see byte 4 below), so every
+	// frame -- keyframe or interframe -- belongs to TL0, and RFC 7741
+	// requires TL0PICIDX to increment on every TL0 frame. Freezing it across
+	// interframes while TID stays 0 would be an internally-inconsistent
+	// descriptor no real single-layer VP8 encoder produces.
 	interframe := []byte{0xd1, 0x02, 0x00}
 	pkts2 := p.Packetize(interframe, false, 4500, 1200)
 	if len(pkts2) != 1 {
@@ -73,8 +78,8 @@ func TestVP8PacketizerMatchesOptionA(t *testing.T) {
 	if pkt2.Payload[2] != 12 {
 		t.Errorf("expected PictureID 12, got %d", pkt2.Payload[2])
 	}
-	if pkt2.Payload[3] != 6 {
-		t.Errorf("expected TL0PICIDX unchanged at 6, got %d", pkt2.Payload[3])
+	if pkt2.Payload[3] != 7 {
+		t.Errorf("expected TL0PICIDX incremented to 7, got %d", pkt2.Payload[3])
 	}
 }
 

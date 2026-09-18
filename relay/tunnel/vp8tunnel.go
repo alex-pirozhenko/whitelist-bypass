@@ -66,9 +66,15 @@ func (p *VP8Packetizer) Packetize(frame []byte, isKeyframe bool, tsDelta uint32,
 	if p.pictureID == 0 {
 		p.pictureID = 1
 	}
-	if isKeyframe {
-		p.tl0picidx++
-	}
+	// TID is hardcoded to 0 below (single temporal layer), so every frame --
+	// keyframe or interframe -- belongs to TL0. RFC 7741's TL0PICIDX must
+	// increment on every TL0 frame, not just keyframes: freezing it across a
+	// run of interframes while TID stays 0 is an internally-inconsistent
+	// descriptor a real single-layer VP8 encoder never produces, and a
+	// giveaway to anything parsing the payload descriptor. isKeyframe is
+	// intentionally unused here now; kept in the signature for callers and
+	// because a future multi-layer TID would need it again.
+	p.tl0picidx++
 
 	buildDescriptor := func(startOfPartition bool) []byte {
 		b0 := byte(0x80) // X=1
@@ -133,6 +139,7 @@ type VP8DataTunnel struct {
 	packetizer     *VP8Packetizer
 	needKeyframe   atomic.Bool
 	keyframePeriod int
+	frameSeq       atomic.Uint64
 	logFn          func(string, ...any)
 	obf            *TunnelObfuscator
 	stopCh         chan struct{}
@@ -152,6 +159,7 @@ type VP8DataTunnel struct {
 	profileIdleKeepalive time.Duration // 0 = use the jittered keepaliveMin/Max range (today's default)
 	maxFrameBytes        int           // cfgMu-protected; 0 = coalescing disabled (today's behavior)
 	tier                 Tier          // cfgMu-protected; informational only, see Profile.Tier
+	keepaliveInterframe  bool          // cfgMu-protected; see TunnelConfig.KeepaliveInterframe, default false
 
 	sentFrames      atomic.Uint64
 	sentBytes       atomic.Uint64
@@ -199,8 +207,84 @@ func (t *VP8DataTunnel) SetOnData(fn func([]byte))  { t.OnData = fn }
 func (t *VP8DataTunnel) SetOnClose(fn func())       { t.OnClose = fn }
 func (t *VP8DataTunnel) SetOnPeerRestart(fn func()) { t.OnPeerRestart = fn }
 
+// TunnelConfig carries construction-time wire-compatibility toggles for a
+// VP8DataTunnel -- knobs that gate a specific *receiver* capability, unlike
+// Profile (which only tunes send-side rate/pacing and is always safe for any
+// decoder that already understands this tunnel's wire format at all).
+type TunnelConfig struct {
+	// KeepaliveInterframe, when true, lets idle keepalives ride the same I/P
+	// keyframe cadence introduced for data frames (see dueForKeyframe):
+	// ~1-in-keyframePeriod keepalives are keyframe-tagged (EncodeKeepalive),
+	// the rest interframe-tagged (EncodeKeepaliveInterframe).
+	//
+	// Default false: every keepalive is sent via EncodeKeepalive (keyframe
+	// tag), byte-for-byte identical to this tunnel's behavior before the I/P
+	// cadence change. This is required for backward compatibility -- every
+	// already-deployed device APK runs the pre-cadence obfuscator.go, whose
+	// Decode() only recognizes an AEAD-authentication failure as a keepalive
+	// under the keyframe tag (see the isKeyframe-gated branch this package's
+	// history shows was removed from Decode). An interframe-tagged keepalive
+	// sent to that decoder is NOT recognized as a keepalive -- it falls
+	// through to the same code path as a genuinely corrupt frame
+	// (DecodeResult{}, HasFrame=false), which VP8DataTunnel.HandleFrame on
+	// the receiving side counts as badFrames and logs as "undecodable
+	// frame". Data frames are unaffected by this flag in either direction:
+	// old decoders already accept interframe-tagged DATA frames fine (the
+	// success path through Decode -- AEAD Open() succeeds -- never
+	// depended on which tag the frame carried, before or after this
+	// package's I/P cadence change; only the Open()-failure/keepalive
+	// branch was tag-gated).
+	//
+	// Flip to true only once every device in the fleet is running a
+	// decoder new enough to treat both tags symmetrically in Decode's
+	// Open()-failure branch.
+	KeepaliveInterframe bool
+}
+
+// ApplyConfig applies a TunnelConfig's toggles. Safe to call before or after
+// Start(); like SetProfile, it is cfgMu-protected and picked up by the next
+// sendKeepalive call.
+func (t *VP8DataTunnel) ApplyConfig(cfg TunnelConfig) {
+	t.SetKeepaliveInterframe(cfg.KeepaliveInterframe)
+}
+
+// SetKeepaliveInterframe sets the KeepaliveInterframe toggle (see
+// TunnelConfig). Default is false.
+func (t *VP8DataTunnel) SetKeepaliveInterframe(enabled bool) {
+	t.cfgMu.Lock()
+	t.keepaliveInterframe = enabled
+	t.cfgMu.Unlock()
+}
+
+func (t *VP8DataTunnel) keepaliveInterframeEnabled() bool {
+	t.cfgMu.Lock()
+	defer t.cfgMu.Unlock()
+	return t.keepaliveInterframe
+}
+
 func (t *VP8DataTunnel) RequestKeyframe() {
 	t.needKeyframe.Store(true)
+}
+
+// dueForKeyframe decides, for the next emitted sample (data or keepalive),
+// whether it should carry the keyframe tag. Two independent triggers OR
+// together: an explicit RequestKeyframe() call (e.g. the SFU sent a PLI/FIR
+// on the video sender, see max_joiner.go) always wins and is consumed
+// exactly once; otherwise the tunnel free-runs a periodic cadence of one
+// keyframe every keyframePeriod emitted samples, counting keepalives too --
+// a real VP8 encoder keeps ticking its GOP clock through silence, it doesn't
+// pause it, so the fake stream must not either.
+func (t *VP8DataTunnel) dueForKeyframe() bool {
+	// frameSeq must advance exactly once per call regardless of which
+	// branch below decides the outcome -- if a forced keyframe (RequestKeyframe)
+	// skipped the increment, the periodic cadence would land on the same
+	// counter value again next call and double up (observed as two
+	// keyframes back-to-back instead of the intended 1-in-keyframePeriod).
+	n := t.frameSeq.Add(1) - 1
+	period := uint64(t.keyframePeriod)
+	cadenceDue := period <= 1 || n%period == 0
+	forced := t.needKeyframe.Swap(false)
+	return cadenceDue || forced
 }
 
 func NewVP8DataTunnel(track *webrtc.TrackLocalStaticSample, obf *TunnelObfuscator, logFn func(string, ...any)) *VP8DataTunnel {
@@ -504,14 +588,38 @@ func (t *VP8DataTunnel) writerLoop() {
 		}
 
 		sendFrame := func(data []byte) {
-			isKf := true
-			s := t.obf.EncodeDataKeyframe(data)
+			isKf := t.dueForKeyframe()
+			var s []byte
+			if isKf {
+				s = t.obf.EncodeDataKeyframe(data)
+			} else {
+				s = t.obf.EncodeData(data)
+			}
 			emit(s, isKf, false)
 		}
 
 		sendKeepalive := func(padLen int) {
-			isKf := true
-			s := t.obf.EncodeKeepalive(padLen)
+			isKf := t.dueForKeyframe()
+			// dueForKeyframe is always consulted (even when the interframe
+			// path below is disabled) so toggling KeepaliveInterframe never
+			// shifts the cadence counter data frames key off of -- only
+			// which encode function a non-cadence-due keepalive uses
+			// changes.
+			if !isKf && !t.keepaliveInterframeEnabled() {
+				// KeepaliveInterframe is off (the default): every keepalive
+				// stays keyframe-tagged via EncodeKeepalive, byte-identical
+				// to this tunnel's pre-cadence behavior, for compatibility
+				// with decoders that don't yet accept an interframe-tagged
+				// keepalive (see TunnelConfig.KeepaliveInterframe).
+				emit(t.obf.EncodeKeepalive(padLen), true, true)
+				return
+			}
+			var s []byte
+			if isKf {
+				s = t.obf.EncodeKeepalive(padLen)
+			} else {
+				s = t.obf.EncodeKeepaliveInterframe(padLen)
+			}
 			emit(s, isKf, true)
 		}
 
